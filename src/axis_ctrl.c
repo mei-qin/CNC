@@ -110,15 +110,20 @@ void api_move_relative(int axis_idx,double distance,double speed){
 }
 
 
-void api_push_trajectory(double target_pos[AXIS_NUM],
+int api_push_trajectory(double target_pos[AXIS_NUM],
                          double speed_sec_mm, double acc_sec_mm, double dec_sec_mm)
 {
-    if(!check_soft_limits(target_pos)) return;
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
+        printf("[SAFETY] 系统报警中，拒绝入队运动指令！\n");
+        return -1;
+    }
+    if(!g_all_axis_op_ready) return -1;
+    if(!check_soft_limits(target_pos)) return -1;
 
     // 拦截负速度/零速度：进给速度是标量，非正数属于上层逻辑错误
     if(speed_sec_mm <= 0.0) {
         printf("[SAFETY] 进给速度 %.3f mm/s 非正数，拒绝执行！\n", speed_sec_mm);
-        return;
+        return -1;
     }
 
     // ---- 第一步：计算原始偏差（mm 或 deg）----
@@ -132,7 +137,7 @@ void api_push_trajectory(double target_pos[AXIS_NUM],
         if(fabs(delta_raw[i]) > 0.0001 && g_axis[i].max_speed <= 0.0) {
             printf("[SAFETY] %s 轴动力学未配置(max_speed=0)，拒绝执行运动指令！\n",
                    g_axis[i].axis_name);
-            return;
+            return -1;
         }
     }
 
@@ -145,7 +150,7 @@ void api_push_trajectory(double target_pos[AXIS_NUM],
             if(g_axis[i].equivalent_radius <= 0.0) {
                 printf("[SAFETY] %s 旋转轴等效半径未配置(%.2f)，拒绝执行！\n",
                        g_axis[i].axis_name, g_axis[i].equivalent_radius);
-                return;
+                return -1;
             }
             delta_mm[i] = delta_raw[i] * DEG_TO_RAD * g_axis[i].equivalent_radius;
         } else {
@@ -161,10 +166,10 @@ void api_push_trajectory(double target_pos[AXIS_NUM],
     double dist = sqrt(dist_sq);
     if(dist < 1e-6) dist = 0.0;
 
-    // Wait for queue slot: 急停/报警时 RT 线程停止消费，必须打破死锁
+    // Wait for queue slot: 报警/急停时 RT 线程停止消费，必须打破死锁
     int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     while (next_head == g_cmd_queue.tail) {
-        if (!dorun) return;
+        if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
         osal_usleep(1000);
         next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     }
@@ -256,14 +261,20 @@ void api_push_trajectory(double target_pos[AXIS_NUM],
 
     g_cmd_queue.head = next_head;
     planner_recalculate(0);
+    return 0;
 }
 
 
-void api_push_mcode(int m_code, double s_value)
+int api_push_mcode(int m_code, double s_value)
 {
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
+        printf("[SAFETY] 系统报警中，拒绝入队M代码指令！\n");
+        return -1;
+    }
+    if(!g_all_axis_op_ready) return -1;
     int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     while (next_head == g_cmd_queue.tail) {
-        if (!dorun) return;
+        if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
         osal_usleep(1000);
         next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     }
@@ -288,6 +299,7 @@ void api_push_mcode(int m_code, double s_value)
 
     g_cmd_queue.head = next_head;
     planner_recalculate(0);
+    return 0;
 }
 
 
@@ -316,6 +328,30 @@ void api_motion_pause(){
 
 void api_motion_resume(){
     g_interpolator.pause_request=0;
+}
+
+// @Context: Non-RealTime Background Thread (上层管理线程调用)
+// @Thread-Safety: 仅设置 alarm_reset_request 标志，由 RT 线程在 HOLD_PAUSED 安全点消化
+// 安全条件：全部轴使能就绪 + 全部轴跟随误差归零
+// 注意：不再检查队列和插补器状态（这两个检查曾导致死锁和竞态），
+//       实际复位动作由 RT 线程在确认电机刹停(HOLD_PAUSED)后执行
+int api_alarm_reset(void){
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==0){
+        printf("[Alarm] 当前无报警，无需复位\n");
+        return 0;
+    }
+
+    // 防重入：上一次请求尚未被 RT 线程消化，拒绝重复提交
+    if(atomic_load_explicit(&g_interpolator.alarm_reset_request, memory_order_acquire)==1){
+        printf("[Alarm] 上一次复位请求尚未被消化，请勿重复提交\n");
+        return -2;
+    }
+
+    // 提交复位请求，由 RT 线程在安全点(HOLD_PAUSED && op_ready)执行实际状态清理
+    atomic_store_explicit(&g_interpolator.alarm_reset_request, 1, memory_order_release);
+
+    printf("[Alarm] 复位请求已提交，等待 RT 线程在安全点确认...\n");
+    return 0;
 }
 
 void axis_sys_init(void)

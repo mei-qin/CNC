@@ -54,20 +54,20 @@ int main(int argc, char *argv[])
     // ==========================================
     // 2. 硬件拓扑与总线映射配置
     // ==========================================
-    SMC_ConfigAxisTopology(SMC_AXIS_X, "X轴", 0, 1, 0);
+    SMC_ConfigAxisTopology(SMC_AXIS_X, "X轴", 0, 5, 0);
     SMC_ConfigAxisTopology(SMC_AXIS_Y, "Y轴", 1, 3, 4); // Y轴双驱 (主站3, 从站4)
-    SMC_ConfigAxisTopology(SMC_AXIS_Z, "Z轴", 0, 5, 0);
-    SMC_ConfigAxisTopology(SMC_AXIS_A, "A轴", 0, 2, 0);
-    SMC_ConfigAxisTopology(SMC_AXIS_B, "B轴", 0, 6, 0);
+    SMC_ConfigAxisTopology(SMC_AXIS_Z, "Z轴", 0, 6, 0);
+    SMC_ConfigAxisTopology(SMC_AXIS_A, "A轴", 0, 1, 0);
+    SMC_ConfigAxisTopology(SMC_AXIS_B, "B轴", 0, 2, 0);
 
     // ==========================================
     // 3. 脉冲当量配置 (1 单位对应多少个脉冲)
     // ==========================================
     SMC_ConfigPulsePerUnit(SMC_AXIS_X, 10000.0); // 1 mm = 10000 脉冲
     SMC_ConfigPulsePerUnit(SMC_AXIS_Y, 10000.0); // 1 mm = 10000 脉冲
-    SMC_ConfigPulsePerUnit(SMC_AXIS_Z, 10000.0); // 1 mm = 10000 脉冲
-    SMC_ConfigPulsePerUnit(SMC_AXIS_A, 10000.0); // 1 度 = 10000 脉冲
-    SMC_ConfigPulsePerUnit(SMC_AXIS_B, 10000.0); // 1 度 = 10000 脉冲
+    SMC_ConfigPulsePerUnit(SMC_AXIS_Z, 1000.0);  // 1 mm = 1000 脉冲
+    SMC_ConfigPulsePerUnit(SMC_AXIS_A, 1000.0); // 1 度 = 1000 脉冲
+    SMC_ConfigPulsePerUnit(SMC_AXIS_B, 1000.0); // 1 度 = 1000 脉冲
 
     // ==========================================
     // 4. 动力学约束与量纲护城河配置 (极其核心)
@@ -155,12 +155,12 @@ int main(int argc, char *argv[])
                 if (ax == SMC_AXIS_A || ax == SMC_AXIS_B) {
                     printf("请输入移动角度 (度°, 正负代表方向): ");
                     scanf("%lf", &dist);
-                    printf("请输入移动速度 (度°/min): ");
+                    printf("请输入移动速度 (度°/s): ");
                     scanf("%lf", &spd);
                 } else if (ax >= SMC_AXIS_X && ax <= SMC_AXIS_Z) {
                     printf("请输入移动距离 (mm, 正负代表方向): ");
                     scanf("%lf", &dist);
-                    printf("请输入移动速度 (mm/min): ");
+                    printf("请输入移动速度 (mm/s): ");
                     scanf("%lf", &spd);
                 } else {
                     printf("全轴测试，请输入统一位移数值: ");

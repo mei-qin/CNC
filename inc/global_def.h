@@ -41,5 +41,6 @@ extern CoordManager_t g_coord_mgr; // 坐标系管理器
 extern RtLog_t g_rt_log;           // 实时线程环形日志缓冲
 extern PlannerConfig_t g_planner_config; // 规划器全局参数
 extern pthread_mutex_t planner_mutex;    // 规划器互斥锁（parser线程 vs 看门狗线程）
+extern _Atomic int g_sys_alarm_state;    // 系统报警状态: 0=正常, 1=软停机报警中
 
 #endif // GLOBAL_DEF_H

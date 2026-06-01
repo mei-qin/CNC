@@ -20,6 +20,7 @@ int wkc;
 int mappingdone = 0;
 volatile int dorun = 0;
 int inOP = 0;
+_Atomic int g_sys_alarm_state = 0;
 int dowkccheck = 0, currentgroup = 0;
 int g_all_axis_enabled = 0;
 
@@ -141,6 +142,107 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             if (ctx.slavelist[0].hasdc && (wkc > 0))
                 ec_sync(ctx.DCtime, cycletime, &toff);
 
+            // === 报警复位安全点：必须在 g_all_axis_op_ready 门控之外 ===
+            // 若复位逻辑在门控内，op_ready=0 时请求永远无法被消费 → 死锁。
+            // 但消费条件必须同时满足：插补器已停稳 + 驱动器全部就绪。
+            // 若驱动器仍在 case 4 故障恢复中，此条件不满足，RT 线程安全空转等待。
+            if(g_interpolator.alarm_reset_request){
+                if(g_all_axis_op_ready && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)){
+                    g_interpolator.is_moving = 0;
+                    g_interpolator.is_waiting_mcode = 0;
+                    g_interpolator.time_scale = 1.0;
+                    g_interpolator.hold_state = HOLD_NORMAL;
+                    g_interpolator.alarm_reset_request = 0;
+                    g_cmd_queue.tail = g_cmd_queue.head;
+                    // 同步插补器位置到驱动器实际位置，防止故障恢复后位置偏差
+                    for(int j=0;j<AXIS_NUM;j++){
+                        if(g_axis[j].slave_count < 1 || g_axis[j].slave_ids[0] <= 0) continue;
+                        int64_t raw_pulse_j = (int64_t)axis_pdo_read_pos(g_axis[j].slave_ids[0])
+                                            - (int64_t)g_axis[j].home_offset[0];
+                        double ppu = g_axis[j].pulse_per_unit;
+                        g_axis[j].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse_j / ppu : 0.0;
+                        g_interpolator.current_pos[j] = g_axis[j].current_cmd_pos;
+                    }
+                    api_sync_planner_cursor();
+                    atomic_store_explicit(&g_sys_alarm_state, 0, memory_order_release);
+                    rt_log("[RT] 报警复位已执行，队列已清空，位置已同步");
+                }
+            }
+
+            // === 插补器运动控制：必须在 g_all_axis_op_ready 门控之外 ===
+            // 单轴故障时，非故障轴仍需跟踪平滑刹车轨迹。
+            // 若插补器被门控冻结，time_scale 无法递减，HOLD_BRAKING 永远不会完成。
+            if(g_interpolator.is_moving){
+
+                int alarm_active = atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire);
+                if(alarm_active){
+                    if(g_interpolator.hold_state != HOLD_PAUSED && g_interpolator.hold_state != HOLD_BRAKING){
+                        g_interpolator.hold_state = HOLD_BRAKING;
+                    }
+                } else {
+                    if (g_interpolator.pause_request && g_interpolator.hold_state == HOLD_NORMAL) {
+                        g_interpolator.hold_state = HOLD_BRAKING;
+                    } else if (!g_interpolator.pause_request && g_interpolator.hold_state == HOLD_PAUSED) {
+                        g_interpolator.hold_state = HOLD_RESUMING;
+                    }
+                }
+
+                const double TIME_DEC_STEP = 0.005;
+
+                if (g_interpolator.hold_state == HOLD_BRAKING) {
+                    g_interpolator.time_scale -= TIME_DEC_STEP;
+                    if (g_interpolator.time_scale <= 0.0) {
+                        g_interpolator.time_scale = 0.0;
+                        g_interpolator.hold_state = HOLD_PAUSED;
+                    }
+                } else if (g_interpolator.hold_state == HOLD_RESUMING) {
+                    g_interpolator.time_scale += TIME_DEC_STEP;
+                    if (g_interpolator.time_scale >= 1.0) {
+                        g_interpolator.time_scale = 1.0;
+                        g_interpolator.hold_state = HOLD_NORMAL;
+                    }
+                }
+
+                g_interpolator.virtual_time_ms+=g_interpolator.time_scale;
+
+                double t_val = g_interpolator.virtual_time_ms;
+
+                double s = 0.0;
+                double t1_val = (double)g_interpolator.t_acc;
+                double t2_val = (double)(g_interpolator.t_acc + g_interpolator.t_cru);
+
+                double s_acc_phase = 0.5 * g_interpolator.acc * t1_val * t1_val + g_interpolator.v_start * t1_val;
+                double v_acc_phase = g_interpolator.acc * t1_val + g_interpolator.v_start;
+                double s_cru_phase = s_acc_phase + v_acc_phase * g_interpolator.t_cru;
+
+                if (t_val <= t1_val) {
+                    s = 0.5 * g_interpolator.acc * t_val * t_val + g_interpolator.v_start * t_val;
+                }
+                else if (t_val <= t2_val) {
+                    double dt = t_val - t1_val;
+                    s = s_acc_phase + v_acc_phase * dt;
+                }
+                else if (t_val <= g_interpolator.total_time_ms) {
+                    double dt = t_val - t2_val;
+                    s = s_cru_phase + v_acc_phase * dt - 0.5 * g_interpolator.dec * dt * dt;
+                }
+                else {
+                    s = g_interpolator.total_distance;
+                    g_interpolator.is_moving = 0;
+                }
+
+                double ratio=0;
+                if(g_interpolator.total_distance>0.000001){
+                    ratio=s/g_interpolator.total_distance;
+                }
+                if(ratio>1.0) ratio=1.0;
+                if(ratio<0.0) ratio=0.0;
+
+                for(int j=0;j<AXIS_NUM;j++){
+                    g_interpolator.current_pos[j]=g_interpolator.start_pos[j]+(g_interpolator.target_pos[j]-g_interpolator.start_pos[j])*ratio;
+                }
+            }
+
             if(g_all_axis_op_ready){
                 for(int i=0;i<AXIS_NUM;i++){
                     if(g_axis[i].slave_count>=2&&g_axis[i].enable_sync_alarm){
@@ -153,7 +255,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         int32_t diff=abs(act_1-act_2);
                         if(diff>g_axis[i].sync_max_err_pulse){
                            rt_log("同步异常！轴%d 从站%d与%d位置差%d超过最大误差%d", i, slave_1, slave_2, diff, g_axis[i].sync_max_err_pulse);
-                           dorun=0;
+                           atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                            continue;
                         }
 
@@ -161,7 +263,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             g_axis[i]._current_sync_timer++;
                             if(g_axis[i]._current_sync_timer>g_axis[i].sync_err_time_ms){
                                 rt_log("同步报警！轴%d 从站%d与%d差%d持续%dms超限%d", i, slave_1, slave_2, diff, g_axis[i]._current_sync_timer, g_axis[i].sync_err_time_ms);
-                                dorun=0;
+                                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                             }
                         }else{
                             g_axis[i]._current_sync_timer=0;
@@ -171,8 +273,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             }
 
             if(g_all_axis_op_ready){
-
-                if(g_interpolator.is_moving==0&&g_interpolator.is_waiting_mcode==0&&g_cmd_queue.head!=g_cmd_queue.tail){
+                if(g_interpolator.is_moving==0&&g_interpolator.is_waiting_mcode==0&&g_cmd_queue.head!=g_cmd_queue.tail&&atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==0){
 
                     if(atomic_load_explicit(&g_cmd_queue.buffer[g_cmd_queue.tail].is_ready, memory_order_acquire)==1){
                         TrajectorySegment_t seg=g_cmd_queue.buffer[g_cmd_queue.tail];
@@ -229,70 +330,6 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     }
                 }
 
-                if(g_interpolator.is_moving){
-
-                    // 虚拟时间轴控制器 (Feedhold)
-                    if (g_interpolator.pause_request && g_interpolator.hold_state == HOLD_NORMAL) {
-                        g_interpolator.hold_state = HOLD_BRAKING;
-                    } else if (!g_interpolator.pause_request && g_interpolator.hold_state == HOLD_PAUSED) {
-                        g_interpolator.hold_state = HOLD_RESUMING;
-                    }
-
-                    const double TIME_DEC_STEP = 0.005;
-
-                    if (g_interpolator.hold_state == HOLD_BRAKING) {
-                        g_interpolator.time_scale -= TIME_DEC_STEP;
-                        if (g_interpolator.time_scale <= 0.0) {
-                            g_interpolator.time_scale = 0.0;
-                            g_interpolator.hold_state = HOLD_PAUSED;
-                        }
-                    } else if (g_interpolator.hold_state == HOLD_RESUMING) {
-                        g_interpolator.time_scale += TIME_DEC_STEP;
-                        if (g_interpolator.time_scale >= 1.0) {
-                            g_interpolator.time_scale = 1.0;
-                            g_interpolator.hold_state = HOLD_NORMAL;
-                        }
-                    }
-
-                    g_interpolator.virtual_time_ms+=g_interpolator.time_scale;
-
-                    double t_val = g_interpolator.virtual_time_ms;
-
-                    double s = 0.0;
-                    double t1_val = (double)g_interpolator.t_acc;
-                    double t2_val = (double)(g_interpolator.t_acc + g_interpolator.t_cru);
-
-                    double s_acc_phase = 0.5 * g_interpolator.acc * t1_val * t1_val + g_interpolator.v_start * t1_val;
-                    double v_acc_phase = g_interpolator.acc * t1_val + g_interpolator.v_start;
-                    double s_cru_phase = s_acc_phase + v_acc_phase * g_interpolator.t_cru;
-
-                    if (t_val <= t1_val) {
-                        s = 0.5 * g_interpolator.acc * t_val * t_val + g_interpolator.v_start * t_val;
-                    }
-                    else if (t_val <= t2_val) {
-                        double dt = t_val - t1_val;
-                        s = s_acc_phase + v_acc_phase * dt;
-                    }
-                    else if (t_val <= g_interpolator.total_time_ms) {
-                        double dt = t_val - t2_val;
-                        s = s_cru_phase + v_acc_phase * dt - 0.5 * g_interpolator.dec * dt * dt;
-                    }
-                    else {
-                        s = g_interpolator.total_distance;
-                        g_interpolator.is_moving = 0;
-                    }
-
-                    double ratio=0;
-                    if(g_interpolator.total_distance>0.000001){
-                        ratio=s/g_interpolator.total_distance;
-                    }
-                    if(ratio>1.0) ratio=1.0;
-                    if(ratio<0.0) ratio=0.0;
-
-                    for(int j=0;j<AXIS_NUM;j++){
-                        g_interpolator.current_pos[j]=g_interpolator.start_pos[j]+(g_interpolator.target_pos[j]-g_interpolator.start_pos[j])*ratio;
-                    }
-                }
                 for(int j=0;j<AXIS_NUM;j++){
                     g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
                     if(g_coord_mgr.current_coord==COORD_G53){
@@ -356,7 +393,6 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
                             int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
                             g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
-                            g_interpolator.current_pos[i]=g_axis[i].current_cmd_pos;
                             api_sync_planner_cursor();
                         }
                     }
@@ -366,15 +402,35 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     case 3:
                     output_cw=CW_ENABLE_OP;
 
-            
-                    if(g_axis[i].cia_step_delay==0){
-                        int64_t primary_pulse = (int64_t)axis_pdo_read_pos(g_axis[i].slave_ids[0]) 
+                    // 驱动器故障检测：必须在跟随误差监控之前
+                    // 当驱动器内部触发故障(如 AL009)时，状态字 bit3(SW_ERROR) 置位，
+                    // 需进入 case 4 执行 CW_FAULT_RESET 并重新走使能流程。
+                    // 绝对禁止在此处置 is_moving=0！仅触发报警，让虚拟时间轴平滑刹车。
+                    if(sw & SW_ERROR){
+                        g_axis[i].cia_step = 4;
+                        g_axis[i].cia_step_delay = 0;
+                        g_axis[i]._follow_err_timer = 0;
+                        all_ready_flag = 0;
+                        output_cw = CW_FAULT_RESET;
+                        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                        break;
+                    }
+
+                    if(g_axis[i].cia_step_delay==1){
+                        int64_t primary_pulse = (int64_t)axis_pdo_read_pos(g_axis[i].slave_ids[0])
                                               - (int64_t)g_axis[i].home_offset[0];
-                        
-                        g_axis[i].current_cmd_pos = (double)primary_pulse / g_axis[i].pulse_per_unit;
-                        g_interpolator.current_pos[i] = g_axis[i].current_cmd_pos;
-                        g_axis[i].cia_step_delay = 1;
+
+                        double ppu = g_axis[i].pulse_per_unit;
+                        g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)primary_pulse / ppu : 0.0;
+                        // 仅在插补器完全静止时才同步位置，运动/刹车中禁止覆写 current_pos！
+                        // 否则插补器下一周期会用 start_pos + dir_vec*ratio 覆盖回来，产生位置阶跃。
+                        if(!g_interpolator.is_moving) {
+                            g_interpolator.current_pos[i] = g_axis[i].current_cmd_pos;
+                        }
                     }else{
+                        // 无论是否报警，只要轴在 case 3（健康运行），就必须追随插补器！
+                        // 插补器已在报警时启动 HOLD_BRAKING 平滑减速，健康轴必须跟随减速，
+                        // 否则等于硬停，违背平滑急停设计。
                         g_axis[i].current_cmd_pos=g_interpolator.current_pos[i];
                     }
 
@@ -384,22 +440,37 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         int32_t abs_err=follow_err<0?-follow_err:follow_err;
                         if(abs_err>FOLLOW_ERR_MAX_PULSE){
                             rt_log("[跟随误差] %s 硬限超差 %d 脉冲",g_axis[i].axis_name,abs_err);
-                            g_interpolator.is_moving=0;
-                            g_interpolator.is_waiting_mcode=0;
-                            dorun=0;
+                            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                         }else if(abs_err>FOLLOW_ERR_WARN_PULSE){
                             g_axis[i]._follow_err_timer++;
                             if(g_axis[i]._follow_err_timer>=FOLLOW_ERR_WARN_TIME_MS){
                                 rt_log("[跟随误差] %s 警告持续 %dms",g_axis[i].axis_name,g_axis[i]._follow_err_timer);
-                                g_interpolator.is_moving=0;
-                                g_interpolator.is_waiting_mcode=0;
-                                dorun=0;
+                                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                             }
                         }else{
                             g_axis[i]._follow_err_timer=0;
                         }
                     }
 
+                    break;
+
+                    case 4:
+                    // 驱动器故障恢复：发送 CW_FAULT_RESET，等待故障位清除后重新使能
+                    all_ready_flag = 0;
+                    if(sw & SW_ERROR){
+                        output_cw = CW_FAULT_RESET;
+                        // 故障期间：命令位置死咬实际位置，防止恢复瞬间飞车追位
+                        if(g_axis[i].slave_count >= 1 && g_axis[i].slave_ids[0] > 0){
+                            int32_t raw_pulse = axis_pdo_read_pos(g_axis[i].slave_ids[0]) - g_axis[i].home_offset[0];
+                            double ppu = g_axis[i].pulse_per_unit;
+                            g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse / ppu : 0.0;
+                        }
+                    } else {
+                        // 故障已清除，回到 case 0 重新走完整使能流程
+                        g_axis[i].cia_step = 0;
+                        g_axis[i].cia_step_delay = 0;
+                        rt_log("[CiA402] %s 故障已清除，重新使能", g_axis[i].axis_name);
+                    }
                     break;
                 }
 

@@ -207,6 +207,7 @@ typedef struct{
     double time_scale;
     FeedHoldState_t hold_state;
     int pause_request;
+    _Atomic int alarm_reset_request;
 
     double total_distance;
     int32_t t_acc;

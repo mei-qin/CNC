@@ -17,6 +17,7 @@ typedef struct {
 
     double feedrate_mm_min; // 当前进给速度（mm/min）
     int is_absolute;       // 是否为绝对坐标模式（G90）1=G90，0=G91
+    int active_plane;      // 当前工作平面: 17=XY(默认), 18=ZX, 19=YZ
 } GCodeState_t;
 
 typedef struct{
@@ -30,7 +31,7 @@ typedef struct{
 int parse_gcode_line(const char *gcode_line);
 const char* skip_spaces(const char* str);
 OSAL_THREAD_FUNC parser_thread_func(void *arg);
-void generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM] ,
-                             double i_offset, double j_offset,
+int  generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
+                             double offset_1st, double offset_2nd,
                              int is_CW,double feedrate_mm_min);
 #endif // GCODE_PARSER_H
