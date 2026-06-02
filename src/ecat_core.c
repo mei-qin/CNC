@@ -205,42 +205,80 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
                 g_interpolator.virtual_time_ms+=g_interpolator.time_scale;
 
-                double t_val = g_interpolator.virtual_time_ms;
+                // ==== 7段式 S 曲线绝对解析插补 ====
+                // @Context: 1ms Hard-RT Thread (EtherCAT)
+                // @Danger: NO BLOCKING, NO MATH.H (sqrt/acos), NO PRINTF, NO MALLOC.
+                // 无状态：仅凭 virtual_time_ms 与预计算参数直接解析 s。
+                {
+                    double t = g_interpolator.virtual_time_ms;
+                    double s = 0.0;
+                    // 局部缓存，减少对结构体的重复访问
+                    double _T1=g_interpolator.T1, _T2=g_interpolator.T2;
+                    double _T3=g_interpolator.T3, _T4=g_interpolator.T4;
+                    double _T5=g_interpolator.T5, _T6=g_interpolator.T6;
+                    double _T7=g_interpolator.T7;
 
-                double s = 0.0;
-                double t1_val = (double)g_interpolator.t_acc;
-                double t2_val = (double)(g_interpolator.t_acc + g_interpolator.t_cru);
+                    if (t >= _T7) {
+                        s = g_interpolator.total_distance;
+                        g_interpolator.is_moving = 0;
+                    }
+                    else if (t <= _T1) {
+                        // T1: 加加速段  s = s0 + v0*dt + j1*dt^3/6
+                        double dt = t;
+                        s = g_interpolator.s0 + g_interpolator.v0*dt
+                          + g_interpolator.j1*dt*dt*dt/6.0;
+                    }
+                    else if (t <= _T2) {
+                        // T2: 匀加速段  s = s1 + v1*dt + 0.5*a2*dt^2
+                        double dt = t - _T1;
+                        s = g_interpolator.s1 + g_interpolator.v1*dt
+                          + 0.5*g_interpolator.a2*dt*dt;
+                    }
+                    else if (t <= _T3) {
+                        // T3: 减加速段  s = s2 + v2*dt + 0.5*a2*dt^2 + j3*dt^3/6
+                        double dt = t - _T2;
+                        s = g_interpolator.s2 + g_interpolator.v2*dt
+                          + 0.5*g_interpolator.a2*dt*dt
+                          + g_interpolator.j3*dt*dt*dt/6.0;
+                    }
+                    else if (t <= _T4) {
+                        // T4: 匀速段  s = s3 + v3*dt
+                        double dt = t - _T3;
+                        s = g_interpolator.s3 + g_interpolator.v3*dt;
+                    }
+                    else if (t <= _T5) {
+                        // T5: 加减速段  s = s4 + v4*dt + j5*dt^3/6
+                        double dt = t - _T4;
+                        s = g_interpolator.s4 + g_interpolator.v4*dt
+                          + g_interpolator.j5*dt*dt*dt/6.0;
+                    }
+                    else if (t <= _T6) {
+                        // T6: 匀减速段  s = s5 + v5*dt + 0.5*a6*dt^2
+                        double dt = t - _T5;
+                        s = g_interpolator.s5 + g_interpolator.v5*dt
+                          + 0.5*g_interpolator.a6*dt*dt;
+                    }
+                    else {
+                        // T7: 减减速段  s = s6 + v6*dt + 0.5*a6*dt^2 + j7*dt^3/6
+                        double dt = t - _T6;
+                        s = g_interpolator.s6 + g_interpolator.v6*dt
+                          + 0.5*g_interpolator.a6*dt*dt
+                          + g_interpolator.j7*dt*dt*dt/6.0;
+                    }
 
-                double s_acc_phase = 0.5 * g_interpolator.acc * t1_val * t1_val + g_interpolator.v_start * t1_val;
-                double v_acc_phase = g_interpolator.acc * t1_val + g_interpolator.v_start;
-                double s_cru_phase = s_acc_phase + v_acc_phase * g_interpolator.t_cru;
+                    double ratio = 0.0;
+                    if (g_interpolator.total_distance > 1e-6) {
+                        ratio = s / g_interpolator.total_distance;
+                    }
+                    if (ratio > 1.0) ratio = 1.0;
+                    if (ratio < 0.0) ratio = 0.0;
 
-                if (t_val <= t1_val) {
-                    s = 0.5 * g_interpolator.acc * t_val * t_val + g_interpolator.v_start * t_val;
-                }
-                else if (t_val <= t2_val) {
-                    double dt = t_val - t1_val;
-                    s = s_acc_phase + v_acc_phase * dt;
-                }
-                else if (t_val <= g_interpolator.total_time_ms) {
-                    double dt = t_val - t2_val;
-                    s = s_cru_phase + v_acc_phase * dt - 0.5 * g_interpolator.dec * dt * dt;
-                }
-                else {
-                    s = g_interpolator.total_distance;
-                    g_interpolator.is_moving = 0;
+                    for (int j = 0; j < AXIS_NUM; j++) {
+                        g_interpolator.current_pos[j] = g_interpolator.start_pos[j]
+                            + (g_interpolator.target_pos[j] - g_interpolator.start_pos[j]) * ratio;
+                    }
                 }
 
-                double ratio=0;
-                if(g_interpolator.total_distance>0.000001){
-                    ratio=s/g_interpolator.total_distance;
-                }
-                if(ratio>1.0) ratio=1.0;
-                if(ratio<0.0) ratio=0.0;
-
-                for(int j=0;j<AXIS_NUM;j++){
-                    g_interpolator.current_pos[j]=g_interpolator.start_pos[j]+(g_interpolator.target_pos[j]-g_interpolator.start_pos[j])*ratio;
-                }
             }
 
             if(g_all_axis_op_ready){
@@ -293,21 +331,34 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         }
 
                         g_interpolator.total_distance=seg.total_distance;
-                        g_interpolator.t_acc=seg.t_acc;
-                        g_interpolator.t_dec=seg.t_dec;
-                        g_interpolator.t_cru=seg.t_cru;
+                        // 7段式 S 曲线绝对解析参数（planner 已预计算）
+                        g_interpolator.T1=seg.T1; g_interpolator.T2=seg.T2;
+                        g_interpolator.T3=seg.T3; g_interpolator.T4=seg.T4;
+                        g_interpolator.T5=seg.T5; g_interpolator.T6=seg.T6;
+                        g_interpolator.T7=seg.T7;
+                        g_interpolator.v0=seg.v0; g_interpolator.v1=seg.v1;
+                        g_interpolator.v2=seg.v2; g_interpolator.v3=seg.v3;
+                        g_interpolator.v4=seg.v4; g_interpolator.v5=seg.v5;
+                        g_interpolator.v6=seg.v6;
+                        g_interpolator.s0=seg.s0; g_interpolator.s1=seg.s1;
+                        g_interpolator.s2=seg.s2; g_interpolator.s3=seg.s3;
+                        g_interpolator.s4=seg.s4; g_interpolator.s5=seg.s5;
+                        g_interpolator.s6=seg.s6;
+                        g_interpolator.j1=seg.j1; g_interpolator.a2=seg.a2;
+                        g_interpolator.j3=seg.j3;
+                        g_interpolator.j5=seg.j5; g_interpolator.a6=seg.a6;
+                        g_interpolator.j7=seg.j7;
                         g_interpolator.v_target=seg.v_target;
                         g_interpolator.acc=seg.acc;
                         g_interpolator.dec=seg.dec;
-                        g_interpolator.total_time_ms=seg.t_total;
                         g_interpolator.v_start=seg.v_start;
                         g_interpolator.v_end=seg.v_end;
                         g_interpolator.virtual_time_ms=0.0;
 
-                        if(g_interpolator.total_time_ms>0){
+                        if(seg.T_total > 0.5){
                             g_interpolator.is_moving=1;
                         }else{
-                            rt_log("invalid trajectory segment: total_time_ms=%d",g_interpolator.total_time_ms);
+                            rt_log("invalid trajectory segment: T_total=%.3f",seg.T_total);
                         }
                     }
                 }
@@ -440,6 +491,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         int32_t abs_err=follow_err<0?-follow_err:follow_err;
                         if(abs_err>FOLLOW_ERR_MAX_PULSE){
                             rt_log("[跟随误差] %s 硬限超差 %d 脉冲",g_axis[i].axis_name,abs_err);
+                            g_interpolator.is_moving = 0;
+                            g_interpolator.is_waiting_mcode = 0;
                             atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                         }else if(abs_err>FOLLOW_ERR_WARN_PULSE){
                             g_axis[i]._follow_err_timer++;

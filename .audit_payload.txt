@@ -1,0 +1,3724 @@
+请你对我提交的以下代码修改进行极限安全审计。
+
+【核心目标】：本次修改的业务需求是："3 段梯形 → 7 段 S 曲线 (Jerk Control)，短距退化二分查表"。
+
+【被修改的核心差异对比 (Git Diff)】:
+--- 暂存区 (Staged) 修改 ---
+diff --git a/inc/axis_cfg.h b/inc/axis_cfg.h
+index a48ae60..111ea2f 100644
+--- a/inc/axis_cfg.h
++++ b/inc/axis_cfg.h
+@@ -156,6 +156,7 @@ typedef struct {
+     double max_speed;     // 单轴最大允许速度 (mm/s 或 deg/s)
+     double max_acc;       // 单轴最大允许加速度 (mm/s^2 或 deg/s^2)
+     double max_dec;       // 单轴最大允许减速度 (mm/s^2 或 deg/s^2)
++    double max_jerk;      // 单轴最大加加速度 (mm/s^3 或 deg/s^3)，默认 5000.0
+     double equivalent_radius; // 旋转轴的物理半径，单位: mm (用于弧长换算: mm = deg * (PI/180) * radius)
+ 
+     // ③  软件限位参数（可选，视驱动器支持情况而定）
+@@ -192,7 +193,7 @@ typedef enum{
+ }FeedHoldState_t;
+ 
+ typedef struct{
+-    int is_moving;
++    _Atomic int is_moving;
+ 
+     double start_pos[AXIS_NUM];
+     double target_pos[AXIS_NUM];
+@@ -201,8 +202,6 @@ typedef struct{
+     double current_pos[AXIS_NUM];
+     double v_max,v_start,v_end;
+ 
+-    int32_t total_time_ms;
+-    int32_t current_time_ms;
+     double virtual_time_ms;
+     double time_scale;
+     FeedHoldState_t hold_state;
+@@ -210,10 +209,16 @@ typedef struct{
+     _Atomic int alarm_reset_request;
+ 
+     double total_distance;
+-    int32_t t_acc;
+-    int32_t t_dec;
+-    int32_t t_cru;
+-    //int32_t t_total;
++
++    // ---- 7段式 S 曲线绝对解析参数（由 planner 预计算，RT 线程只读）----
++    // T[n] = 第 n 阶段结束时的累计虚拟时间（ms），T7 = 总时长
++    double T1, T2, T3, T4, T5, T6, T7;
++    // v[n] = 第 n 阶段入口处的瞬时速度（mm/ms）
++    double v0, v1, v2, v3, v4, v5, v6;
++    // s[n] = 第 n 阶段入口处的累计位移（mm）
++    double s0, s1, s2, s3, s4, s5, s6;
++    // 各阶段控制量：j=jerk(mm/ms^3), a=加速度(mm/ms^2)
++    double j1, a2, j3, j5, a6, j7;
+ 
+     double v_target;
+     double acc;
+@@ -226,14 +231,11 @@ typedef struct{
+ }Interpolator_t;
+ 
+ /*
+- * Interpolator_t 字段说明（补充，便于维护）
+- * - is_moving: 是否处于运动中
+- * - start_pos/target_pos/current_pos: 各轴的起始/目标/当前位置（工程单位）
+- * - dir_vec: 运动方向单位向量
+- * - v_max/v_start/v_end: 速度上限与起始/结束速度
+- * - total_time_ms/current_time_ms: 轨迹总时长与已运行时间（ms）
+- * - t_acc/t_dec/t_cru: 加速/减速/巡航时间（ms）
+- * - v_target/acc/dec: 目标速度与加/减速
++ * Interpolator_t 字段说明（绝对解析式 S 曲线版）
++ * RT 线程通过 virtual_time_ms 与 T1~T7 比较确定当前阶段，
++ * 使用预计算的 v[n]/s[n]/控制量 进行无状态绝对解析求 s。
++ * T1=加加速结束, T2=匀加速结束, T3=减加速结束, T4=匀速结束,
++ * T5=加减速结束, T6=匀减速结束, T7=减减速结束=总时长。
+  */
+ 
+ typedef struct{
+@@ -253,14 +255,17 @@ typedef struct{
+     double v_start;
+     double v_end;
+ 
+-    int32_t t_acc;
+-    int32_t t_dec;
+-    int32_t t_cru;
+-    int32_t t_total;
++    // ---- 7段式 S 曲线绝对解析参数（由 planner 预计算）----
++    double T1, T2, T3, T4, T5, T6, T7;
++    double v0, v1, v2, v3, v4, v5, v6;
++    double s0, s1, s2, s3, s4, s5, s6;
++    double j1, a2, j3, j5, a6, j7;
++    double T_total;  // = T7，总时长（ms）
+ 
+     double v_target;
+     double acc;
+     double dec;
++    double jerk;
+ }TrajectorySegment_t;
+ 
+ 
+diff --git a/inc/gcode_parser.h b/inc/gcode_parser.h
+index ef6c773..89d8def 100644
+--- a/inc/gcode_parser.h
++++ b/inc/gcode_parser.h
+@@ -9,8 +9,9 @@
+ #include "axis_cfg.h"
+ 
+ #define RAPID_SPEED_MM_MIN 3000.0 // G00 快速移动速度（mm/min），可根据需要调整
+-#define DEFAULT_ACC 100.0 // 默认加速度（mm/s^2），可根据需要调整
+-#define DEFAULT_DEC 100.0 // 默认减速度（mm/s^2），可根据需要调整
++#define DEFAULT_ACC  100.0   // 默认加速度（mm/s^2）
++#define DEFAULT_DEC  100.0   // 默认减速度（mm/s^2）
++#define DEFAULT_JERK 5000.0  // 默认加加速度（mm/s^3）
+ 
+ typedef struct {
+     double current_pos[AXIS_NUM];
+diff --git a/src/axis_ctrl.c b/src/axis_ctrl.c
+index b0fe4ac..c58851f 100644
+--- a/src/axis_ctrl.c
++++ b/src/axis_ctrl.c
+@@ -199,6 +199,7 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
+     double final_speed_ratio = 1.0;
+     double final_acc_ratio   = 1.0;
+     double final_dec_ratio   = 1.0;
++    double final_jerk_ratio  = 1.0;
+ 
+     for(int i = 0; i < AXIS_NUM; i++){
+         if(fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
+@@ -208,18 +209,21 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
+         double req_v_mm = speed_sec_mm * axis_ratio_mm;
+         double req_a_mm = acc_sec_mm   * axis_ratio_mm;
+         double req_d_mm = dec_sec_mm   * axis_ratio_mm;
++        double req_j_mm = DEFAULT_JERK * axis_ratio_mm;
+ 
+-        double req_v, req_a, req_d;
++        double req_v, req_a, req_d, req_j;
+         if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
+             double safe_r = fmax(g_axis[i].equivalent_radius, 1e-4);
+             double conv = DEG_TO_RAD * safe_r;
+             req_v = req_v_mm / conv;
+             req_a = req_a_mm / conv;
+             req_d = req_d_mm / conv;
++            req_j = req_j_mm / conv;
+         } else {
+             req_v = req_v_mm;
+             req_a = req_a_mm;
+             req_d = req_d_mm;
++            req_j = req_j_mm;
+         }
+ 
+         if(g_axis[i].max_speed > 0.0 && req_v > g_axis[i].max_speed){
+@@ -234,26 +238,43 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
+             double r = g_axis[i].max_dec / req_d;
+             if(r < final_dec_ratio) final_dec_ratio = r;
+         }
++        if(g_axis[i].max_jerk > 0.0 && req_j > g_axis[i].max_jerk){
++            double r = g_axis[i].max_jerk / req_j;
++            if(r < final_jerk_ratio) final_jerk_ratio = r;
++        }
+     }
+ 
+     // 短板限幅：物理防爆墙，限幅后无论多小都必须服从，绝不允许再抬高！
+     speed_sec_mm *= final_speed_ratio;
+     acc_sec_mm   *= final_acc_ratio;
+     dec_sec_mm   *= final_dec_ratio;
++    double jerk_sec_mm = DEFAULT_JERK * final_jerk_ratio;
+ 
+     // 数学安全下限（限幅之后，仅防除零/NaN；规划器内部有 fmax(x,1e-6) 二次兜底）
+     if(speed_sec_mm < 1e-6) speed_sec_mm = 1e-6;
+     if(acc_sec_mm < 1e-6)   acc_sec_mm   = 1e-6;
+     if(dec_sec_mm < 1e-6)   dec_sec_mm   = 1e-6;
++    if(jerk_sec_mm < 1e-6)  jerk_sec_mm  = 1e-6;
+ 
+-    // 单位转换: mm/s → mm/ms, mm/s^2 → mm/ms^2
++    // 单位转换: mm/s → mm/ms, mm/s^2 → mm/ms^2, mm/s^3 → mm/ms^3
+     seg->v_target = speed_sec_mm / 1000.0;
+     seg->acc = acc_sec_mm / 1000000.0;
+     seg->dec = dec_sec_mm / 1000000.0;
++    seg->jerk = jerk_sec_mm / 1.0e9;
+     seg->v_start = 0.0;
+     seg->v_end = 0.0;
+     seg->v_max = seg->v_target;
+ 
++    // 7段式 S 曲线绝对解析参数初始化（由 planner_recalculate 填充）
++    seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
++    seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
++    seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
++    seg->v4=0; seg->v5=0; seg->v6=0;
++    seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
++    seg->s4=0; seg->s5=0; seg->s6=0;
++    seg->j1=0; seg->a2=0; seg->j3=0;
++    seg->j5=0; seg->a6=0; seg->j7=0;
++
+     // 所有安全检查通过，方可推进光标
+     for(int i=0;i<AXIS_NUM;i++){
+         plan_cursor[i]=target_pos[i];
+@@ -292,10 +313,14 @@ int api_push_mcode(int m_code, double s_value)
+     seg->v_end         = 0.0;
+     seg->acc           = 0.0;
+     seg->dec           = 0.0;
+-    seg->t_total       = 0;
+-    seg->t_acc         = 0;
+-    seg->t_dec         = 0;
+-    seg->t_cru         = 0;
++    seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
++    seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
++    seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
++    seg->v4=0; seg->v5=0; seg->v6=0;
++    seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
++    seg->s4=0; seg->s5=0; seg->s6=0;
++    seg->j1=0; seg->a2=0; seg->j3=0;
++    seg->j5=0; seg->a6=0; seg->j7=0;
+ 
+     g_cmd_queue.head = next_head;
+     planner_recalculate(0);
+@@ -382,6 +407,7 @@ void axis_sys_init(void)
+         g_axis[i].max_speed = 200.0;  // mm/s
+         g_axis[i].max_acc   = 200.0;  // mm/s^2
+         g_axis[i].max_dec   = 200.0;  // mm/s^2
++        g_axis[i].max_jerk  = 5000.0; // mm/s^3
+         // 旋转轴等效半径默认值：用户须通过 SMC_ConfigAxisDynamics 覆盖
+         g_axis[i].equivalent_radius = 0.0; // 0.0 表示未配置，退化回原始行为
+     }
+diff --git a/src/ecat_core.c b/src/ecat_core.c
+index 574892f..46dfea0 100644
+--- a/src/ecat_core.c
++++ b/src/ecat_core.c
+@@ -205,42 +205,78 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
+ 
+                 g_interpolator.virtual_time_ms+=g_interpolator.time_scale;
+ 
+-                double t_val = g_interpolator.virtual_time_ms;
+-
+-                double s = 0.0;
+-                double t1_val = (double)g_interpolator.t_acc;
+-                double t2_val = (double)(g_interpolator.t_acc + g_interpolator.t_cru);
+-
+-                double s_acc_phase = 0.5 * g_interpolator.acc * t1_val * t1_val + g_interpolator.v_start * t1_val;
+-                double v_acc_phase = g_interpolator.acc * t1_val + g_interpolator.v_start;
+-                double s_cru_phase = s_acc_phase + v_acc_phase * g_interpolator.t_cru;
++                // ==== 7段式 S 曲线绝对解析插补 ====
++                // @Context: 1ms Hard-RT Thread (EtherCAT)
++                // @Danger: NO BLOCKING, NO MATH.H (sqrt/acos), NO PRINTF, NO MALLOC.
++                // 无状态：仅凭 virtual_time_ms 与预计算参数直接解析 s。
++                {
++                    double t = g_interpolator.virtual_time_ms;
++                    double s = 0.0;
++                    // 局部缓存，减少对结构体的重复访问
++                    double _T1=g_interpolator.T1, _T2=g_interpolator.T2;
++                    double _T3=g_interpolator.T3, _T4=g_interpolator.T4;
++                    double _T5=g_interpolator.T5, _T6=g_interpolator.T6;
++                    double _T7=g_interpolator.T7;
++
++                    if (t >= _T7) {
++                        s = g_interpolator.total_distance;
++                        g_interpolator.is_moving = 0;
++                    }
++                    else if (t <= _T1) {
++                        // T1: 加加速段  s = s0 + v0*dt + j1*dt^3/6
++                        double dt = t;
++                        s = g_interpolator.s0 + g_interpolator.v0*dt
++                          + g_interpolator.j1*dt*dt*dt/6.0;
++                    }
++                    else if (t <= _T2) {
++                        // T2: 匀加速段  s = s1 + v1*dt + 0.5*a2*dt^2
++                        double dt = t - _T1;
++                        s = g_interpolator.s1 + g_interpolator.v1*dt
++                          + 0.5*g_interpolator.a2*dt*dt;
++                    }
++                    else if (t <= _T3) {
++                        // T3: 减加速段  s = s2 + v2*dt + j3*dt^3/6
++                        double dt = t - _T2;
++                        s = g_interpolator.s2 + g_interpolator.v2*dt
++                          + g_interpolator.j3*dt*dt*dt/6.0;
++                    }
++                    else if (t <= _T4) {
++                        // T4: 匀速段  s = s3 + v3*dt
++                        double dt = t - _T3;
++                        s = g_interpolator.s3 + g_interpolator.v3*dt;
++                    }
++                    else if (t <= _T5) {
++                        // T5: 加减速段  s = s4 + v4*dt + j5*dt^3/6
++                        double dt = t - _T4;
++                        s = g_interpolator.s4 + g_interpolator.v4*dt
++                          + g_interpolator.j5*dt*dt*dt/6.0;
++                    }
++                    else if (t <= _T6) {
++                        // T6: 匀减速段  s = s5 + v5*dt + 0.5*a6*dt^2
++                        double dt = t - _T5;
++                        s = g_interpolator.s5 + g_interpolator.v5*dt
++                          + 0.5*g_interpolator.a6*dt*dt;
++                    }
++                    else {
++                        // T7: 减减速段  s = s6 + v6*dt + j7*dt^3/6
++                        double dt = t - _T6;
++                        s = g_interpolator.s6 + g_interpolator.v6*dt
++                          + g_interpolator.j7*dt*dt*dt/6.0;
++                    }
+ 
+-                if (t_val <= t1_val) {
+-                    s = 0.5 * g_interpolator.acc * t_val * t_val + g_interpolator.v_start * t_val;
+-                }
+-                else if (t_val <= t2_val) {
+-                    double dt = t_val - t1_val;
+-                    s = s_acc_phase + v_acc_phase * dt;
+-                }
+-                else if (t_val <= g_interpolator.total_time_ms) {
+-                    double dt = t_val - t2_val;
+-                    s = s_cru_phase + v_acc_phase * dt - 0.5 * g_interpolator.dec * dt * dt;
+-                }
+-                else {
+-                    s = g_interpolator.total_distance;
+-                    g_interpolator.is_moving = 0;
+-                }
++                    double ratio = 0.0;
++                    if (g_interpolator.total_distance > 1e-6) {
++                        ratio = s / g_interpolator.total_distance;
++                    }
++                    if (ratio > 1.0) ratio = 1.0;
++                    if (ratio < 0.0) ratio = 0.0;
+ 
+-                double ratio=0;
+-                if(g_interpolator.total_distance>0.000001){
+-                    ratio=s/g_interpolator.total_distance;
++                    for (int j = 0; j < AXIS_NUM; j++) {
++                        g_interpolator.current_pos[j] = g_interpolator.start_pos[j]
++                            + (g_interpolator.target_pos[j] - g_interpolator.start_pos[j]) * ratio;
++                    }
+                 }
+-                if(ratio>1.0) ratio=1.0;
+-                if(ratio<0.0) ratio=0.0;
+ 
+-                for(int j=0;j<AXIS_NUM;j++){
+-                    g_interpolator.current_pos[j]=g_interpolator.start_pos[j]+(g_interpolator.target_pos[j]-g_interpolator.start_pos[j])*ratio;
+-                }
+             }
+ 
+             if(g_all_axis_op_ready){
+@@ -293,21 +329,34 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
+                         }
+ 
+                         g_interpolator.total_distance=seg.total_distance;
+-                        g_interpolator.t_acc=seg.t_acc;
+-                        g_interpolator.t_dec=seg.t_dec;
+-                        g_interpolator.t_cru=seg.t_cru;
++                        // 7段式 S 曲线绝对解析参数（planner 已预计算）
++                        g_interpolator.T1=seg.T1; g_interpolator.T2=seg.T2;
++                        g_interpolator.T3=seg.T3; g_interpolator.T4=seg.T4;
++                        g_interpolator.T5=seg.T5; g_interpolator.T6=seg.T6;
++                        g_interpolator.T7=seg.T7;
++                        g_interpolator.v0=seg.v0; g_interpolator.v1=seg.v1;
++                        g_interpolator.v2=seg.v2; g_interpolator.v3=seg.v3;
++                        g_interpolator.v4=seg.v4; g_interpolator.v5=seg.v5;
++                        g_interpolator.v6=seg.v6;
++                        g_interpolator.s0=seg.s0; g_interpolator.s1=seg.s1;
++                        g_interpolator.s2=seg.s2; g_interpolator.s3=seg.s3;
++                        g_interpolator.s4=seg.s4; g_interpolator.s5=seg.s5;
++                        g_interpolator.s6=seg.s6;
++                        g_interpolator.j1=seg.j1; g_interpolator.a2=seg.a2;
++                        g_interpolator.j3=seg.j3;
++                        g_interpolator.j5=seg.j5; g_interpolator.a6=seg.a6;
++                        g_interpolator.j7=seg.j7;
+                         g_interpolator.v_target=seg.v_target;
+                         g_interpolator.acc=seg.acc;
+                         g_interpolator.dec=seg.dec;
+-                        g_interpolator.total_time_ms=seg.t_total;
+                         g_interpolator.v_start=seg.v_start;
+                         g_interpolator.v_end=seg.v_end;
+                         g_interpolator.virtual_time_ms=0.0;
+ 
+-                        if(g_interpolator.total_time_ms>0){
++                        if(seg.T_total > 0.5){
+                             g_interpolator.is_moving=1;
+                         }else{
+-                            rt_log("invalid trajectory segment: total_time_ms=%d",g_interpolator.total_time_ms);
++                            rt_log("invalid trajectory segment: T_total=%.3f",seg.T_total);
+                         }
+                     }
+                 }
+diff --git a/src/planner.c b/src/planner.c
+index c50c65e..6618548 100644
+--- a/src/planner.c
++++ b/src/planner.c
+@@ -1,56 +1,150 @@
+ #include "planner.h"
+ 
+ // ====================================================================
+-// G64 向心加速度过弯模型（替代旧 cos_theta 线性降速）
++// 7 段式 S 曲线 (Jerk Control) — 绝对解析式预计算
++// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
++// 所有内部物理量单位：mm/ms, mm/ms^2, mm/ms^3 → 时间自然为 ms
++// ====================================================================
++
++// 默认 Jerk：5000 mm/s^3 → mm/ms^3
++#define DEFAULT_JERK_MS3  (5000.0 / 1.0e9)
++// 二分查找迭代次数
++#define SCURVE_BISECT_ITERS  20
++// 前瞻精确求解迭代次数
++#define LOOKAHEAD_BISECT_ITERS  24
++
++// --------------------------------------------------------------------
++// 加速段 v_s → v_m 的时序与距离
++// 输出: tj = jerk段时长(T1=T3), ta = 匀加速时长(T2), *S_out = 距离
++// --------------------------------------------------------------------
++static void compute_acc_profile(double v_s, double v_m, double a_max, double jerk,
++                                double *tj, double *ta, double *S_out)
++{
++    double dv = v_m - v_s;
++    if (dv <= 1e-12 || jerk <= 1e-15 || a_max <= 1e-15) {
++        *tj = 0.0; *ta = 0.0; *S_out = 0.0; return;
++    }
++    double tj_max = a_max / jerk;
++    double dv_j   = 0.5 * jerk * tj_max * tj_max;
++
++    if (dv < 2.0 * dv_j) {
++        // 退化：加速度峰值 < a_max
++        *tj = sqrt(dv / jerk);
++        *ta = 0.0;
++        *S_out = v_s * 2.0 * (*tj) + jerk * (*tj) * (*tj) * (*tj);
++    } else {
++        *tj = tj_max;
++        *ta = (dv - 2.0 * dv_j) / a_max;
++        double t = *tj, a = *ta;
++        *S_out = v_s * (2.0*t + a) + a_max*t*t + 1.5*a_max*t*a + 0.5*a_max*a*a;
++    }
++}
++
++// --------------------------------------------------------------------
++// 减速段 v_m → v_e 的时序与距离
++// 输出: tj = jerk段时长(T5=T7), td = 匀减速时长(T6), *S_out = 距离
++// --------------------------------------------------------------------
++static void compute_dec_profile(double v_m, double v_e, double d_max, double jerk,
++                                double *tj, double *td, double *S_out)
++{
++    double dv = v_m - v_e;
++    if (dv <= 1e-12 || jerk <= 1e-15 || d_max <= 1e-15) {
++        *tj = 0.0; *td = 0.0; *S_out = 0.0; return;
++    }
++    double tj_max = d_max / jerk;
++    double dv_j   = 0.5 * jerk * tj_max * tj_max;
++
++    if (dv < 2.0 * dv_j) {
++        *tj = sqrt(dv / jerk);
++        *td = 0.0;
++        *S_out = v_m * 2.0 * (*tj) - jerk * (*tj) * (*tj) * (*tj);
++    } else {
++        *tj = tj_max;
++        *td = (dv - 2.0 * dv_j) / d_max;
++        double t = *tj, d = *td;
++        *S_out = v_m * (2.0*t + d) - d_max*t*t - 1.5*d_max*t*d - 0.5*d_max*d*d;
++    }
++}
++
++// --------------------------------------------------------------------
++// 精确求解：给定 v_end 和可用距离 S，求最大 v_start
++//   使得 S 曲线减速 (v_start → v_end) 恰好 fits in S
++// @Context: Non-RealTime Background Thread
++// --------------------------------------------------------------------
++static double solve_max_vstart_scurve(double v_end, double S,
++                                       double d_max, double jerk, double v_ceil)
++{
++    double lo = v_end, hi = fmax(v_end, v_ceil);
++    for (int i = 0; i < LOOKAHEAD_BISECT_ITERS; i++) {
++        double mid = 0.5 * (lo + hi);
++        double tj, td, S_test;
++        compute_dec_profile(mid, v_end, d_max, jerk, &tj, &td, &S_test);
++        if (S_test > S) hi = mid; else lo = mid;
++    }
++    return lo;
++}
++
++// --------------------------------------------------------------------
++// 精确求解：给定 v_start 和可用距离 S，求最大 v_end
++//   使得 S 曲线加速 (v_start → v_end) 恰好 fits in S
++// @Context: Non-RealTime Background Thread
++// --------------------------------------------------------------------
++static double solve_max_vend_scurve(double v_start, double S,
++                                     double a_max, double jerk, double v_ceil)
++{
++    double lo = v_start, hi = fmax(v_start, v_ceil);
++    for (int i = 0; i < LOOKAHEAD_BISECT_ITERS; i++) {
++        double mid = 0.5 * (lo + hi);
++        double tj, ta, S_test;
++        compute_acc_profile(v_start, mid, a_max, jerk, &tj, &ta, &S_test);
++        if (S_test > S) hi = mid; else lo = mid;
++    }
++    return lo;
++}
++
++// --------------------------------------------------------------------
++// 获取段的等效 jerk（段 jerk > 0 则取段值，否则取默认）
++// --------------------------------------------------------------------
++static inline double seg_effective_jerk(const TrajectorySegment_t *seg)
++{
++    return (seg->jerk > 1e-15) ? seg->jerk : DEFAULT_JERK_MS3;
++}
++
++// ====================================================================
++// G64 向心加速度过弯模型
+ // @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+ // ====================================================================
+ double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *curr)
+ {
+-    // ---- M 代码安全隔离墙 ----
+     if (prev->cmd_type == CMD_TYPE_MCODE || curr->cmd_type == CMD_TYPE_MCODE) {
+         return 0.0;
+     }
+ 
+-    // ---- N 维方向向量点积 ----
+     double cos_theta = 0.0;
+     for (int i = 0; i < AXIS_NUM; i++) {
+         cos_theta += prev->dir_vec[i] * curr->dir_vec[i];
+     }
+-
+-    // 钳制到 [-1.0, 1.0]，防止浮点漂移导致 acos NaN
+     if (cos_theta > 1.0)  cos_theta = 1.0;
+     if (cos_theta < -1.0) cos_theta = -1.0;
+ 
+-    // ---- 极端角度快速路径 ----
+-    if (cos_theta >= 0.999) {
+-        return fmin(prev->v_max, curr->v_max);
+-    }
+-    if (cos_theta <= -0.999) {
+-        return 0.0;
+-    }
++    if (cos_theta >= 0.999) return fmin(prev->v_max, curr->v_max);
++    if (cos_theta <= -0.999) return 0.0;
+ 
+-    // ---- 向心加速度模型 ----
+     double alpha = acos(cos_theta);
+     double denom = 1.0 - cos(alpha * 0.5);
+     if (denom <= 1e-6) denom = 1e-6;
+ 
+     double v_allow = sqrt(g_planner_config.max_centripetal_acc
+                         * (g_planner_config.corner_tolerance / denom));
++    if (isnan(v_allow) || isinf(v_allow) || v_allow < 0.0) v_allow = 0.0;
+ 
+-    // 防爆墙：NaN / Inf / 负数强制归零
+-    if (isnan(v_allow) || isinf(v_allow) || v_allow < 0.0) {
+-        v_allow = 0.0;
+-    }
+-
+-    double v_min = fmin(prev->v_max, curr->v_max);
+-    return fmin(v_allow, v_min);
++    return fmin(v_allow, fmin(prev->v_max, curr->v_max));
+ }
+ 
+ // ====================================================================
+-// Look-Ahead 前瞻核心引擎（反向+正向扫描 + plan_tail 结界 + 互斥锁）
++// Look-Ahead 前瞻核心引擎（精确 S 曲线距离求解版）
+ // @Context: Non-RealTime Background Thread (parser 或 看门狗)
+ // @Thread-Safety: 由 planner_mutex 保护，禁止 RT 线程调用！
+-// force_flush: 0=正常前瞻, 1=强制释放所有未释放段（饥饿唤醒用）
+ // ====================================================================
+ void planner_recalculate(int force_flush)
+ {
+@@ -59,30 +153,24 @@ void planner_recalculate(int force_flush)
+     int tail = g_cmd_queue.tail;
+     int head = g_cmd_queue.head;
+     int count = (head - tail + QUEUE_SIZE) % QUEUE_SIZE;
+-    if (count == 0) {
+-        pthread_mutex_unlock(&planner_mutex);
+-        return;
+-    }
++    if (count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+ 
+-    // ================================================================
+-    // plan_tail 结界：跳过所有 is_ready==1 的已释放段
+-    // 已释放段正在被 RT 线程消费，神圣不可侵犯！
+-    // ================================================================
++    // ---- plan_tail 结界 ----
+     int plan_tail = tail;
+-    while (plan_tail != head && atomic_load_explicit(&g_cmd_queue.buffer[plan_tail].is_ready, memory_order_acquire) == 1) {
++    while (plan_tail != head &&
++           atomic_load_explicit(&g_cmd_queue.buffer[plan_tail].is_ready,
++                                memory_order_acquire) == 1) {
+         plan_tail = (plan_tail + 1) % QUEUE_SIZE;
+     }
+     int plan_count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
+-    if (plan_count == 0) {
+-        pthread_mutex_unlock(&planner_mutex);
+-        return;
+-    }
++    if (plan_count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+ 
+-    // ---- 0. 仅初始化未释放段的 v_start / v_end ----
++    // ---- 0. 初始化未释放段 ----
+     {
+         int c = plan_tail;
+         while (c != head) {
+-            if (atomic_load_explicit(&g_cmd_queue.buffer[c].is_ready, memory_order_acquire) == 0) {
++            if (atomic_load_explicit(&g_cmd_queue.buffer[c].is_ready,
++                                     memory_order_acquire) == 0) {
+                 g_cmd_queue.buffer[c].v_start = 0.0;
+                 g_cmd_queue.buffer[c].v_end   = 0.0;
+             }
+@@ -91,81 +179,73 @@ void planner_recalculate(int force_flush)
+     }
+ 
+     // ================================================================
+-    // 前瞻速度平滑计算（plan_count >= 3 才启动）
++    // 前瞻速度平滑（精确 S 曲线距离求解，废弃 K 系数）
++    // 直接调用 compute_dec_profile / compute_acc_profile + 二分搜索
++    // 精确计算 S 曲线真实刹车/加速距离。
+     // ================================================================
+     if (plan_count >= 3) {
+         int safe_tail = (plan_tail + 1) % QUEUE_SIZE;
+         int curr = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+         g_cmd_queue.buffer[curr].v_end = 0.0;
+ 
+-        // ---- 1. 反向扫描（head-1 → safe_tail，确保刹车距离足够）----
++        // ---- 1. 反向扫描 ----
+         while (curr != safe_tail) {
+             int prev = (curr - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+             TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev];
+             TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
+ 
+             double v_junc = calculate_junction_speed(s_prev, s_curr);
++            double d_max  = fmax(s_curr->dec, 1e-9);
++            double J_c    = seg_effective_jerk(s_curr);
+ 
+-            double inner = s_curr->v_end * s_curr->v_end
+-                         + 2.0 * s_curr->dec * s_curr->total_distance;
+-            if (inner < 0.0) inner = 0.0;
+-            double max_v_start = sqrt(inner);
++            double max_v_start = solve_max_vstart_scurve(
++                s_curr->v_end, s_curr->total_distance,
++                d_max, J_c, s_curr->v_target);
+ 
+-            s_curr->v_start = fmin(v_junc, max_v_start);
+-            s_curr->v_start = fmin(s_curr->v_start, s_curr->v_target);
++            s_curr->v_start = fmin(v_junc, fmin(max_v_start, s_curr->v_target));
+             s_prev->v_end = s_curr->v_start;
+             curr = prev;
+         }
+-        // 反向扫描结束后：plan_tail.v_end 已通过传播被设置
+ 
+-        // ---- 计算 plan_tail 的 v_start（与已释放前驱的衔接速度）----
++        // plan_tail 衔接
+         if (plan_tail != tail) {
+-            // 存在已释放前驱段，用拐角衔接速度
+             int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+             double v_junc = calculate_junction_speed(
+                 &g_cmd_queue.buffer[prev_idx], &g_cmd_queue.buffer[plan_tail]);
++            TrajectorySegment_t *sp = &g_cmd_queue.buffer[plan_tail];
++            double d_max = fmax(sp->dec, 1e-9);
++            double J_p   = seg_effective_jerk(sp);
+ 
+-            double inner = g_cmd_queue.buffer[plan_tail].v_end
+-                         * g_cmd_queue.buffer[plan_tail].v_end
+-                         + 2.0 * g_cmd_queue.buffer[plan_tail].dec
+-                         * g_cmd_queue.buffer[plan_tail].total_distance;
+-            if (inner < 0.0) inner = 0.0;
+-            double max_v_start = sqrt(inner);
+-
+-            g_cmd_queue.buffer[plan_tail].v_start = fmin(v_junc, max_v_start);
+-            g_cmd_queue.buffer[plan_tail].v_start = fmin(
+-                g_cmd_queue.buffer[plan_tail].v_start,
+-                g_cmd_queue.buffer[plan_tail].v_target);
++            double max_vs = solve_max_vstart_scurve(
++                sp->v_end, sp->total_distance,
++                d_max, J_p, sp->v_target);
++
++            sp->v_start = fmin(v_junc, fmin(max_vs, sp->v_target));
+         }
+-        // else: plan_tail == tail，v_start 保持初始化值 0.0（从静止起步）
+ 
+-        // ---- 2. 正向扫描（safe_tail → head-1，确保加速合法）----
+-        // 正向扫描起点继承 plan_tail.v_end（衔接速度）
++        // ---- 2. 正向扫描 ----
+         curr = safe_tail;
+         g_cmd_queue.buffer[curr].v_start = g_cmd_queue.buffer[plan_tail].v_end;
+ 
+         while (curr != (head - 1 + QUEUE_SIZE) % QUEUE_SIZE) {
+             TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
+             int next = (curr + 1) % QUEUE_SIZE;
+-            TrajectorySegment_t *s_next = &g_cmd_queue.buffer[next];
+ 
+-            double inner = s_curr->v_start * s_curr->v_start
+-                         + 2.0 * s_curr->acc * s_curr->total_distance;
+-            if (inner < 0.0) inner = 0.0;
+-            double max_v_end = sqrt(inner);
++            double a_max = fmax(s_curr->acc, 1e-9);
++            double J_c   = seg_effective_jerk(s_curr);
++
++            double max_v_end = solve_max_vend_scurve(
++                s_curr->v_start, s_curr->total_distance,
++                a_max, J_c, s_curr->v_target);
+ 
+             s_curr->v_end = fmin(s_curr->v_end, max_v_end);
+             s_curr->v_end = fmin(s_curr->v_end, s_curr->v_target);
+-            s_next->v_start = s_curr->v_end;
++            g_cmd_queue.buffer[next].v_start = s_curr->v_end;
+             curr = next;
+         }
+     }
+ 
+-    // ================================================================
+-    // 衔接速度保障：plan_count < 3 时补齐段间衔接
+-    // ================================================================
+-
+-    // plan_count == 2: 两条段之间做 G64 拐角平滑（含动力学约束）
++    // ---- plan_count == 2 ----
+     if (plan_count == 2) {
+         int seg0 = plan_tail;
+         int seg1 = (plan_tail + 1) % QUEUE_SIZE;
+@@ -175,146 +255,237 @@ void planner_recalculate(int force_flush)
+         double v_junc = calculate_junction_speed(s0, s1);
+         v_junc = fmin(v_junc, fmin(s0->v_target, s1->v_target));
+ 
+-        // s0 加速距离约束：从 v_start 出发，最多能加速到多少
+-        double inner0 = s0->v_start * s0->v_start
+-                      + 2.0 * fmax(s0->acc, 1e-6) * s0->total_distance;
+-        if (inner0 < 0.0) inner0 = 0.0;
+-        double max_v_end_by_acc = sqrt(inner0);
+-        s0->v_end = fmin(v_junc, max_v_end_by_acc);
+-        s0->v_end = fmin(s0->v_end, s0->v_target);
+-
+-        // s1 减速距离约束：从 v_junc 出发，必须能刹停到 v_end
+-        double inner1 = s1->v_end * s1->v_end
+-                      + 2.0 * fmax(s1->dec, 1e-6) * s1->total_distance;
+-        if (inner1 < 0.0) inner1 = 0.0;
+-        double max_v_start_by_dec = sqrt(inner1);
+-        s1->v_start = fmin(s0->v_end, max_v_start_by_dec);
+-        s1->v_start = fmin(s1->v_start, s1->v_target);
+-
+-        s0->v_end = s1->v_start; // 链式约束：保证衔接一致
+-
+-        // 如果 plan_tail 有已释放前驱，还需计算 plan_tail.v_start
+-        if (plan_tail != tail) {
+-            int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+-            double v_junc_front = calculate_junction_speed(
+-                &g_cmd_queue.buffer[prev_idx], s0);
++        double a0 = fmax(s0->acc, 1e-9);
++        double J0 = seg_effective_jerk(s0);
++        double max_ve0 = solve_max_vend_scurve(
++            s0->v_start, s0->total_distance, a0, J0, s0->v_target);
++        s0->v_end = fmin(v_junc, fmin(max_ve0, s0->v_target));
+ 
+-            double inner_f = s0->v_end * s0->v_end
+-                           + 2.0 * fmax(s0->dec, 1e-6) * s0->total_distance;
+-            if (inner_f < 0.0) inner_f = 0.0;
+-            double max_v_start = sqrt(inner_f);
++        double d1 = fmax(s1->dec, 1e-9);
++        double J1 = seg_effective_jerk(s1);
++        double max_vs1 = solve_max_vstart_scurve(
++            s1->v_end, s1->total_distance, d1, J1, s1->v_target);
++        s1->v_start = fmin(s0->v_end, fmin(max_vs1, s1->v_target));
++        s0->v_end = s1->v_start;
+ 
+-            s0->v_start = fmin(v_junc_front, max_v_start);
+-            s0->v_start = fmin(s0->v_start, s0->v_target);
++        if (plan_tail != tail) {
++            int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
++            double vj = calculate_junction_speed(&g_cmd_queue.buffer[prev_idx], s0);
++            double d0 = fmax(s0->dec, 1e-9);
++            double J0b = seg_effective_jerk(s0);
++            double max_vs0 = solve_max_vstart_scurve(
++                s0->v_end, s0->total_distance, d0, J0b, s0->v_target);
++            s0->v_start = fmin(vj, fmin(max_vs0, s0->v_target));
+         }
+     }
+ 
+-    // plan_count == 1 且有前驱：补齐 plan_tail 与前驱的衔接
++    // ---- plan_count == 1 ----
+     if (plan_count == 1 && plan_tail != tail) {
+         int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+-        TrajectorySegment_t *s_plan = &g_cmd_queue.buffer[plan_tail];
+-
+-        double v_junc = calculate_junction_speed(
+-            &g_cmd_queue.buffer[prev_idx], s_plan);
+-
+-        double inner = s_plan->v_end * s_plan->v_end
+-                     + 2.0 * s_plan->dec * s_plan->total_distance;
+-        if (inner < 0.0) inner = 0.0;
+-        double max_v_start = sqrt(inner);
+-
+-        s_plan->v_start = fmin(v_junc, max_v_start);
+-        s_plan->v_start = fmin(s_plan->v_start, s_plan->v_target);
++        TrajectorySegment_t *sp = &g_cmd_queue.buffer[plan_tail];
++        double v_junc = calculate_junction_speed(&g_cmd_queue.buffer[prev_idx], sp);
++        double d_max = fmax(sp->dec, 1e-9);
++        double J_sp  = seg_effective_jerk(sp);
++        double max_vs = solve_max_vstart_scurve(
++            sp->v_end, sp->total_distance, d_max, J_sp, sp->v_target);
++        sp->v_start = fmin(v_junc, fmin(max_vs, sp->v_target));
+     }
+ 
+     // ================================================================
+-    // 3. 时间重构（仅对未释放段计算，double 中间量 + 30s 熔断）
++    // 3. 7段式 S 曲线绝对解析式预计算
++    //    严禁 ceil()！所有时间为精确 double ms。
++    //    planner 直接把 7 段入口状态全部算好，RT 线程只做查表插值。
+     // ================================================================
+     {
++        double J_default = DEFAULT_JERK_MS3;
+         int curr = plan_tail;
++
+         while (curr != head) {
+             TrajectorySegment_t *seg = &g_cmd_queue.buffer[curr];
+ 
+-            if (seg->cmd_type == CMD_TYPE_MCODE || seg->total_distance <= 0.0001) {
+-                seg->t_acc   = 0;
+-                seg->t_dec   = 0;
+-                seg->t_cru   = 0;
+-                seg->t_total = 1;
++            // ---- M 代码 / 零距离：直接归零 ----
++            if (seg->cmd_type == CMD_TYPE_MCODE || seg->total_distance <= 1e-6) {
++                seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
++                seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
++                seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
++                seg->v4=0; seg->v5=0; seg->v6=0;
++                seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
++                seg->s4=0; seg->s5=0; seg->s6=0;
++                seg->j1=0; seg->a2=0; seg->j3=0;
++                seg->j5=0; seg->a6=0; seg->j7=0;
++                seg->T_total = 1.0;
++                seg->total_distance = 0.0;
+                 curr = (curr + 1) % QUEUE_SIZE;
+                 continue;
+             }
+ 
+-            double v_s = seg->v_start;
+-            double v_e = seg->v_end;
+-            double v_m = seg->v_target;
+-            double a   = fmax(seg->acc, 1e-6);
+-            double d   = fmax(seg->dec, 1e-6);
+-            double S   = seg->total_distance;
++            double v_s   = seg->v_start;
++            double v_e   = seg->v_end;
++            double v_m   = seg->v_target;
++            double a_max = fmax(seg->acc, 1e-9);
++            double d_max = fmax(seg->dec, 1e-9);
++            double S     = seg->total_distance;
++            double J     = (seg->jerk > 1e-15) ? seg->jerk : J_default;
+ 
+-            double d_acc = fabs(v_m * v_m - v_s * v_s) / (2.0 * a);
+-            double d_dec = fabs(v_m * v_m - v_e * v_e) / (2.0 * d);
++            // 安全钳制
++            if (v_m < v_s) v_m = v_s;
++            if (v_m < v_e) v_m = v_e;
++            seg->v_target = v_m;
+ 
+-            double t_acc_d, t_dec_d, t_cru_d;
++            // ---- 步骤 1：计算加速段和减速段的 (tj, ta/td, S) ----
++            double tj_a, ta, S_acc;
++            double tj_d, td, S_dec;
+ 
+-            if (d_acc + d_dec > S) {
+-                double inner = (2.0 * S * a * d + v_s * v_s * d + v_e * v_e * a) / (a + d);
+-                if (inner < 0.0) inner = 0.0;
+-                v_m = sqrt(inner);
+-                seg->v_target = v_m;
+-                t_acc_d = ceil(fabs(v_m - v_s) / a);
+-                t_dec_d = ceil(fabs(v_m - v_e) / d);
+-                t_cru_d = 0.0;
++            compute_acc_profile(v_s, v_m, a_max, J, &tj_a, &ta, &S_acc);
++            compute_dec_profile(v_m, v_e, d_max, J, &tj_d, &td, &S_dec);
++
++            double t_cru;
++
++            // ---- 步骤 2：距离校验 ----
++            if (S_acc + S_dec <= S + 1e-9) {
++                t_cru = (v_m > 1e-12) ? (S - S_acc - S_dec) / v_m : 0.0;
+             } else {
+-                t_acc_d = ceil(fabs(v_m - v_s) / a);
+-                t_dec_d = ceil(fabs(v_m - v_e) / d);
+-                double d_cru = S - d_acc - d_dec;
+-                t_cru_d = (v_m > 1e-6) ? ceil(d_cru / v_m) : 0.0;
++                // 二分查找 v_m_real
++                double lo = fmax(v_s, v_e);
++                double hi = v_m;
++
++                // ---- 防爆熔断：若最低速度仍超距，强制归零并反向传播 ----
++                {
++                    double sa_test, sd_test, dummy1, dummy2;
++                    compute_acc_profile(v_s, lo, a_max, J,
++                                        &dummy1, &dummy2, &sa_test);
++                    compute_dec_profile(lo, v_e, d_max, J,
++                                        &dummy1, &dummy2, &sd_test);
++                    if (sa_test + sd_test > S) {
++                        // 前瞻给死局，触发熔断
++                        v_s = 0.0; v_e = 0.0; lo = 0.0;
++                        seg->v_start = 0.0; seg->v_end = 0.0;
++
++                        // 反向传播：修改前驱段 v_end 以保持速度连续性
++                        // 仅修改尚未释放的前驱段
++                        if (curr != plan_tail) {
++                            int prev_idx = (curr - 1 + QUEUE_SIZE) % QUEUE_SIZE;
++                            TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev_idx];
++                            if (atomic_load_explicit(&s_prev->is_ready,
++                                                     memory_order_acquire) == 0) {
++                                s_prev->v_end = 0.0;
++                            }
++                        }
++                    }
++                }
++
++                for (int iter = 0; iter < SCURVE_BISECT_ITERS; iter++) {
++                    double mid = 0.5 * (lo + hi);
++                    double sa, sd, d1, d2;
++                    compute_acc_profile(v_s, mid, a_max, J, &d1, &d2, &sa);
++                    compute_dec_profile(mid, v_e, d_max, J, &d1, &d2, &sd);
++                    if (sa + sd > S) hi = mid; else lo = mid;
++                }
++
++                v_m = lo;
++                seg->v_target = v_m;
++                compute_acc_profile(v_s, v_m, a_max, J, &tj_a, &ta, &S_acc);
++                compute_dec_profile(v_m, v_e, d_max, J, &tj_d, &td, &S_dec);
++                t_cru = 0.0;
+             }
+ 
+-            double t_total_d = t_acc_d + t_dec_d + t_cru_d;
+-
+-            // 拦截 NaN / Inf 数学异常，或 t_total 溢出 int32_t
+-            // 溢出说明动力学参数极其荒谬（耗时超 24 天），直接废弃
+-            if (isnan(t_total_d) || isinf(t_total_d) || t_total_d > (double)INT32_MAX) {
+-                seg->t_acc   = 0;
+-                seg->t_dec   = 0;
+-                seg->t_cru   = 0;
+-                seg->t_total = 1;
++            if (t_cru < 0.0) t_cru = 0.0;
++
++            // ---- 步骤 3：预计算 7 段入口状态 ----
++            // 各段持续时间
++            double dt1 = tj_a;       // T1: 加加速
++            double dt2 = ta;         // T2: 匀加速
++            double dt3 = tj_a;       // T3: 减加速 (=T1, 对称)
++            double dt4 = t_cru;      // T4: 匀速
++            double dt5 = tj_d;       // T5: 加减速
++            double dt6 = td;         // T6: 匀减速
++            double dt7 = tj_d;       // T7: 减减速 (=T5, 对称)
++
++            // 累计时间节点
++            seg->T1 = dt1;
++            seg->T2 = seg->T1 + dt2;
++            seg->T3 = seg->T2 + dt3;
++            seg->T4 = seg->T3 + dt4;
++            seg->T5 = seg->T4 + dt5;
++            seg->T6 = seg->T5 + dt6;
++            seg->T7 = seg->T6 + dt7;
++            seg->T_total = seg->T7;
++
++            // 各段控制量
++            double jrk_a = (dt1 > 1e-12) ? J : 0.0;
++            double jrk_d = (dt5 > 1e-12) ? J : 0.0;
++            double a_peak = jrk_a * dt1;   // T1 结束时的加速度峰值
++            double d_peak = jrk_d * dt5;   // T5 结束时的减速度峰值
++            seg->j1 =  jrk_a;              // T1: jerk > 0
++            seg->a2 =  a_peak;             // T2: 恒定加速度 = a_peak
++            seg->j3 = -jrk_a;              // T3: jerk < 0（加速度下降）
++            seg->j5 = -jrk_d;              // T5: jerk < 0（减速度上升）
++            seg->a6 = -d_peak;             // T6: 恒定减速度 = -d_peak
++            seg->j7 =  jrk_d;              // T7: jerk > 0（减速度下降）
++
++            // 各段入口速度
++            seg->v0 = v_s;
++            seg->v1 = v_s + 0.5 * jrk_a * dt1 * dt1;
++            seg->v2 = seg->v1 + a_peak * dt2;
++            seg->v3 = v_m;                              // = seg->v2 + 0.5*jrk_a*dt3^2
++            seg->v4 = v_m;                              // 匀速不变
++            seg->v5 = v_m - 0.5 * jrk_d * dt5 * dt5;
++            seg->v6 = seg->v5 - d_peak * dt6;
++            // v7 = v_e（不存，由 v6 + 0.5*j7*dt7^2 推出）
++
++            // 各段入口位移（解析积分）
++            // T1: s = v0*t + j1*t^3/6     T2: s = v1*t + a2*t^2/2
++            // T3: s = v2*t + j3*t^3/6      T4: s = v3*t (匀速)
++            // T5: s = v4*t + j5*t^3/6      T6: s = v5*t + a6*t^2/2
++            // T7: s = v6*t + j7*t^3/6
++            seg->s0 = 0.0;
++            seg->s1 = seg->s0 + seg->v0*dt1 + seg->j1*dt1*dt1*dt1/6.0;
++            seg->s2 = seg->s1 + seg->v1*dt2 + 0.5*seg->a2*dt2*dt2;
++            seg->s3 = seg->s2 + seg->v2*dt3 + seg->j3*dt3*dt3*dt3/6.0;
++            seg->s4 = seg->s3 + seg->v3*dt4;
++            seg->s5 = seg->s4 + seg->v4*dt5 + seg->j5*dt5*dt5*dt5/6.0;
++            seg->s6 = seg->s5 + seg->v5*dt6 + 0.5*seg->a6*dt6*dt6;
++
++            // NaN / Inf 熔断（总时长上限 30s）
++            if (isnan(seg->T_total) || isinf(seg->T_total)
++                || seg->T_total <= 0.0 || seg->T_total > 30000.0) {
++                seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
++                seg->T5=0; seg->T6=0; seg->T7=0;
++                seg->T_total = 1.0;
++                seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
++                seg->v4=0; seg->v5=0; seg->v6=0;
++                seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
++                seg->s4=0; seg->s5=0; seg->s6=0;
++                seg->j1=0; seg->a2=0; seg->j3=0;
++                seg->j5=0; seg->a6=0; seg->j7=0;
+                 seg->total_distance = 0.0;
+                 seg->v_target = 0.0;
+-                seg->acc = 0.0;
+-                seg->dec = 0.0;
+-                curr = (curr + 1) % QUEUE_SIZE;
+-                continue;
+             }
+ 
+-            seg->t_acc   = (int32_t)t_acc_d;
+-            seg->t_dec   = (int32_t)t_dec_d;
+-            seg->t_cru   = (int32_t)t_cru_d;
+-            seg->t_total = (int32_t)t_total_d;
+-            if (seg->t_total <= 0) seg->t_total = 1;
+-
+             curr = (curr + 1) % QUEUE_SIZE;
+         }
+     }
+ 
+     // ================================================================
+-    // 4. 释放标志（release 语义确保上方所有写入对 RT 线程可见）
++    // 4. 释放标志
+     // ================================================================
+     if (force_flush || plan_count < 3) {
+         int mark_curr = plan_tail;
+         while (mark_curr != head) {
+-            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready, 1, memory_order_release);
++            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready,
++                                  1, memory_order_release);
+             mark_curr = (mark_curr + 1) % QUEUE_SIZE;
+         }
+     } else {
+         int safe_release_head = (head - 2 + QUEUE_SIZE) % QUEUE_SIZE;
+-        // 如果最后一段是 M 代码，它要求停顿执行，前驱段无需保留做速度平滑
+-        if (g_cmd_queue.buffer[(head - 1 + QUEUE_SIZE) % QUEUE_SIZE].cmd_type == CMD_TYPE_MCODE) {
++        if (g_cmd_queue.buffer[(head - 1 + QUEUE_SIZE) % QUEUE_SIZE].cmd_type
++            == CMD_TYPE_MCODE) {
+             safe_release_head = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+         }
+         int mark_curr = plan_tail;
+         while (mark_curr != safe_release_head) {
+-            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready, 1, memory_order_release);
++            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready,
++                                  1, memory_order_release);
+             mark_curr = (mark_curr + 1) % QUEUE_SIZE;
+         }
+     }
+
+--- 工作区 (Unstaged) 修改 ---
+diff --git a/src/ecat_core.c b/src/ecat_core.c
+index 46dfea0..3b6792f 100644
+--- a/src/ecat_core.c
++++ b/src/ecat_core.c
+@@ -235,9 +235,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
+                           + 0.5*g_interpolator.a2*dt*dt;
+                     }
+                     else if (t <= _T3) {
+-                        // T3: 减加速段  s = s2 + v2*dt + j3*dt^3/6
++                        // T3: 减加速段  s = s2 + v2*dt + 0.5*a2*dt^2 + j3*dt^3/6
+                         double dt = t - _T2;
+                         s = g_interpolator.s2 + g_interpolator.v2*dt
++                          + 0.5*g_interpolator.a2*dt*dt
+                           + g_interpolator.j3*dt*dt*dt/6.0;
+                     }
+                     else if (t <= _T4) {
+@@ -258,9 +259,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
+                           + 0.5*g_interpolator.a6*dt*dt;
+                     }
+                     else {
+-                        // T7: 减减速段  s = s6 + v6*dt + j7*dt^3/6
++                        // T7: 减减速段  s = s6 + v6*dt + 0.5*a6*dt^2 + j7*dt^3/6
+                         double dt = t - _T6;
+                         s = g_interpolator.s6 + g_interpolator.v6*dt
++                          + 0.5*g_interpolator.a6*dt*dt
+                           + g_interpolator.j7*dt*dt*dt/6.0;
+                     }
+ 
+diff --git a/src/planner.c b/src/planner.c
+index 6618548..fb59a2f 100644
+--- a/src/planner.c
++++ b/src/planner.c
+@@ -224,8 +224,7 @@ void planner_recalculate(int force_flush)
+         }
+ 
+         // ---- 2. 正向扫描 ----
+-        curr = safe_tail;
+-        g_cmd_queue.buffer[curr].v_start = g_cmd_queue.buffer[plan_tail].v_end;
++        curr = plan_tail;
+ 
+         while (curr != (head - 1 + QUEUE_SIZE) % QUEUE_SIZE) {
+             TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
+@@ -441,7 +440,7 @@ void planner_recalculate(int force_flush)
+             seg->s0 = 0.0;
+             seg->s1 = seg->s0 + seg->v0*dt1 + seg->j1*dt1*dt1*dt1/6.0;
+             seg->s2 = seg->s1 + seg->v1*dt2 + 0.5*seg->a2*dt2*dt2;
+-            seg->s3 = seg->s2 + seg->v2*dt3 + seg->j3*dt3*dt3*dt3/6.0;
++            seg->s3 = seg->s2 + seg->v2*dt3 + 0.5*seg->a2*dt3*dt3 + seg->j3*dt3*dt3*dt3/6.0;
+             seg->s4 = seg->s3 + seg->v3*dt4;
+             seg->s5 = seg->s4 + seg->v4*dt5 + seg->j5*dt5*dt5*dt5/6.0;
+             seg->s6 = seg->s5 + seg->v5*dt6 + 0.5*seg->a6*dt6*dt6;
+
+【涉及的完整文件源码 (上帝视角上下文)】:
+
+========================================
+--- 完整文件上下文: inc/axis_cfg.h ---
+========================================
+#ifndef AXIS_CFG_H
+#define AXIS_CFG_H
+
+#include <stdint.h>
+#include <string.h>
+#include <stdatomic.h>
+typedef int32_t int32;
+typedef uint16_t uint16;
+/************************ 核心宏定义 ************************/
+#define AXIS_NUM         5      // 五轴核心宏！改此值可灵活增减轴数
+#define EC_TIMEOUTMON    500     // SOEM超时时间
+#define NSEC_PER_SEC     1000000000
+#define CYCLE_TIME_NS    1000000  // 1ms实时周期，五轴共用
+
+/************************ CiA402 控制字（台达B3-E标准） ************************/
+#define CW_FAULT_RESET   0x0080
+#define CW_SHUTDOWN      0x0006
+#define CW_SWITCH_ON     0x0007
+#define CW_ENABLE_OP     0x000F
+#define CW_PP_TRIGGER    0x001F   // bit4上升沿触发
+#define CW_CSP_ENABLE    0x004F 
+
+/************************ CiA402 状态字（掩码+标准状态） ************************/
+#define SW_MASK          0x006F   // CiA402状态字有效位掩码
+#define SW_FAULT_CLEAR   0x0000   // 故障位(bit3)清零
+#define SW_SHUTDOWN_RDY  0x0021   // 关机就绪
+#define SW_SWITCHED_ON   0x0023   // 伺服上电完成
+#define SW_OP_ENABLED    0x0027   // 操作使能就绪
+#define SW_TARGET_REACH  0x0400   // 目标位置到达
+
+/************************ PDO 字节偏移（台达B3-E标准，所有轴统一） ************************/
+#define PDO_CW_BYTE0     0
+#define PDO_CW_BYTE1     1
+#define PDO_POS_BYTE0    2
+#define PDO_POS_BYTE1    3
+#define PDO_POS_BYTE2    4
+#define PDO_POS_BYTE3    5
+#define PDO_SW_BYTE0     0
+#define PDO_SW_BYTE1     1
+#define PDO_FOLLOW_BYTE0 6   // 0x60F4 跟随误差（32位，小端）
+#define PDO_FOLLOW_BYTE1 7
+#define PDO_FOLLOW_BYTE2 8
+#define PDO_FOLLOW_BYTE3 9
+
+// 补全所有未定义的对象字典标识符
+#define OD6060_MODE_OF_OPERATION 0x6060  // 操作模式
+#define OD607A_TARGET_POSITION   0x607A  // 目标位置（32位有符号）
+#define OD6081_MAX_SPEED         0x6081  // 最大速度（32位无符号）
+#define OD6083_ACCELERATION      0x6083  // 加速时间（32位无符号）
+#define OD6084_DECELERATION      0x6084  // 减速时间（32位无符号）
+#define OD6040_CONTROL_WORD      0x6040  // 控制字（备用）
+#define OD6041_STATUS_WORD       0x6041  // 状态字（备用）
+#define OD60FF_TARGET_SPEED      0x60FF  // 目标速度（32位有符号）
+
+
+// 状态字位掩码
+#define SW_READY_FUNC_START  0x0001  // bit0：准备功能启动
+#define SW_SERVO_READY       0x0002  // bit1：伺服准备完成
+#define SW_SERVO_ENABLE      0x0004  // bit2：伺服使能
+#define SW_ERROR             0x0008  // bit3：异常信号
+#define SW_MAIN_POWER_ON     0x0010  // bit4：入力侧供电
+#define SW_EMERGENCY_STOP    0x0020  // bit5：紧急停止
+#define SW_READY_FUNC_OFF    0x0040  // bit6：准备功能关闭
+#define SW_WARNING           0x0080  // bit7：警告信号
+#define SW_REMOTE_CTRL       0x0200  // bit9：远程控制
+#define SW_TARGET_REACH      0x0400  // bit10：目标到达
+
+// 核心状态组合宏（便于上层判断）
+#define SW_IS_NORMAL         ((SW_ERROR == 0) && (SW_EMERGENCY_STOP == 0)) // 无异常无急停
+#define SW_IS_ENABLED        (SW_SERVO_ENABLE == 1)                        // 伺服使能
+#define SW_IS_TARGET_REACH   (SW_TARGET_REACH == 1)                        // 目标到达
+
+// ========== CSP模式相关宏 ==========
+// CiA402模式值
+#define CSP_MODE           0x08    // CSP模式（循环同步位置）
+#define PP_MODE            0x01    // PP模式（点位，原有）
+
+// CSP轨迹生成参数
+#define CSP_AMPLITUDE      10000   // 轨迹幅值（脉冲）
+#define CSP_FREQUENCY      1.0f    // 轨迹频率（Hz）
+#define CSP_OFFSET         0       // 轨迹偏移（脉冲）
+
+//#define LOGICAL_AXIS_NUM 5
+#define AXIS_X 0
+#define AXIS_Y 1
+#define AXIS_Z 2
+#define AXIS_A 3
+#define AXIS_B 4
+#define AXIS_ALL -1
+
+#define MAX_SLAVES_PER_AXIS 2
+#define MIN_FEED_SPEED  0.5   // 合成速度下限（mm/s），低于此值钳制
+#define MIN_FEED_ACC   10.0   // 合成加速度下限（mm/s^2），防止龟速蠕动
+#define MIN_FEED_DEC   10.0   // 合成减速度下限（mm/s^2）
+#define QUEUE_SIZE 1024 // 命令队列大小
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#define DEG_TO_RAD (M_PI / 180.0)
+
+/************************ 命令类型宏 ************************/
+#define CMD_TYPE_MOTION  0   // 运动段（G00/G01/G02/G03）
+#define CMD_TYPE_MCODE   1   // M代码段（辅助功能）
+
+#define MCODE_WAIT_TIMEOUT_MS  5000  // M代码等待绝对超时（ms），防止队列死锁
+
+/************************ 跟随误差监控参数 ************************/
+#define FOLLOW_ERR_MAX_PULSE     5000   // 跟随误差硬限（脉冲），超过立即停机
+#define FOLLOW_ERR_WARN_PULSE    3000   // 跟随误差警告阈值（脉冲）
+#define FOLLOW_ERR_WARN_TIME_MS  200    // 警告阈值持续时长（ms），超过则停机
+
+/************************ 实时线程环形日志缓冲 ************************/
+#define RT_LOG_BUF_SIZE  64
+#define RT_LOG_MSG_LEN   128
+
+typedef struct {
+    char buffer[RT_LOG_BUF_SIZE][RT_LOG_MSG_LEN];
+    volatile int head;
+    volatile int tail;
+} RtLog_t;
+
+
+/************************ 轴参数结构体（单轴所有参数独立封装） ************************/
+// 每个轴的独立配置/状态，五轴通过数组管理
+typedef struct {
+    // ① 静态配置（初始化赋值，运行中不变）
+    int slave_id; 
+    int slave_ids[MAX_SLAVES_PER_AXIS];  // 关联的从站ID数组（支持多从站）
+    int slave_count;      // 有效的从站数量（<= MAX_SLAVES_PER_AXIS）
+    char axis_name[16];    // 轴名（例如 "X","Y","Z","A","B"）
+    int32 pp_target_pos;   // PP模式目标位置（脉冲/PUU，32位有符号）
+    int32 csp_base_pos;    // CSP模式的基准位置（用于相对轨迹计算）
+    float csp_speed;       // CSP模式速度，单位为 脉冲/ms（浮点）
+   
+
+
+    // ② 动态状态（运行时实时更新，每个轴独立）
+    int cia_step;          // CiA402状态机步骤（0-6）
+    int cia_step_delay;    // 步骤延时计数器
+    int pp_trigger_sent;   // PP触发标志（0=未触发，1=已触发）
+    int is_op_ready;       // 操作使能就绪（0=否，1=是）
+    int is_target_reach;   // 目标到达（0=否，1=是）
+    int is_error;          // 故障标志（0=无错，1=故障）
+    int state;
+    int is_enabled;
+    int32_t target_pos;    // 目标位置（脉冲），由上层命令或轨迹生成器设置
+    int32_t actual_pos;    // 实际位置（脉冲），从驱动器或编码器反馈
+
+    int32_t home_offset[MAX_SLAVES_PER_AXIS]; // 归零/原点偏移（每个从站）
+    double current_cmd_pos; // 当前命令位置（以工程单位表示，用于UI/控制）
+    double pulse_per_unit; // 脉冲/单位（如 脉冲/mm 或 脉冲/度），用于位置/速度换算
+
+    // ④ 轴动力学参数（由 SMC_ConfigAxisDynamics 配置）
+    int axis_type;        // 0: 线性轴 (Linear), 1: 旋转轴 (Rotary)
+    double max_speed;     // 单轴最大允许速度 (mm/s 或 deg/s)
+    double max_acc;       // 单轴最大允许加速度 (mm/s^2 或 deg/s^2)
+    double max_dec;       // 单轴最大允许减速度 (mm/s^2 或 deg/s^2)
+    double max_jerk;      // 单轴最大加加速度 (mm/s^3 或 deg/s^3)，默认 5000.0
+    double equivalent_radius; // 旋转轴的物理半径，单位: mm (用于弧长换算: mm = deg * (PI/180) * radius)
+
+    // ③  软件限位参数（可选，视驱动器支持情况而定）
+    int enable_soft_limit;   // 软件限位使能（0=否，1=是）
+    double soft_limit_pos;  // 软件限位位置- 正向限位
+    double soft_limit_neg;  // 软件限位位置- 负向限位
+
+    //
+    int enable_sync_alarm;    // 同步报警使能（0=否，1=是）
+    int32_t sync_tolerance_pulse; // 同步容差（脉冲），用于判断同步异常
+    int32_t sync_max_err_pulse;   // 同步最大误差（脉冲），超过则判定为同步故障
+    int sync_err_time_ms;       // 同步误差持续时间（ms），超过则判定为同步故障
+    int _current_sync_timer;    // 同步误差计时器（ms），用于跟踪同步异常持续时间
+
+    int32_t _follow_err_timer;  // 跟随误差警告持续时间计时器（ms）
+    
+} AxisCtrl_t;
+
+/************************ 规划器全局参数 ************************/
+typedef struct {
+    double corner_tolerance;      // G64 拐角容差 (mm)
+    double max_centripetal_acc;   // G64 最大向心加速度 (mm/s^2)
+} PlannerConfig_t;
+
+extern PlannerConfig_t g_planner_config;
+
+
+typedef enum{
+    HOLD_NORMAL=0,
+    HOLD_BRAKING,
+    HOLD_PAUSED,
+    HOLD_RESUMING //
+
+}FeedHoldState_t;
+
+typedef struct{
+    _Atomic int is_moving;
+
+    double start_pos[AXIS_NUM];
+    double target_pos[AXIS_NUM];
+    double dir_vec[AXIS_NUM];
+
+    double current_pos[AXIS_NUM];
+    double v_max,v_start,v_end;
+
+    double virtual_time_ms;
+    double time_scale;
+    FeedHoldState_t hold_state;
+    int pause_request;
+    _Atomic int alarm_reset_request;
+
+    double total_distance;
+
+    // ---- 7段式 S 曲线绝对解析参数（由 planner 预计算，RT 线程只读）----
+    // T[n] = 第 n 阶段结束时的累计虚拟时间（ms），T7 = 总时长
+    double T1, T2, T3, T4, T5, T6, T7;
+    // v[n] = 第 n 阶段入口处的瞬时速度（mm/ms）
+    double v0, v1, v2, v3, v4, v5, v6;
+    // s[n] = 第 n 阶段入口处的累计位移（mm）
+    double s0, s1, s2, s3, s4, s5, s6;
+    // 各阶段控制量：j=jerk(mm/ms^3), a=加速度(mm/ms^2)
+    double j1, a2, j3, j5, a6, j7;
+
+    double v_target;
+    double acc;
+    double dec;
+
+    int is_waiting_mcode;       // M代码等待屏障标志
+    int32_t mcode_wait_timer;   // M代码非阻塞延时计数器（ms）
+    int current_mcode;          // 当前等待中的M代码编号
+
+}Interpolator_t;
+
+/*
+ * Interpolator_t 字段说明（绝对解析式 S 曲线版）
+ * RT 线程通过 virtual_time_ms 与 T1~T7 比较确定当前阶段，
+ * 使用预计算的 v[n]/s[n]/控制量 进行无状态绝对解析求 s。
+ * T1=加加速结束, T2=匀加速结束, T3=减加速结束, T4=匀速结束,
+ * T5=加减速结束, T6=匀减速结束, T7=减减速结束=总时长。
+ */
+
+typedef struct{
+    double target_pos[AXIS_NUM];
+    _Atomic int is_ready;
+    int32_t speed;
+
+    int cmd_type;       // CMD_TYPE_MOTION 或 CMD_TYPE_MCODE
+    int m_code;         // M代码编号（如 3=M03, 5=M05）
+    double s_value;     // S值（如主轴转速）
+
+    double total_distance;
+    double dir_vec[AXIS_NUM];
+    //double dir_x,dir_y,dir_z; // 运动方向单位向量
+    
+    double v_max;
+    double v_start;
+    double v_end;
+
+    // ---- 7段式 S 曲线绝对解析参数（由 planner 预计算）----
+    double T1, T2, T3, T4, T5, T6, T7;
+    double v0, v1, v2, v3, v4, v5, v6;
+    double s0, s1, s2, s3, s4, s5, s6;
+    double j1, a2, j3, j5, a6, j7;
+    double T_total;  // = T7，总时长（ms）
+
+    double v_target;
+    double acc;
+    double dec;
+    double jerk;
+}TrajectorySegment_t;
+
+
+/* CommandQueue_t 说明:
+ * - buffer: 轨迹段环形缓冲
+ * - head: 下一个可读位置索引
+ * - tail: 下一个可写位置索引
+ */
+
+typedef struct{
+    TrajectorySegment_t buffer[QUEUE_SIZE];
+    volatile int head;
+    volatile int tail;
+    
+}CommandQueue_t;
+
+typedef enum{
+
+    COORD_G53=0, 
+    COORD_G54=1,
+    COORD_G55=2,
+    COORD_G56=3,
+    COORD_G57=4,
+    COORD_G58=5,
+    COORD_G59=6,
+
+}CoordSystem_t;
+
+typedef struct{
+
+    CoordSystem_t current_coord;   // 当前坐标系
+    double work_offsets[6][AXIS_NUM]; // 各坐标系的工件坐标偏移（mm或度），例如 word_offsets[1] 就是 G54 的偏移
+    double current_g53_pos[AXIS_NUM]; // 当前G53坐标位置（机床坐标），实时更新用于UI显示和坐标转换
+    double current_logical_pos[AXIS_NUM];// 当前逻辑坐标位置（相对于当前坐标系），实时更新用于UI显示和控制
+
+}CoordManager_t;
+
+#endif // AXIS_CFG_H
+
+
+
+========================================
+--- 完整文件上下文: inc/gcode_parser.h ---
+========================================
+#ifndef GCODE_PARSER_H
+#define GCODE_PARSER_H
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include "soem/soem.h"
+#include "axis_cfg.h"
+
+#define RAPID_SPEED_MM_MIN 3000.0 // G00 快速移动速度（mm/min），可根据需要调整
+#define DEFAULT_ACC  100.0   // 默认加速度（mm/s^2）
+#define DEFAULT_DEC  100.0   // 默认减速度（mm/s^2）
+#define DEFAULT_JERK 5000.0  // 默认加加速度（mm/s^3）
+
+typedef struct {
+    double current_pos[AXIS_NUM];
+
+    double feedrate_mm_min; // 当前进给速度（mm/min）
+    int is_absolute;       // 是否为绝对坐标模式（G90）1=G90，0=G91
+    int active_plane;      // 当前工作平面: 17=XY(默认), 18=ZX, 19=YZ
+} GCodeState_t;
+
+typedef struct{
+    char filepath[256];
+    int is_running;
+    int is_paused;
+    int abort_request;
+}ParserControl_t;
+
+// Function declarations for G-code parsing
+int parse_gcode_line(const char *gcode_line);
+const char* skip_spaces(const char* str);
+OSAL_THREAD_FUNC parser_thread_func(void *arg);
+int  generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
+                             double offset_1st, double offset_2nd,
+                             int is_CW,double feedrate_mm_min);
+#endif // GCODE_PARSER_H
+
+
+========================================
+--- 完整文件上下文: inc/global_def.h ---
+========================================
+#ifndef GLOBAL_DEF_H
+#define GLOBAL_DEF_H
+
+#include "soem/soem.h"
+#include "axis_cfg.h"
+#include "gcode_parser.h"
+#include <pthread.h>
+/************************ SOEM全局核心变量（b3_drive原有） ************************/
+extern ecx_contextt ctx;                // SOEM主站上下文
+extern uint8 IOmap[4096];               // PDO映射缓冲区（所有轴共用）
+extern OSAL_THREAD_HANDLE thread_rt;    // 实时线程句柄
+extern OSAL_THREAD_HANDLE thread_chk;   // 故障检查线程句柄
+extern OSAL_THREAD_HANDLE thread_parser; // G-code解析线程句柄
+
+extern int expectedWKC;                 // SOEM期望WKC值
+extern int wkc;                         // 实际WKC值
+extern int mappingdone;
+extern volatile int dorun;
+extern int inOP;
+extern int dowkccheck, currentgroup;    // SOEM故障检查标志
+
+/************************ 实时控制全局变量 ************************/
+extern int cycle;                       // 实时周期计数
+extern int64 cycletime;                 // 实时周期（1ms）
+extern int64 syncoffset, timeerror;     // DC同步参数
+extern float pgain, igain;              // DC同步PI参数
+extern int64_t g_cycle;
+extern int g_all_axis_enabled; 
+extern int64 ec_DCtime;                 // SOEM 提供的全局变量，单位 ns
+/************************ 五轴全局核心变量 ************************/
+extern AxisCtrl_t g_axis[AXIS_NUM];     // 五轴控制数组（核心！）
+extern int g_all_axis_op_ready;         // 全局标志：五轴均使能就绪
+extern int g_all_axis_reach;            // 全局标志：五轴均目标到达
+extern int g_csp_ready; 
+extern Interpolator_t g_interpolator;   // 插补器状态结构体
+extern CommandQueue_t g_cmd_queue;      // 运动命令队列
+extern GCodeState_t g_state;             // 全局G-code状态变量
+extern ParserControl_t g_parser_ctrl;     // 全局G-code解析控制变量
+extern double g_pulse_per_unit[AXIS_NUM]; // 每轴脉冲/单位（如mm）转换系数
+extern CoordManager_t g_coord_mgr; // 坐标系管理器
+extern RtLog_t g_rt_log;           // 实时线程环形日志缓冲
+extern PlannerConfig_t g_planner_config; // 规划器全局参数
+extern pthread_mutex_t planner_mutex;    // 规划器互斥锁（parser线程 vs 看门狗线程）
+extern _Atomic int g_sys_alarm_state;    // 系统报警状态: 0=正常, 1=软停机报警中
+
+#endif // GLOBAL_DEF_H
+
+
+
+========================================
+--- 完整文件上下文: src/axis_ctrl.c ---
+========================================
+#include "axis_ctrl.h"
+#include "global_def.h"
+#include "soem/soem.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include "planner.h"
+#include "gcode_parser.h"
+/************************ 全局变量定义（仅轴相关，其余在ecat_core.c） ************************/
+AxisCtrl_t g_axis[AXIS_NUM];            // 五轴核心数组，全局唯一定义
+int g_all_axis_op_ready = 0;            // 五轴均使能就绪标志
+int g_all_axis_reach = 0;               // 五轴均目标到达标志
+Interpolator_t g_interpolator={0};
+CommandQueue_t g_cmd_queue={0};
+static double plan_cursor[AXIS_NUM]={0};
+CoordManager_t g_coord_mgr={COORD_G54,{0},{0},{0}};
+PlannerConfig_t g_planner_config={0.05, 500.0};
+pthread_mutex_t planner_mutex;
+/************************ 五轴系统初始化（核心配置，修改此函数即可调整轴参数） ************************/
+static int check_soft_limits(double target_pos[AXIS_NUM]){
+    for(int i=0;i<AXIS_NUM;i++){
+        if(g_axis[i].enable_soft_limit){
+            if(target_pos[i]>g_axis[i].soft_limit_pos||target_pos[i]<g_axis[i].soft_limit_neg){
+                printf("[软限位] %s 目标位置%.2f 超出范围 [%.2f, %.2f]\n",
+                       g_axis[i].axis_name, target_pos[i],
+                       g_axis[i].soft_limit_neg, g_axis[i].soft_limit_pos);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+void api_sync_planner_cursor(){
+    for(int i=0;i<AXIS_NUM;i++){
+        plan_cursor[i]=g_axis[i].current_cmd_pos;
+    }
+}
+
+double api_get_cursor(int axis_idx){
+
+    return plan_cursor[axis_idx];
+    
+}
+
+
+void wait_motion_done(){
+    while(g_interpolator.is_moving) osal_usleep(10000);
+}
+
+void api_set_zero(int axis_idx){
+
+    if(g_coord_mgr.current_coord==COORD_G53){
+        printf("[API] G53坐标系不允许设置零点！\n");
+        return;
+    }
+
+    int coord_idx=g_coord_mgr.current_coord-1; // G54对应0，G55对应1，以此类推
+    for(int i=0;i<AXIS_NUM;i++){
+        if(axis_idx==AXIS_ALL||axis_idx==i){
+            g_coord_mgr.work_offsets[coord_idx][i]=g_coord_mgr.current_g53_pos[i];
+
+            g_coord_mgr.current_logical_pos[i]=0.0; // 设置当前逻辑坐标为0
+            plan_cursor[i]=0.0; // 同步规划器光标
+        }
+    }
+    printf("[API] 已设置 %s 坐标系零点，当前G53位置 (%.3f, %.3f, %.3f)\n", 
+            (g_coord_mgr.current_coord==COORD_G54)?"G54":"G55",
+            g_coord_mgr.current_g53_pos[0], g_coord_mgr.current_g53_pos[1], g_coord_mgr.current_g53_pos[2]);
+}
+
+
+void api_go_zero(int axis_idx,double speed){
+    double t_pos[AXIS_NUM];
+    for(int i=0;i<AXIS_NUM;i++){
+        t_pos[i]=plan_cursor[i];
+    }
+    //double tx=plan_cursor_x;
+    //double ty=plan_cursor_y;
+    //double tz=plan_cursor_z;
+
+    if(axis_idx==AXIS_ALL){
+        for(int i=0;i<AXIS_NUM;i++){
+            t_pos[i]=0.0;
+        }
+    }else if(axis_idx>=0.0&&axis_idx<AXIS_NUM){
+        t_pos[axis_idx]=0.0;
+    }
+
+    api_push_trajectory(t_pos,speed,DEFAULT_ACC,DEFAULT_DEC);
+}
+
+
+
+void api_move_relative(int axis_idx,double distance,double speed){
+    double t_pos[AXIS_NUM];
+    for(int i=0;i<AXIS_NUM;i++){
+        t_pos[i]=plan_cursor[i];
+    }
+
+    if(axis_idx==AXIS_ALL){
+        for(int i=0;i<AXIS_NUM;i++){
+            t_pos[i]+=distance;
+        }
+    }else if(axis_idx>=0&&axis_idx<AXIS_NUM){
+        t_pos[axis_idx]+=distance;
+    }
+
+    api_push_trajectory(t_pos,speed,DEFAULT_ACC,DEFAULT_DEC);
+}
+
+
+int api_push_trajectory(double target_pos[AXIS_NUM],
+                         double speed_sec_mm, double acc_sec_mm, double dec_sec_mm)
+{
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
+        printf("[SAFETY] 系统报警中，拒绝入队运动指令！\n");
+        return -1;
+    }
+    if(!g_all_axis_op_ready) return -1;
+    if(!check_soft_limits(target_pos)) return -1;
+
+    // 拦截负速度/零速度：进给速度是标量，非正数属于上层逻辑错误
+    if(speed_sec_mm <= 0.0) {
+        printf("[SAFETY] 进给速度 %.3f mm/s 非正数，拒绝执行！\n", speed_sec_mm);
+        return -1;
+    }
+
+    // ---- 第一步：计算原始偏差（mm 或 deg）----
+    double delta_raw[AXIS_NUM];
+    for(int i=0;i<AXIS_NUM;i++){
+        delta_raw[i]=target_pos[i]-plan_cursor[i];
+    }
+
+    // Pre-check: 拦截未配置动力学的轴（max_speed==0 表示未初始化）
+    for(int i=0;i<AXIS_NUM;i++){
+        if(fabs(delta_raw[i]) > 0.0001 && g_axis[i].max_speed <= 0.0) {
+            printf("[SAFETY] %s 轴动力学未配置(max_speed=0)，拒绝执行运动指令！\n",
+                   g_axis[i].axis_name);
+            return -1;
+        }
+    }
+
+    // ---- 第二步：统一量纲 → 等效毫米位移 ----
+    // equivalent_radius: 旋转轴物理半径(mm)
+    // 弧长 = deg × (π/180) × radius → mm
+    double delta_mm[AXIS_NUM];
+    for(int i=0;i<AXIS_NUM;i++){
+        if(g_axis[i].axis_type == 1){
+            if(g_axis[i].equivalent_radius <= 0.0) {
+                printf("[SAFETY] %s 旋转轴等效半径未配置(%.2f)，拒绝执行！\n",
+                       g_axis[i].axis_name, g_axis[i].equivalent_radius);
+                return -1;
+            }
+            delta_mm[i] = delta_raw[i] * DEG_TO_RAD * g_axis[i].equivalent_radius;
+        } else {
+            delta_mm[i] = delta_raw[i];
+        }
+    }
+
+    // ---- 第三步：空间合成距离（纯 mm）----
+    double dist_sq = 0.0;
+    for(int i=0;i<AXIS_NUM;i++){
+        dist_sq += delta_mm[i] * delta_mm[i];
+    }
+    double dist = sqrt(dist_sq);
+    if(dist < 1e-6) dist = 0.0;
+
+    // Wait for queue slot: 报警/急停时 RT 线程停止消费，必须打破死锁
+    int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
+    while (next_head == g_cmd_queue.tail) {
+        if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
+        osal_usleep(1000);
+        next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
+    }
+
+    TrajectorySegment_t *seg = &g_cmd_queue.buffer[g_cmd_queue.head];
+    seg->is_ready = 0;
+    seg->cmd_type = CMD_TYPE_MOTION;
+    seg->m_code = 0;
+    seg->s_value = 0.0;
+    seg->total_distance = dist;
+
+    // ---- 第四步：纯净几何空间方向向量（无量纲）----
+    for(int i=0;i<AXIS_NUM;i++){
+        seg->target_pos[i]=target_pos[i];
+        if(dist > 1e-6){
+            seg->dir_vec[i] = delta_mm[i] / dist;
+        }else{
+            seg->dir_vec[i] = 0;
+        }
+    }
+
+    // ---- 第五步：短板效应限幅（量纲纯净 ratio 缩放）----
+    // axis_ratio_mm = |delta_mm[i]|/dist: 纯空间无量纲投影比
+    // 空间分配速度 req_v_mm = v × axis_ratio_mm (mm/s)
+    // 旋转轴逆解: req_v = req_v_mm / equivalent_radius → deg/s
+    // 线性轴直取: req_v = req_v_mm → mm/s
+    double final_speed_ratio = 1.0;
+    double final_acc_ratio   = 1.0;
+    double final_dec_ratio   = 1.0;
+    double final_jerk_ratio  = 1.0;
+
+    for(int i = 0; i < AXIS_NUM; i++){
+        if(fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
+
+        double axis_ratio_mm = fabs(delta_mm[i]) / dist;
+
+        double req_v_mm = speed_sec_mm * axis_ratio_mm;
+        double req_a_mm = acc_sec_mm   * axis_ratio_mm;
+        double req_d_mm = dec_sec_mm   * axis_ratio_mm;
+        double req_j_mm = DEFAULT_JERK * axis_ratio_mm;
+
+        double req_v, req_a, req_d, req_j;
+        if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
+            double safe_r = fmax(g_axis[i].equivalent_radius, 1e-4);
+            double conv = DEG_TO_RAD * safe_r;
+            req_v = req_v_mm / conv;
+            req_a = req_a_mm / conv;
+            req_d = req_d_mm / conv;
+            req_j = req_j_mm / conv;
+        } else {
+            req_v = req_v_mm;
+            req_a = req_a_mm;
+            req_d = req_d_mm;
+            req_j = req_j_mm;
+        }
+
+        if(g_axis[i].max_speed > 0.0 && req_v > g_axis[i].max_speed){
+            double r = g_axis[i].max_speed / req_v;
+            if(r < final_speed_ratio) final_speed_ratio = r;
+        }
+        if(g_axis[i].max_acc > 0.0 && req_a > g_axis[i].max_acc){
+            double r = g_axis[i].max_acc / req_a;
+            if(r < final_acc_ratio) final_acc_ratio = r;
+        }
+        if(g_axis[i].max_dec > 0.0 && req_d > g_axis[i].max_dec){
+            double r = g_axis[i].max_dec / req_d;
+            if(r < final_dec_ratio) final_dec_ratio = r;
+        }
+        if(g_axis[i].max_jerk > 0.0 && req_j > g_axis[i].max_jerk){
+            double r = g_axis[i].max_jerk / req_j;
+            if(r < final_jerk_ratio) final_jerk_ratio = r;
+        }
+    }
+
+    // 短板限幅：物理防爆墙，限幅后无论多小都必须服从，绝不允许再抬高！
+    speed_sec_mm *= final_speed_ratio;
+    acc_sec_mm   *= final_acc_ratio;
+    dec_sec_mm   *= final_dec_ratio;
+    double jerk_sec_mm = DEFAULT_JERK * final_jerk_ratio;
+
+    // 数学安全下限（限幅之后，仅防除零/NaN；规划器内部有 fmax(x,1e-6) 二次兜底）
+    if(speed_sec_mm < 1e-6) speed_sec_mm = 1e-6;
+    if(acc_sec_mm < 1e-6)   acc_sec_mm   = 1e-6;
+    if(dec_sec_mm < 1e-6)   dec_sec_mm   = 1e-6;
+    if(jerk_sec_mm < 1e-6)  jerk_sec_mm  = 1e-6;
+
+    // 单位转换: mm/s → mm/ms, mm/s^2 → mm/ms^2, mm/s^3 → mm/ms^3
+    seg->v_target = speed_sec_mm / 1000.0;
+    seg->acc = acc_sec_mm / 1000000.0;
+    seg->dec = dec_sec_mm / 1000000.0;
+    seg->jerk = jerk_sec_mm / 1.0e9;
+    seg->v_start = 0.0;
+    seg->v_end = 0.0;
+    seg->v_max = seg->v_target;
+
+    // 7段式 S 曲线绝对解析参数初始化（由 planner_recalculate 填充）
+    seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+    seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
+    seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+    seg->v4=0; seg->v5=0; seg->v6=0;
+    seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+    seg->s4=0; seg->s5=0; seg->s6=0;
+    seg->j1=0; seg->a2=0; seg->j3=0;
+    seg->j5=0; seg->a6=0; seg->j7=0;
+
+    // 所有安全检查通过，方可推进光标
+    for(int i=0;i<AXIS_NUM;i++){
+        plan_cursor[i]=target_pos[i];
+    }
+
+    g_cmd_queue.head = next_head;
+    planner_recalculate(0);
+    return 0;
+}
+
+
+int api_push_mcode(int m_code, double s_value)
+{
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
+        printf("[SAFETY] 系统报警中，拒绝入队M代码指令！\n");
+        return -1;
+    }
+    if(!g_all_axis_op_ready) return -1;
+    int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
+    while (next_head == g_cmd_queue.tail) {
+        if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
+        osal_usleep(1000);
+        next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
+    }
+
+    TrajectorySegment_t *seg = &g_cmd_queue.buffer[g_cmd_queue.head];
+    memset(seg, 0, sizeof(TrajectorySegment_t));
+
+    seg->cmd_type      = CMD_TYPE_MCODE;
+    seg->m_code        = m_code;
+    seg->s_value       = s_value;
+    seg->is_ready      = 0;
+    seg->total_distance = 0.0;
+    seg->v_target      = 0.0;
+    seg->v_start       = 0.0;
+    seg->v_end         = 0.0;
+    seg->acc           = 0.0;
+    seg->dec           = 0.0;
+    seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+    seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
+    seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+    seg->v4=0; seg->v5=0; seg->v6=0;
+    seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+    seg->s4=0; seg->s5=0; seg->s6=0;
+    seg->j1=0; seg->a2=0; seg->j3=0;
+    seg->j5=0; seg->a6=0; seg->j7=0;
+
+    g_cmd_queue.head = next_head;
+    planner_recalculate(0);
+    return 0;
+}
+
+
+int is_trajectory_finished(){
+    if(g_cmd_queue.head==g_cmd_queue.tail
+       && g_interpolator.is_moving==0
+       && g_interpolator.is_waiting_mcode==0){
+        return 1;
+    }
+    return 0;
+}
+
+void api_flush_planner(){
+    pthread_mutex_lock(&planner_mutex);
+    int curr=g_cmd_queue.tail;
+    while(curr!=g_cmd_queue.head){
+        atomic_store_explicit(&g_cmd_queue.buffer[curr].is_ready, 1, memory_order_release);
+        curr=(curr+1)%QUEUE_SIZE;
+    }
+    pthread_mutex_unlock(&planner_mutex);
+}
+
+void api_motion_pause(){
+    g_interpolator.pause_request=1;
+}
+
+void api_motion_resume(){
+    g_interpolator.pause_request=0;
+}
+
+// @Context: Non-RealTime Background Thread (上层管理线程调用)
+// @Thread-Safety: 仅设置 alarm_reset_request 标志，由 RT 线程在 HOLD_PAUSED 安全点消化
+// 安全条件：全部轴使能就绪 + 全部轴跟随误差归零
+// 注意：不再检查队列和插补器状态（这两个检查曾导致死锁和竞态），
+//       实际复位动作由 RT 线程在确认电机刹停(HOLD_PAUSED)后执行
+int api_alarm_reset(void){
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==0){
+        printf("[Alarm] 当前无报警，无需复位\n");
+        return 0;
+    }
+
+    // 防重入：上一次请求尚未被 RT 线程消化，拒绝重复提交
+    if(atomic_load_explicit(&g_interpolator.alarm_reset_request, memory_order_acquire)==1){
+        printf("[Alarm] 上一次复位请求尚未被消化，请勿重复提交\n");
+        return -2;
+    }
+
+    // 提交复位请求，由 RT 线程在安全点(HOLD_PAUSED && op_ready)执行实际状态清理
+    atomic_store_explicit(&g_interpolator.alarm_reset_request, 1, memory_order_release);
+
+    printf("[Alarm] 复位请求已提交，等待 RT 线程在安全点确认...\n");
+    return 0;
+}
+
+void axis_sys_init(void)
+{
+    // 0. 互斥锁初始化（必须在任何线程创建之前）
+    pthread_mutex_init(&planner_mutex, NULL);
+
+    // 1. 轴数据结构初始化
+    memset(g_axis,0,sizeof(g_axis));
+
+    // 2. 插补器和命令队列初始化
+    memset(&g_interpolator,0,sizeof(Interpolator_t));
+    memset(&g_cmd_queue,0,sizeof(CommandQueue_t));
+
+
+    // 3. 规划器光标初始化
+    for(int i=0;i<AXIS_NUM;i++){
+        plan_cursor[i]=0.0;
+    }
+
+    // 4. 全局状态标志初始化
+    g_all_axis_op_ready=0;
+    g_all_axis_reach=0;
+
+    for(int i=0;i<AXIS_NUM;i++){
+        g_axis[i].pulse_per_unit=10000.0; // 默认10000脉冲/单位
+        // 动力学安全默认值：防止未配置时零速死锁或无限速飞车
+        g_axis[i].max_speed = 200.0;  // mm/s
+        g_axis[i].max_acc   = 200.0;  // mm/s^2
+        g_axis[i].max_dec   = 200.0;  // mm/s^2
+        g_axis[i].max_jerk  = 5000.0; // mm/s^3
+        // 旋转轴等效半径默认值：用户须通过 SMC_ConfigAxisDynamics 覆盖
+        g_axis[i].equivalent_radius = 0.0; // 0.0 表示未配置，退化回原始行为
+    }
+
+    // 5.
+    g_interpolator.virtual_time_ms=0.0;
+    g_interpolator.time_scale=1.0;
+    g_interpolator.hold_state=HOLD_NORMAL;
+    g_interpolator.pause_request=0;
+
+    printf("[系统初始化] 五轴控制系统已初始化，等待SOEM主站配置...\n");
+
+
+
+
+}
+
+/************************ 单轴SDO配置PP模式 ************************/
+void axis_sdo_config_pp(int axis_idx)
+{
+    
+    axis_sdo_config_mode(axis_idx, CSP_MODE);
+    
+    
+    /*if (axis_idx < 0 || axis_idx >= AXIS_NUM)
+    {
+        printf("[SDO错误] 轴索引越界！输入索引：%d，最大索引：%d\n", axis_idx, AXIS_NUM-1);
+        return;
+    }
+    if (g_axis[axis_idx].is_error) return; // 故障轴跳过
+
+    uint8 pp_mode = 0x01; // CiA402 PP模式=1
+    int sz = sizeof(pp_mode);
+    ecx_SDOwrite(&ctx, g_axis[axis_idx].slave_id, 0x6060, 0x00, FALSE, sz, &pp_mode, EC_TIMEOUTRXM);
+    osal_usleep(200000);
+    if (ecx_SDOwrite(&ctx, g_axis[axis_idx].slave_id, 0x6060, 0x00, FALSE, sz, &pp_mode, EC_TIMEOUTRXM) == 0)
+    {
+        printf("[SDO配置] %s PP模式配置成功(0x6060=1)\n", g_axis[axis_idx].axis_name);
+    }
+    else
+    {
+        printf("[SDO错误] %s PP模式配置失败！请检查从站ID和SAFE_OP状态\n", g_axis[axis_idx].axis_name);
+        g_axis[axis_idx].is_error = 1;
+        exit(-1); // 配置失败直接退出，
+    }*/
+
+
+}
+
+void axis_sdo_config_mode(int axis_idx, uint8_t mode)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM)
+    {
+        printf("[SDO错误] 轴索引越界！输入索引：%d，最大索引：%d\n", axis_idx, AXIS_NUM-1);
+        return;
+    }
+    if (g_axis[axis_idx].is_error) return;
+
+    int sz = sizeof(mode);
+    // 1.写入CiA402模式值（0x6060）
+    for(int s=0;s<g_axis[axis_idx].slave_count;s++){
+        int wkc = ecx_SDOwrite(&ctx, g_axis[axis_idx].slave_ids[s], 0x6060, 0x00, FALSE, sz, &mode, EC_TIMEOUTRXM);
+        osal_usleep(200000); 
+
+        //sz=sizeof(g_axis[axis_idx].pp_target_pos);
+        //ecx_SDOwrite(&ctx, g_axis[axis_idx].slave_id, 0x607A, 0x00, FALSE, sz, &g_axis[axis_idx].pp_target_pos, EC_TIMEOUTRXM);
+        //osal_usleep(200000);
+           // 2. 读回当前模式，验证是否配置成功
+    }
+}
+
+// SDO读取函数（读取指定索引/子索引的值）
+uint8_t axis_sdo_read_mode(int axis_idx)
+{
+    uint8_t mode = 0;
+    int sz = sizeof(mode);
+    // 调用SOEM的SDO读函数（ecx_SDOread，与write逻辑对称）
+    int wkc = ecx_SDOread(&ctx, g_axis[axis_idx].slave_id, 0x6060, 0x00, FALSE, &sz, &mode, EC_TIMEOUTRXM);
+    
+    // 即使wkc=0，也返回读取到的mode（可能有效）
+    return mode;
+}
+
+/************************ PDO写（控制字+目标位置） ************************/
+void axis_pdo_write(int slave_id, uint16 cw, int32 pos)
+{
+    // 越界检查
+    if (slave_id <= 0 || slave_id > ctx.slavecount) return;
+
+    // 空指针检查+故障置位
+    uint8 *out = ctx.slavelist[slave_id].outputs;
+    if (!out)
+    {
+        printf("[PDO错误] %s PDO输出缓冲区为空！\n");
+        return;
+    }
+
+    // 写入控制字（2字节，小端）
+    out[PDO_CW_BYTE0] = cw & 0xFF;
+    out[PDO_CW_BYTE1] = (cw >> 8) & 0xFF;
+
+    // 写入目标位置（4字节，小端，台达B3-E标准）
+    out[PDO_POS_BYTE0] = pos & 0xFF;
+    out[PDO_POS_BYTE1] = (pos >> 8) & 0xFF;
+    out[PDO_POS_BYTE2] = (pos >> 16) & 0xFF;
+    out[PDO_POS_BYTE3] = (pos >> 24) & 0xFF;
+}
+
+/************************ 单轴PDO读（状态字） ************************/
+uint16 axis_pdo_read_sw(int slave_id)
+{
+    // 1. 基础校验：索引越界/轴故障/从站ID无效
+    if (slave_id <= 0 || slave_id > ctx.slavecount) return 0xFFFF;
+
+    // 2. 重试获取PDO输入缓冲区（防偶发空指针）
+    uint8 *in = NULL;
+    for (int retry = 0; retry < 2; retry++) {
+        in = ctx.slavelist[slave_id].inputs;
+        if (in) break;
+        osal_usleep(1000); // 1ms重试间隔
+    }
+
+    // 3. 解析状态字（小端序：低字节在前，高字节在后）
+    uint16 sw = (uint16)(in[PDO_SW_BYTE1] << 8 | in[PDO_SW_BYTE0]);
+    return sw;
+}
+
+/************************ 状态位解析函数（上层调用） ************************/
+// 判断某状态位是否为1
+int axis_check_sw_bit(int axis_idx, uint16 bit_mask)
+{
+    uint16 sw = axis_pdo_read_sw(axis_idx);
+    if (sw == 0xFFFF) return -1; // 读取失败
+    return (sw & bit_mask) ? 1 : 0; // 1=位有效，0=位无效
+}
+
+// 打印状态字详细解析（调试用）
+void axis_print_sw_detail(int axis_idx)
+{
+    uint16 sw = axis_pdo_read_sw(axis_idx);
+    if (sw == 0xFFFF) {
+        printf("[状态字解析] %s 读取失败！\n", g_axis[axis_idx].axis_name);
+        return;
+    }
+
+    printf("[状态字解析] %s 完整值：0x%04X\n", g_axis[axis_idx].axis_name, sw);
+    printf("  - 准备功能启动：%s\n", (sw & SW_READY_FUNC_START) ? "是" : "否");
+    printf("  - 伺服准备完成：%s\n", (sw & SW_SERVO_READY) ? "是" : "否");
+    printf("  - 伺服使能：%s\n", (sw & SW_SERVO_ENABLE) ? "是" : "否");
+    printf("  - 异常信号：%s\n", (sw & SW_ERROR) ? "是" : "否");
+    printf("  - 入力侧供电：%s\n", (sw & SW_MAIN_POWER_ON) ? "是" : "否");
+    printf("  - 紧急停止：%s\n", (sw & SW_EMERGENCY_STOP) ? "是" : "否");
+    printf("  - 警告信号：%s\n", (sw & SW_WARNING) ? "是" : "否");
+    printf("  - 远程控制：%s\n", (sw & SW_REMOTE_CTRL) ? "是" : "否");
+    printf("  - 目标到达：%s\n", (sw & SW_TARGET_REACH) ? "是" : "否");
+}
+
+
+/************************ 配置CSP模式所有参数 ************************/
+void axis_config_csp_params(int axis_idx)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
+    
+    int slave_id = g_axis[axis_idx].slave_id;
+    printf("\n========== 配置 %s CSP参数（修正版） ==========\n", g_axis[axis_idx].axis_name);
+    
+    // 1. 最大轮廓速度 (0x607F) - 单位: pulse/s
+    // 使用驱动器实际支持的值（从读回值看，60000是有效的）
+    uint32_t profile_velocity = 60000;  // 60k pulse/s = 60 pulse/ms
+    int wkc = ecx_SDOwrite(&ctx, slave_id, 0x607F, 0x00, FALSE, 4, &profile_velocity, EC_TIMEOUTRXM);
+    osal_usleep(50000);
+    
+    // 读回验证
+    uint32_t read_vel = 0;
+    int sz = sizeof(read_vel);
+    ecx_SDOread(&ctx, slave_id, 0x607F, 0x00, FALSE, &sz, &read_vel, EC_TIMEOUTRXM);
+    printf("0x607F 最大轮廓速度: %d pulse/s\n", read_vel);
+    
+    for(int i=0;i<AXIS_NUM;i++){
+        int32_t actual_pos = 0;
+        sz = sizeof(actual_pos);
+        ecx_SDOread(&ctx, g_axis[i].slave_id, 0x6064, 0x00, FALSE, &sz, &actual_pos, EC_TIMEOUTRXM);
+        g_axis[i].target_pos=actual_pos;
+    }
+    /*// 2. 加速度 (0x6083) - 使用驱动器支持的值
+    uint32_t acceleration = 10000;  // 从读回值看，19264附近是有效的
+    ecx_SDOwrite(&ctx, slave_id, 0x6083, 0x00, FALSE, 4, &acceleration, EC_TIMEOUTRXM);
+    osal_usleep(50000);
+    
+    uint32_t read_acc = 0;
+    ecx_SDOread(&ctx, slave_id, 0x6083, 0x00, FALSE, &sz, &read_acc, EC_TIMEOUTRXM);
+    printf("0x6083 加速度: %d pulse/s²\n", read_acc);
+    
+    // 3. 减速度 (0x6084) - 与加速度相同
+    ecx_SDOwrite(&ctx, slave_id, 0x6084, 0x00, FALSE, 4, &acceleration, EC_TIMEOUTRXM);
+    osal_usleep(50000);
+    
+    uint32_t read_dec = 0;
+    ecx_SDOread(&ctx, slave_id, 0x6084, 0x00, FALSE, &sz, &read_dec, EC_TIMEOUTRXM);
+    printf("0x6084 减速度: %d pulse/s²\n", read_dec);
+     */ 
+    // 4. 软件限位保持不变
+    int32_t min_pos = -1000000;
+    int32_t max_pos = 1000000;
+    ecx_SDOwrite(&ctx, slave_id, 0x607D, 0x01, FALSE, 4, &min_pos, EC_TIMEOUTRXM);
+    osal_usleep(30000);
+    ecx_SDOwrite(&ctx, slave_id, 0x607D, 0x02, FALSE, 4, &max_pos, EC_TIMEOUTRXM);
+    osal_usleep(30000);
+    
+    printf("========== %s CSP参数配置完成 ==========\n\n", g_axis[axis_idx].axis_name);
+}
+
+
+/************************ 读取CSP运行状态 ************************/
+void axis_read_csp_status(int axis_idx)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
+    
+    int slave_id = g_axis[axis_idx].slave_id;
+    
+    // 1. 状态字
+    uint16_t sw = axis_pdo_read_sw(axis_idx);
+    
+    // 2. 当前模式 (0x6061)
+    uint8_t current_mode = 0;
+    int sz = sizeof(current_mode);
+    ecx_SDOread(&ctx, slave_id, 0x6061, 0x00, FALSE, &sz, &current_mode, EC_TIMEOUTRXM);
+    
+    // 3. 实际位置 (0x6064)
+    int32_t actual_pos = 0;
+    sz = sizeof(actual_pos);
+    ecx_SDOread(&ctx, slave_id, 0x6064, 0x00, FALSE, &sz, &actual_pos, EC_TIMEOUTRXM);
+    
+    // 4. 跟随误差 (0x60F4)
+    int32_t following_error = 0;
+    sz = sizeof(following_error);
+    ecx_SDOread(&ctx, slave_id, 0x60F4, 0x00, FALSE, &sz, &following_error, EC_TIMEOUTRXM);
+    
+    // 5. 速度实际值 (0x606C)
+    int32_t actual_vel = 0;
+    sz = sizeof(actual_vel);
+    ecx_SDOread(&ctx, slave_id, 0x606C, 0x00, FALSE, &sz, &actual_vel, EC_TIMEOUTRXM);
+    
+    printf("\n========== %s 运行状态 ==========\n", g_axis[axis_idx].axis_name);
+    printf("状态字: 0x%04X (bit3=%d, bit12=%d)\n", sw, (sw>>3)&1, (sw>>12)&1);
+    printf("当前模式 (0x6061): %d %s\n", current_mode, 
+           (current_mode == 8) ? "(CSP)" : "(其他)");
+    printf("目标位置: %d\n", g_axis[axis_idx].target_pos);
+    printf("实际位置 (0x6064): %d\n", actual_pos);
+    printf("跟随误差 (0x60F4): %d\n", following_error);
+    printf("实际速度 (0x606C): %d pulse/s\n", actual_vel);
+    
+    if(actual_pos != g_axis[axis_idx].target_pos) {
+        printf("⚠️ 实际位置与目标位置不符！差值: %d\n", 
+               g_axis[axis_idx].target_pos - actual_pos);
+    }
+    
+    if(following_error > 1000) {
+        printf("⚠️ 跟随误差过大！\n");
+    }
+    
+    printf("=====================================\n");
+}
+
+void check_pdo_mapping(int axis_idx)
+{
+    int slave_id = g_axis[axis_idx].slave_id;
+    
+    printf("\n========== %s PDO映射检查 ==========\n", g_axis[axis_idx].axis_name);
+    
+    // 检查RxPDO分配 (0x1C12)
+    uint8_t sub_count = 0;
+    int sz = 1;
+    ecx_SDOread(&ctx, slave_id, 0x1C12, 0x00, FALSE, &sz, &sub_count, EC_TIMEOUTRXM);
+    printf("RxPDO分配 (0x1C12) 子索引数: %d\n", sub_count);
+    
+    for(int i = 1; i <= sub_count && i <= 10; i++) {
+        uint16_t pdo_num = 0;
+        sz = 2;
+        ecx_SDOread(&ctx, slave_id, 0x1C12, i, FALSE, &sz, &pdo_num, EC_TIMEOUTRXM);
+        printf("  RxPDO[%d] = 0x%04X\n", i, pdo_num);
+        
+        // 打印RxPDO详细映射
+        if(pdo_num >= 0x1600 && pdo_num <= 0x1603) {
+            uint8_t map_sub = 0;
+            sz = 1;
+            ecx_SDOread(&ctx, slave_id, pdo_num, 0x00, FALSE, &sz, &map_sub, EC_TIMEOUTRXM);
+            printf("    RxPDO 0x%04X 映射对象数: %d\n", pdo_num, map_sub);
+            
+            for(int j = 1; j <= map_sub; j++) {
+                uint32_t mapping = 0;
+                sz = 4;
+                ecx_SDOread(&ctx, slave_id, pdo_num, j, FALSE, &sz, &mapping, EC_TIMEOUTRXM);
+                uint16_t index = (mapping >> 16) & 0xFFFF;
+                uint8_t sub = (mapping >> 8) & 0xFF;
+                uint8_t bits = mapping & 0xFF;
+                printf("      0x%04X:%02X (%d bits)\n", index, sub, bits);
+            }
+        }
+    }
+    
+    // 检查TxPDO分配 (0x1C13) - 关键修改：打印详细映射
+    sz = 1;
+    ecx_SDOread(&ctx, slave_id, 0x1C13, 0x00, FALSE, &sz, &sub_count, EC_TIMEOUTRXM);
+    printf("\nTxPDO分配 (0x1C13) 子索引数: %d\n", sub_count);
+    
+    for(int i = 1; i <= sub_count && i <= 10; i++) {
+        uint16_t pdo_num = 0;
+        sz = 2;
+        ecx_SDOread(&ctx, slave_id, 0x1C13, i, FALSE, &sz, &pdo_num, EC_TIMEOUTRXM);
+        printf("  TxPDO[%d] = 0x%04X\n", i, pdo_num);
+        
+        // ========== 关键修改：打印TxPDO详细映射 ==========
+        if(pdo_num >= 0x1A00 && pdo_num <= 0x1A03) {
+            uint8_t map_sub = 0;
+            sz = 1;
+            ecx_SDOread(&ctx, slave_id, pdo_num, 0x00, FALSE, &sz, &map_sub, EC_TIMEOUTRXM);
+            printf("    TxPDO 0x%04X 映射对象数: %d\n", pdo_num, map_sub);
+            
+            for(int j = 1; j <= map_sub; j++) {
+                uint32_t mapping = 0;
+                sz = 4;
+                ecx_SDOread(&ctx, slave_id, pdo_num, j, FALSE, &sz, &mapping, EC_TIMEOUTRXM);
+                uint16_t index = (mapping >> 16) & 0xFFFF;
+                uint8_t sub = (mapping >> 8) & 0xFF;
+                uint8_t bits = mapping & 0xFF;
+                printf("      0x%04X:%02X (%d bits)\n", index, sub, bits);
+                
+                // 检查是否包含实际位置
+                if(index == 0x6064) {
+                    printf("      ✅ 包含实际位置 (0x6064)\n");
+                }
+            }
+        }
+    }
+    
+    printf("=====================================\n");
+}
+
+void read_error_history(int axis_idx)
+{
+    int slave_id = g_axis[axis_idx].slave_id;
+    
+    printf("\n========== %s 故障历史 ==========\n", g_axis[axis_idx].axis_name);
+    
+    // 读取故障码数量
+    uint8_t err_count = 0;
+    int sz = sizeof(err_count);
+    ecx_SDOread(&ctx, slave_id, 0x1003, 0x00, FALSE, &sz, &err_count, EC_TIMEOUTRXM);
+    printf("故障记录数: %d\n", err_count);
+    
+    // 读取每个故障码
+    for(int i = 1; i <= err_count && i <= 8; i++) {
+        uint32_t err_code = 0;
+        sz = sizeof(err_code);
+        ecx_SDOread(&ctx, slave_id, 0x1003, i, FALSE, &sz, &err_code, EC_TIMEOUTRXM);
+        printf("故障[%d]: 0x%08X\n", i, err_code);
+        
+        // 常见故障码解释
+        switch(err_code & 0xFFFF) {
+            case 0x2310:
+                printf("  位置跟随误差过大\n");
+                break;
+            case 0x2320:
+                printf("  速度过快\n");
+                break;
+            case 0x5110:
+                printf("  参数设置错误\n");
+                break;
+            case 0x7380:
+                printf("  紧急停止\n");
+                break;
+            default:
+                printf("  请查阅台达B3手册\n");
+        }
+    }
+    
+    // 清除故障历史（谨慎使用）
+    // uint8_t clear = 0;
+    // ecx_SDOwrite(&ctx, slave_id, 0x1003, 0x00, FALSE, 1, &clear, EC_TIMEOUTRXM);
+    
+    printf("====================================\n");
+}
+
+/*********************** 写控制字（使能过程用） ************************/
+void axis_pdo_write_cw_only(int axis_idx, uint16 cw)
+{
+    // 越界检查
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
+    if (g_axis[axis_idx].is_error) return;
+
+    uint8 *out = ctx.slavelist[g_axis[axis_idx].slave_id].outputs;
+    if (!out)
+    {
+        g_axis[axis_idx].is_error = 1;
+        printf("[PDO错误] %s PDO输出缓冲区为空！\n", g_axis[axis_idx].axis_name);
+        return;
+    }
+
+    // 写入控制字
+    out[PDO_CW_BYTE0] = cw & 0xFF;
+    out[PDO_CW_BYTE1] = (cw >> 8) & 0xFF;
+    
+  
+}
+
+void diagnose_sync_failure(int axis_idx)
+{
+    int slave_id = g_axis[axis_idx].slave_id;
+    
+    printf("\n========== %s 同步诊断 ==========\n", g_axis[axis_idx].axis_name);
+    
+    // 1. 检查DC同步状态 (0x1C32:08)
+    uint16_t sync_error = 0;
+    int sz = 2;
+    ecx_SDOread(&ctx, slave_id, 0x1C32, 0x08, FALSE, &sz, &sync_error, EC_TIMEOUTRXM);
+    printf("0x1C32:08 (同步错误) = 0x%04X\n", sync_error);
+    
+    // 2. 检查周期过小/过大计数
+    uint32_t cycle_small = 0, cycle_large = 0;
+    sz = 4;
+    ecx_SDOread(&ctx, slave_id, 0x1C32, 0x0A, FALSE, &sz, &cycle_small, EC_TIMEOUTRXM);
+    ecx_SDOread(&ctx, slave_id, 0x1C32, 0x0B, FALSE, &sz, &cycle_large, EC_TIMEOUTRXM);
+    printf("周期过小计数: %d\n", cycle_small);
+    printf("周期过大计数: %d\n", cycle_large);
+    
+    // 3. 检查当前同步模式 (0x1C32:01)
+    uint16_t sync_mode = 0;
+    sz = 2;
+    ecx_SDOread(&ctx, slave_id, 0x1C32, 0x01, FALSE, &sz, &sync_mode, EC_TIMEOUTRXM);
+    printf("当前同步模式: %d (2=DC模式)\n", sync_mode);
+    
+    // 4. 检查DC激活状态
+    printf("DCactive: %d\n", ctx.slavelist[slave_id].DCactive);
+    printf("DCcycle: %d ns\n", ctx.slavelist[slave_id].DCcycle);
+    
+    // 5. 读取警告码 (0x1003可能记录警告)
+    uint8_t err_count = 0;
+    sz = 1;
+    ecx_SDOread(&ctx, slave_id, 0x1003, 0x00, FALSE, &sz, &err_count, EC_TIMEOUTRXM);
+    printf("故障记录数: %d\n", err_count);
+    for(int i = 1; i <= err_count; i++) {
+        uint32_t err_code = 0;
+        sz = 4;
+        ecx_SDOread(&ctx, slave_id, 0x1003, i, FALSE, &sz, &err_code, EC_TIMEOUTRXM);
+        printf("  故障[%d]: 0x%08X\n", i, err_code);
+    }
+    
+    printf("====================================\n");
+}
+
+
+
+/************************ 从PDO读取实际位置 ************************/
+int32 axis_pdo_read_pos(int slave_id)
+{
+    if (slave_id <=0 || slave_id > ctx.slavecount) return 0;
+    
+    uint8 *in = ctx.slavelist[slave_id].inputs;
+    if (!in) return 0;
+    
+    // TxPDO 0x1A01 映射：偏移0-1状态字，偏移2-5实际位置
+    int32_t actual_pos = (int32_t)(
+        in[2] | 
+        (in[3] << 8) | 
+        (in[4] << 16) | 
+        (in[5] << 24)
+    );
+    
+    return actual_pos;
+}
+
+/************************ 从PDO读取跟随误差 (0x60F4) ************************/
+int32_t axis_pdo_read_follow_err(int slave_id)
+{
+    if (slave_id <=0 || slave_id > ctx.slavecount) return 0;
+
+    uint8 *in = ctx.slavelist[slave_id].inputs;
+    if (!in) return 0;
+
+    int32_t follow_err = (int32_t)(
+        in[PDO_FOLLOW_BYTE0] |
+        (in[PDO_FOLLOW_BYTE1] << 8) |
+        (in[PDO_FOLLOW_BYTE2] << 16) |
+        (in[PDO_FOLLOW_BYTE3] << 24)
+    );
+
+    return follow_err;
+}
+
+/************************ 执行原点复归 (Homing) ************************/
+void axis_homing(int axis_idx)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
+    int slave_id = g_axis[axis_idx].slave_id;
+    
+    printf("[Homing] %s 开始原点复归...\n", g_axis[axis_idx].axis_name);
+    
+    // 1. 切换到原点复归模式 (0x6060 = 6)
+    uint8_t homing_mode = 6;
+    ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &homing_mode, EC_TIMEOUTRXM);
+    osal_usleep(100000);
+    
+    // 2. 设置原点复归方法 (0x6098 = 35) —— 将当前位置设为原点
+    int8_t homing_method = 35;
+    ecx_SDOwrite(&ctx, slave_id, 0x6098, 0x00, FALSE, 1, &homing_method, EC_TIMEOUTRXM);
+    osal_usleep(50000);
+    
+    // 3. 触发原点复归（控制字 bit4 = 1）
+    // 注意：需要先使能，然后发送带触发位的控制字
+    // 假设此时伺服已在使能状态（状态字0x0237）
+    axis_pdo_write_cw_only(axis_idx, 0x001F);  // 0x001F = 使能 + 触发位
+    ecx_send_processdata(&ctx);
+    
+    // 4. 等待复归完成（状态字 bit12 可能变为1，或等待一段时间）
+    int timeout = 100; // 100ms * 100 = 10s
+    uint16_t sw = 0;
+    do {
+        osal_usleep(100000);
+        sw = axis_pdo_read_sw(axis_idx);
+        timeout--;
+        if (timeout == 0) {
+            printf("[Homing] %s 超时！\n", g_axis[axis_idx].axis_name);
+            break;
+        }
+    } while (!(sw & 0x1000)); // 假设 bit12 表示复归完成（需查手册）
+    
+    printf("[Homing] %s 完成，状态字=0x%04X\n", g_axis[axis_idx].axis_name, sw);
+    
+    // 5. 切换回CSP模式
+    uint8_t csp_mode = 8;
+    ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &csp_mode, EC_TIMEOUTRXM);
+    osal_usleep(100000);
+}
+
+
+
+========================================
+--- 完整文件上下文: src/ecat_core.c ---
+========================================
+#include "ecat_core.h"
+#include "global_def.h"
+#include "axis_ctrl.h"
+#include "planner.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdarg.h>
+#include <time.h>
+
+/************************ 全局变量定义（SOEM+实时控制相关） ************************/
+// SOEM核心变量
+ecx_contextt ctx;
+uint8 IOmap[4096];
+OSAL_THREAD_HANDLE thread_rt;
+OSAL_THREAD_HANDLE thread_chk;
+OSAL_THREAD_HANDLE thread_parser;
+int expectedWKC;
+int wkc;
+int mappingdone = 0;
+volatile int dorun = 0;
+int inOP = 0;
+_Atomic int g_sys_alarm_state = 0;
+int dowkccheck = 0, currentgroup = 0;
+int g_all_axis_enabled = 0;
+
+// 实时控制变量
+int cycle = 0;
+int g_csp_ready = 0;
+int64 cycletime = CYCLE_TIME_NS;
+int64 syncoffset = 500000;
+int64 timeerror;
+float pgain = 0.01f;
+float igain = 0.00002f;
+extern struct timespec ts;
+
+/************************ 实时线程环形日志 ************************/
+RtLog_t g_rt_log = {{0}, 0, 0};
+
+static void rt_log(const char *fmt, ...)
+{
+    int next = (g_rt_log.head + 1) % RT_LOG_BUF_SIZE;
+    if (next == g_rt_log.tail) return; // 缓冲满，丢弃
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_rt_log.buffer[g_rt_log.head], RT_LOG_MSG_LEN, fmt, ap);
+    va_end(ap);
+    __sync_synchronize(); // 写内存屏障：确保 buffer 内容对 drain 线程可见后再更新 head
+    g_rt_log.head = next;
+}
+
+static void rt_log_drain(void)
+{
+    while (1) {
+        __sync_synchronize(); // 读屏障：确保看到最新的 head 和 buffer 内容
+        if (g_rt_log.tail == g_rt_log.head) break;
+        printf("%s\n", g_rt_log.buffer[g_rt_log.tail]);
+        g_rt_log.tail = (g_rt_log.tail + 1) % RT_LOG_BUF_SIZE;
+        __sync_synchronize(); // 写屏障：确保 tail 更新对实时线程可见
+    }
+}
+
+
+
+
+/************************ 时间工具：纳秒级时间累加 ************************/
+void add_time_ns(ec_timet *ts, int64 addtime)
+{
+    ec_timet addts;
+    addts.tv_nsec = addtime % NSEC_PER_SEC;
+    addts.tv_sec  = (addtime - addts.tv_nsec) / NSEC_PER_SEC;
+    osal_timespecadd(ts, &addts, ts);
+}
+
+
+/**
+ * 同步函数：根据从站DC时间调整主站下一个周期的唤醒时刻。
+ */
+void ec_sync(int64 reftime,int64 cycletime,int64 *offsettime){
+    static int64 integral=0;
+    int64 delta;
+    delta=(reftime-syncoffset)%cycletime;
+    if(delta>(cycletime/2)){
+        delta=delta-cycletime;
+    }
+    timeerror=-delta;
+    integral+=timeerror;
+    *offsettime=(int64)((timeerror*pgain)+(integral*igain));
+}
+
+/************************ 实时控制线程（核心！1ms周期，五轴同周期控制） ************************/
+OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
+{
+    ec_timet ts;
+    int ht;
+    static int64_t toff = 0;
+    uint16 sw = 0;
+
+    dorun=0;
+    while (!mappingdone) osal_usleep(100);
+    osal_get_monotonic_time(&ts);
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(3, &cpuset);
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+
+    struct sched_param sp = {.sched_priority = 99};
+    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+    struct sched_param param;
+    param.sched_priority = 99;
+    sched_setscheduler(0, SCHED_FIFO, &param);
+    rt_log("[RT] 已设置FIFO调度，优先级99");
+
+    osal_get_monotonic_time(&ts);
+    ht = (ts.tv_nsec / 1000000) + 1;
+    ts.tv_nsec = ht * 1000000;
+    ecx_send_processdata(&ctx);
+    rt_log("[RT] 初始化完成，等待dorun启动");
+
+    while (1)
+    {
+        add_time_ns(&ts, cycletime + toff);
+        osal_monotonic_sleep(&ts);
+
+        if(dorun>0){
+            cycle++;
+            wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+
+            static int is_first_run=1;
+            if(is_first_run&&wkc>0){
+                for(int i=0;i<AXIS_NUM;i++){
+                    for(int s=0;s<g_axis[i].slave_count;s++){
+                        int slave_id=g_axis[i].slave_ids[s];
+                        g_axis[i].home_offset[s]=axis_pdo_read_pos(slave_id);
+                    }
+                }
+            }
+            is_first_run=0;
+
+            if (ctx.slavelist[0].hasdc && (wkc > 0))
+                ec_sync(ctx.DCtime, cycletime, &toff);
+
+            // === 报警复位安全点：必须在 g_all_axis_op_ready 门控之外 ===
+            // 若复位逻辑在门控内，op_ready=0 时请求永远无法被消费 → 死锁。
+            // 但消费条件必须同时满足：插补器已停稳 + 驱动器全部就绪。
+            // 若驱动器仍在 case 4 故障恢复中，此条件不满足，RT 线程安全空转等待。
+            if(g_interpolator.alarm_reset_request){
+                if(g_all_axis_op_ready && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)){
+                    g_interpolator.is_moving = 0;
+                    g_interpolator.is_waiting_mcode = 0;
+                    g_interpolator.time_scale = 1.0;
+                    g_interpolator.hold_state = HOLD_NORMAL;
+                    g_interpolator.alarm_reset_request = 0;
+                    g_cmd_queue.tail = g_cmd_queue.head;
+                    // 同步插补器位置到驱动器实际位置，防止故障恢复后位置偏差
+                    for(int j=0;j<AXIS_NUM;j++){
+                        if(g_axis[j].slave_count < 1 || g_axis[j].slave_ids[0] <= 0) continue;
+                        int64_t raw_pulse_j = (int64_t)axis_pdo_read_pos(g_axis[j].slave_ids[0])
+                                            - (int64_t)g_axis[j].home_offset[0];
+                        double ppu = g_axis[j].pulse_per_unit;
+                        g_axis[j].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse_j / ppu : 0.0;
+                        g_interpolator.current_pos[j] = g_axis[j].current_cmd_pos;
+                    }
+                    api_sync_planner_cursor();
+                    atomic_store_explicit(&g_sys_alarm_state, 0, memory_order_release);
+                    rt_log("[RT] 报警复位已执行，队列已清空，位置已同步");
+                }
+            }
+
+            // === 插补器运动控制：必须在 g_all_axis_op_ready 门控之外 ===
+            // 单轴故障时，非故障轴仍需跟踪平滑刹车轨迹。
+            // 若插补器被门控冻结，time_scale 无法递减，HOLD_BRAKING 永远不会完成。
+            if(g_interpolator.is_moving){
+
+                int alarm_active = atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire);
+                if(alarm_active){
+                    if(g_interpolator.hold_state != HOLD_PAUSED && g_interpolator.hold_state != HOLD_BRAKING){
+                        g_interpolator.hold_state = HOLD_BRAKING;
+                    }
+                } else {
+                    if (g_interpolator.pause_request && g_interpolator.hold_state == HOLD_NORMAL) {
+                        g_interpolator.hold_state = HOLD_BRAKING;
+                    } else if (!g_interpolator.pause_request && g_interpolator.hold_state == HOLD_PAUSED) {
+                        g_interpolator.hold_state = HOLD_RESUMING;
+                    }
+                }
+
+                const double TIME_DEC_STEP = 0.005;
+
+                if (g_interpolator.hold_state == HOLD_BRAKING) {
+                    g_interpolator.time_scale -= TIME_DEC_STEP;
+                    if (g_interpolator.time_scale <= 0.0) {
+                        g_interpolator.time_scale = 0.0;
+                        g_interpolator.hold_state = HOLD_PAUSED;
+                    }
+                } else if (g_interpolator.hold_state == HOLD_RESUMING) {
+                    g_interpolator.time_scale += TIME_DEC_STEP;
+                    if (g_interpolator.time_scale >= 1.0) {
+                        g_interpolator.time_scale = 1.0;
+                        g_interpolator.hold_state = HOLD_NORMAL;
+                    }
+                }
+
+                g_interpolator.virtual_time_ms+=g_interpolator.time_scale;
+
+                // ==== 7段式 S 曲线绝对解析插补 ====
+                // @Context: 1ms Hard-RT Thread (EtherCAT)
+                // @Danger: NO BLOCKING, NO MATH.H (sqrt/acos), NO PRINTF, NO MALLOC.
+                // 无状态：仅凭 virtual_time_ms 与预计算参数直接解析 s。
+                {
+                    double t = g_interpolator.virtual_time_ms;
+                    double s = 0.0;
+                    // 局部缓存，减少对结构体的重复访问
+                    double _T1=g_interpolator.T1, _T2=g_interpolator.T2;
+                    double _T3=g_interpolator.T3, _T4=g_interpolator.T4;
+                    double _T5=g_interpolator.T5, _T6=g_interpolator.T6;
+                    double _T7=g_interpolator.T7;
+
+                    if (t >= _T7) {
+                        s = g_interpolator.total_distance;
+                        g_interpolator.is_moving = 0;
+                    }
+                    else if (t <= _T1) {
+                        // T1: 加加速段  s = s0 + v0*dt + j1*dt^3/6
+                        double dt = t;
+                        s = g_interpolator.s0 + g_interpolator.v0*dt
+                          + g_interpolator.j1*dt*dt*dt/6.0;
+                    }
+                    else if (t <= _T2) {
+                        // T2: 匀加速段  s = s1 + v1*dt + 0.5*a2*dt^2
+                        double dt = t - _T1;
+                        s = g_interpolator.s1 + g_interpolator.v1*dt
+                          + 0.5*g_interpolator.a2*dt*dt;
+                    }
+                    else if (t <= _T3) {
+                        // T3: 减加速段  s = s2 + v2*dt + 0.5*a2*dt^2 + j3*dt^3/6
+                        double dt = t - _T2;
+                        s = g_interpolator.s2 + g_interpolator.v2*dt
+                          + 0.5*g_interpolator.a2*dt*dt
+                          + g_interpolator.j3*dt*dt*dt/6.0;
+                    }
+                    else if (t <= _T4) {
+                        // T4: 匀速段  s = s3 + v3*dt
+                        double dt = t - _T3;
+                        s = g_interpolator.s3 + g_interpolator.v3*dt;
+                    }
+                    else if (t <= _T5) {
+                        // T5: 加减速段  s = s4 + v4*dt + j5*dt^3/6
+                        double dt = t - _T4;
+                        s = g_interpolator.s4 + g_interpolator.v4*dt
+                          + g_interpolator.j5*dt*dt*dt/6.0;
+                    }
+                    else if (t <= _T6) {
+                        // T6: 匀减速段  s = s5 + v5*dt + 0.5*a6*dt^2
+                        double dt = t - _T5;
+                        s = g_interpolator.s5 + g_interpolator.v5*dt
+                          + 0.5*g_interpolator.a6*dt*dt;
+                    }
+                    else {
+                        // T7: 减减速段  s = s6 + v6*dt + 0.5*a6*dt^2 + j7*dt^3/6
+                        double dt = t - _T6;
+                        s = g_interpolator.s6 + g_interpolator.v6*dt
+                          + 0.5*g_interpolator.a6*dt*dt
+                          + g_interpolator.j7*dt*dt*dt/6.0;
+                    }
+
+                    double ratio = 0.0;
+                    if (g_interpolator.total_distance > 1e-6) {
+                        ratio = s / g_interpolator.total_distance;
+                    }
+                    if (ratio > 1.0) ratio = 1.0;
+                    if (ratio < 0.0) ratio = 0.0;
+
+                    for (int j = 0; j < AXIS_NUM; j++) {
+                        g_interpolator.current_pos[j] = g_interpolator.start_pos[j]
+                            + (g_interpolator.target_pos[j] - g_interpolator.start_pos[j]) * ratio;
+                    }
+                }
+
+            }
+
+            if(g_all_axis_op_ready){
+                for(int i=0;i<AXIS_NUM;i++){
+                    if(g_axis[i].slave_count>=2&&g_axis[i].enable_sync_alarm){
+                        int slave_1=g_axis[i].slave_ids[0];
+                        int slave_2=g_axis[i].slave_ids[1];
+
+                        int32_t act_1=axis_pdo_read_pos(slave_1)-g_axis[i].home_offset[0];
+                        int32_t act_2=axis_pdo_read_pos(slave_2)-g_axis[i].home_offset[1];
+
+                        int32_t diff=abs(act_1-act_2);
+                        if(diff>g_axis[i].sync_max_err_pulse){
+                           rt_log("同步异常！轴%d 从站%d与%d位置差%d超过最大误差%d", i, slave_1, slave_2, diff, g_axis[i].sync_max_err_pulse);
+                           atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                           continue;
+                        }
+
+                        if(diff>g_axis[i].sync_tolerance_pulse){
+                            g_axis[i]._current_sync_timer++;
+                            if(g_axis[i]._current_sync_timer>g_axis[i].sync_err_time_ms){
+                                rt_log("同步报警！轴%d 从站%d与%d差%d持续%dms超限%d", i, slave_1, slave_2, diff, g_axis[i]._current_sync_timer, g_axis[i].sync_err_time_ms);
+                                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                            }
+                        }else{
+                            g_axis[i]._current_sync_timer=0;
+                        }
+                    }
+                }
+            }
+
+            if(g_all_axis_op_ready){
+                if(g_interpolator.is_moving==0&&g_interpolator.is_waiting_mcode==0&&g_cmd_queue.head!=g_cmd_queue.tail&&atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==0){
+
+                    if(atomic_load_explicit(&g_cmd_queue.buffer[g_cmd_queue.tail].is_ready, memory_order_acquire)==1){
+                        TrajectorySegment_t seg=g_cmd_queue.buffer[g_cmd_queue.tail];
+                        g_cmd_queue.tail=(g_cmd_queue.tail+1)%QUEUE_SIZE;
+
+                        if(seg.cmd_type==CMD_TYPE_MCODE){
+                            g_interpolator.is_waiting_mcode=1;
+                            g_interpolator.mcode_wait_timer=0;
+                            g_interpolator.current_mcode=seg.m_code;
+                            continue;
+                        }
+
+                        for(int j=0;j<AXIS_NUM;j++){
+                            g_interpolator.start_pos[j]=g_interpolator.current_pos[j];
+                            g_interpolator.target_pos[j]=seg.target_pos[j];
+                            g_interpolator.dir_vec[j]=seg.dir_vec[j];
+                        }
+
+                        g_interpolator.total_distance=seg.total_distance;
+                        // 7段式 S 曲线绝对解析参数（planner 已预计算）
+                        g_interpolator.T1=seg.T1; g_interpolator.T2=seg.T2;
+                        g_interpolator.T3=seg.T3; g_interpolator.T4=seg.T4;
+                        g_interpolator.T5=seg.T5; g_interpolator.T6=seg.T6;
+                        g_interpolator.T7=seg.T7;
+                        g_interpolator.v0=seg.v0; g_interpolator.v1=seg.v1;
+                        g_interpolator.v2=seg.v2; g_interpolator.v3=seg.v3;
+                        g_interpolator.v4=seg.v4; g_interpolator.v5=seg.v5;
+                        g_interpolator.v6=seg.v6;
+                        g_interpolator.s0=seg.s0; g_interpolator.s1=seg.s1;
+                        g_interpolator.s2=seg.s2; g_interpolator.s3=seg.s3;
+                        g_interpolator.s4=seg.s4; g_interpolator.s5=seg.s5;
+                        g_interpolator.s6=seg.s6;
+                        g_interpolator.j1=seg.j1; g_interpolator.a2=seg.a2;
+                        g_interpolator.j3=seg.j3;
+                        g_interpolator.j5=seg.j5; g_interpolator.a6=seg.a6;
+                        g_interpolator.j7=seg.j7;
+                        g_interpolator.v_target=seg.v_target;
+                        g_interpolator.acc=seg.acc;
+                        g_interpolator.dec=seg.dec;
+                        g_interpolator.v_start=seg.v_start;
+                        g_interpolator.v_end=seg.v_end;
+                        g_interpolator.virtual_time_ms=0.0;
+
+                        if(seg.T_total > 0.5){
+                            g_interpolator.is_moving=1;
+                        }else{
+                            rt_log("invalid trajectory segment: T_total=%.3f",seg.T_total);
+                        }
+                    }
+                }
+
+                // 非阻塞M代码等待逻辑
+                if(g_interpolator.is_waiting_mcode){
+                    if(g_interpolator.mcode_wait_timer < INT32_MAX) {
+                        g_interpolator.mcode_wait_timer++;
+                    }
+                    int wait_target_ms;
+                    switch(g_interpolator.current_mcode){
+                        case 3:  wait_target_ms=2000; break;
+                        case 5:  wait_target_ms=1000; break;
+                        default: wait_target_ms=1000; break;
+                    }
+                    if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
+                       g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
+                        g_interpolator.is_waiting_mcode=0;
+                        g_interpolator.mcode_wait_timer=0;
+                    }
+                }
+
+                for(int j=0;j<AXIS_NUM;j++){
+                    g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
+                    if(g_coord_mgr.current_coord==COORD_G53){
+                        g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j];
+                    }else{
+                        int idx=g_coord_mgr.current_coord-1;
+                        g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j]-g_coord_mgr.work_offsets[idx][j];
+                    }
+                }
+            }
+
+            int all_ready_flag=1;
+
+            for(int i=0;i<AXIS_NUM;i++){
+                int primary_slave=g_axis[i].slave_ids[0];
+                uint16_t sw=axis_pdo_read_sw(primary_slave);
+                g_axis[i].cia_step_delay++;
+
+                int32_t output_cw=CW_ENABLE_OP;
+
+                switch(g_axis[i].cia_step){
+                    case 0:
+                    output_cw=CW_SHUTDOWN;
+                    if(g_axis[i].cia_step_delay==1){
+                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                        g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                    }
+                    if(g_axis[i].cia_step_delay>50&&((sw&SW_MASK)==SW_SHUTDOWN_RDY)){
+                        g_axis[i].cia_step++;
+                        g_axis[i].cia_step_delay=0;
+                    }
+                    all_ready_flag=0;
+                    break;
+
+                    case 1:
+                    output_cw=CW_SWITCH_ON;
+                    if(g_axis[i].cia_step_delay==1){
+                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                        g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                    }
+                    if(g_axis[i].cia_step_delay>50&&((sw&SW_MASK)==SW_SWITCHED_ON)){
+                        if(llabs(timeerror)<80000){
+                            g_axis[i].cia_step++;
+                            g_axis[i].cia_step_delay=0;
+                        }
+                    }
+                    all_ready_flag=0;
+                    break;
+
+                    case 2:
+                    output_cw=CW_ENABLE_OP;
+                    if(g_axis[i].cia_step_delay==1){
+                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                        g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                    }
+                    if((sw&SW_MASK)==SW_OP_ENABLED){
+                        g_axis[i].cia_step_delay++;
+                        if(g_axis[i].cia_step_delay>50){
+                            g_axis[i].cia_step_delay=0;
+                            g_axis[i].cia_step++;
+
+                            int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                            g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                            api_sync_planner_cursor();
+                        }
+                    }
+                    all_ready_flag=0;
+                    break;
+
+                    case 3:
+                    output_cw=CW_ENABLE_OP;
+
+                    // 驱动器故障检测：必须在跟随误差监控之前
+                    // 当驱动器内部触发故障(如 AL009)时，状态字 bit3(SW_ERROR) 置位，
+                    // 需进入 case 4 执行 CW_FAULT_RESET 并重新走使能流程。
+                    // 绝对禁止在此处置 is_moving=0！仅触发报警，让虚拟时间轴平滑刹车。
+                    if(sw & SW_ERROR){
+                        g_axis[i].cia_step = 4;
+                        g_axis[i].cia_step_delay = 0;
+                        g_axis[i]._follow_err_timer = 0;
+                        all_ready_flag = 0;
+                        output_cw = CW_FAULT_RESET;
+                        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                        break;
+                    }
+
+                    if(g_axis[i].cia_step_delay==1){
+                        int64_t primary_pulse = (int64_t)axis_pdo_read_pos(g_axis[i].slave_ids[0])
+                                              - (int64_t)g_axis[i].home_offset[0];
+
+                        double ppu = g_axis[i].pulse_per_unit;
+                        g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)primary_pulse / ppu : 0.0;
+                        // 仅在插补器完全静止时才同步位置，运动/刹车中禁止覆写 current_pos！
+                        // 否则插补器下一周期会用 start_pos + dir_vec*ratio 覆盖回来，产生位置阶跃。
+                        if(!g_interpolator.is_moving) {
+                            g_interpolator.current_pos[i] = g_axis[i].current_cmd_pos;
+                        }
+                    }else{
+                        // 无论是否报警，只要轴在 case 3（健康运行），就必须追随插补器！
+                        // 插补器已在报警时启动 HOLD_BRAKING 平滑减速，健康轴必须跟随减速，
+                        // 否则等于硬停，违背平滑急停设计。
+                        g_axis[i].current_cmd_pos=g_interpolator.current_pos[i];
+                    }
+
+                    // 跟随误差监控：直接从驱动器 TxPDO 0x60F4 读取（驱动器自身计算，无坐标系偏移风险）
+                    {
+                        int32_t follow_err=axis_pdo_read_follow_err(g_axis[i].slave_ids[0]);
+                        int32_t abs_err=follow_err<0?-follow_err:follow_err;
+                        if(abs_err>FOLLOW_ERR_MAX_PULSE){
+                            rt_log("[跟随误差] %s 硬限超差 %d 脉冲",g_axis[i].axis_name,abs_err);
+                            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                        }else if(abs_err>FOLLOW_ERR_WARN_PULSE){
+                            g_axis[i]._follow_err_timer++;
+                            if(g_axis[i]._follow_err_timer>=FOLLOW_ERR_WARN_TIME_MS){
+                                rt_log("[跟随误差] %s 警告持续 %dms",g_axis[i].axis_name,g_axis[i]._follow_err_timer);
+                                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                            }
+                        }else{
+                            g_axis[i]._follow_err_timer=0;
+                        }
+                    }
+
+                    break;
+
+                    case 4:
+                    // 驱动器故障恢复：发送 CW_FAULT_RESET，等待故障位清除后重新使能
+                    all_ready_flag = 0;
+                    if(sw & SW_ERROR){
+                        output_cw = CW_FAULT_RESET;
+                        // 故障期间：命令位置死咬实际位置，防止恢复瞬间飞车追位
+                        if(g_axis[i].slave_count >= 1 && g_axis[i].slave_ids[0] > 0){
+                            int32_t raw_pulse = axis_pdo_read_pos(g_axis[i].slave_ids[0]) - g_axis[i].home_offset[0];
+                            double ppu = g_axis[i].pulse_per_unit;
+                            g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse / ppu : 0.0;
+                        }
+                    } else {
+                        // 故障已清除，回到 case 0 重新走完整使能流程
+                        g_axis[i].cia_step = 0;
+                        g_axis[i].cia_step_delay = 0;
+                        rt_log("[CiA402] %s 故障已清除，重新使能", g_axis[i].axis_name);
+                    }
+                    break;
+                }
+
+                for(int s=0;s<g_axis[i].slave_count;s++){
+                    int slave_id=g_axis[i].slave_ids[s];
+                    int32_t logical_pulse=(int32_t)round(g_axis[i].current_cmd_pos*g_axis[i].pulse_per_unit);
+                    int32_t phys_pos_to_send=logical_pulse+g_axis[i].home_offset[s];
+                    axis_pdo_write(slave_id,output_cw,phys_pos_to_send);
+                }
+            }
+
+            g_all_axis_op_ready=all_ready_flag;
+
+            ecx_mbxhandler(&ctx, 0, 4);
+            ecx_send_processdata(&ctx);
+
+        }else{
+            g_interpolator.is_waiting_mcode=0;
+            g_interpolator.mcode_wait_timer=0;
+            for(int i=0;i<AXIS_NUM;i++){
+               g_axis[i]._follow_err_timer=0;
+            }
+            for(int i=0;i<AXIS_NUM;i++){
+               for(int s=0;s<g_axis[i].slave_count;s++){
+                int slave_id=g_axis[i].slave_ids[s];
+                int32_t act=axis_pdo_read_pos(slave_id);
+                axis_pdo_write(slave_id,CW_SHUTDOWN,act);
+               }
+            }
+            ecx_send_processdata(&ctx);
+        }
+
+    }
+    return ;
+}
+
+/************************ 故障检查线程 ************************/
+OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
+{
+    int slaveix;
+    // 饥饿看门狗状态
+    static volatile int last_queue_head = -1;
+    static int starvation_counter = 0;
+    #define STARVATION_THRESHOLD 5  // 5 × 10ms = 50ms 无新指令视为饥饿
+
+    while (1)
+    {
+        if (inOP && ((dowkccheck > 2) || ctx.grouplist[currentgroup].docheckstate))
+        {
+            ctx.grouplist[currentgroup].docheckstate = FALSE;
+            ecx_readstate(&ctx);
+
+            for (int i = 0; i < AXIS_NUM; i++)
+            {
+                for(int s=0;s<g_axis[i].slave_count;s++){
+                    slaveix = g_axis[i].slave_ids[s];
+                    ec_slavet *slave = &ctx.slavelist[slaveix];
+                    if (slave->state != EC_STATE_OPERATIONAL)
+                    {
+                       ctx.grouplist[currentgroup].docheckstate = TRUE;
+                       g_axis[i].is_error = 1;
+                       printf("[故障检测] %s 非OP状态！当前状态码：%d\n", g_axis[i].axis_name, slave->state);
+                    }
+                }
+            }
+            dowkccheck = 0;
+        }
+
+        // ---- 队列饥饿看门狗 ----
+        // 仅在解析器已关闭（无新文件读入）时才允许触发强制释放
+        // 防止文件 I/O 阻塞或网络抖动导致的误强行结段
+        {
+            int count = (g_cmd_queue.head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
+            if(count > 0 && count < 3 && !g_parser_ctrl.is_running) {
+                if(g_cmd_queue.head == last_queue_head) {
+                    starvation_counter++;
+                    if(starvation_counter >= STARVATION_THRESHOLD) {
+                        planner_recalculate(1);
+                        starvation_counter = 0;
+                    }
+                } else {
+                    starvation_counter = 0;
+                    last_queue_head = g_cmd_queue.head;
+                }
+            } else {
+                starvation_counter = 0;
+                last_queue_head = g_cmd_queue.head;
+            }
+        }
+
+        rt_log_drain();
+        osal_usleep(10000);
+    }
+    return ;
+}
+
+/************************ ECAT主站启动封装 ************************/
+void ecat_bringup(char *ifname)
+{
+    if (!ecx_init(&ctx, ifname))
+    {
+        printf("[ECAT错误] 主站初始化失败！网卡：%s\n", ifname);
+        exit(-1);
+    }
+    printf("[ECAT] 主站初始化成功，网卡：%s\n", ifname);
+
+    if (ecx_config_init(&ctx) <= 0)
+    {
+        printf("[ECAT错误] 未扫描到任何EtherCAT从站！\n");
+        ecx_close(&ctx);
+        exit(-1);
+    }
+    printf("[ECAT] 扫描到%d个EtherCAT从站\n", ctx.slavecount);
+
+    // TxPDO 重映射：添加 0x60F4 跟随误差到 PDO 输入（必须在 config_map_group 之前）
+    for(int i=0;i<AXIS_NUM;i++){
+        for(int s=0;s<g_axis[i].slave_count;s++){
+            uint16_t slave=g_axis[i].slave_ids[s];
+            if(slave==0) continue;
+
+            // 切到 PRE-OP 才能改 PDO 映射
+            ctx.slavelist[slave].state=EC_STATE_PRE_OP;
+            ecx_writestate(&ctx,slave);
+            ecx_statecheck(&ctx,slave,EC_STATE_PRE_OP,EC_TIMEOUTSTATE);
+
+            // 禁用 TxPDO 分配
+            uint8_t zero=0;
+            ecx_SDOwrite(&ctx,slave,0x1C13,0x00,FALSE,1,&zero,EC_TIMEOUTRXM);
+
+            // 清空映射对象 0x1A00
+            ecx_SDOwrite(&ctx,slave,0x1A00,0x00,FALSE,1,&zero,EC_TIMEOUTRXM);
+
+            // 写入三条映射：状态字(16bit) + 实际位置(32bit) + 跟随误差(32bit)
+            uint32_t map_sw   =0x60410010;
+            uint32_t map_pos  =0x60640020;
+            uint32_t map_ferr =0x60F40020;
+            ecx_SDOwrite(&ctx,slave,0x1A00,0x01,FALSE,4,&map_sw,EC_TIMEOUTRXM);
+            ecx_SDOwrite(&ctx,slave,0x1A00,0x02,FALSE,4,&map_pos,EC_TIMEOUTRXM);
+            ecx_SDOwrite(&ctx,slave,0x1A00,0x03,FALSE,4,&map_ferr,EC_TIMEOUTRXM);
+
+            // 设置映射条目数
+            uint8_t map_cnt=3;
+            ecx_SDOwrite(&ctx,slave,0x1A00,0x00,FALSE,1,&map_cnt,EC_TIMEOUTRXM);
+
+            // 绑定到 TxPDO 分配
+            uint16_t pdo_idx=0x1A00;
+            ecx_SDOwrite(&ctx,slave,0x1C13,0x01,FALSE,2,&pdo_idx,EC_TIMEOUTRXM);
+
+            // 启用 TxPDO 分配
+            uint8_t one=1;
+            ecx_SDOwrite(&ctx,slave,0x1C13,0x00,FALSE,1,&one,EC_TIMEOUTRXM);
+
+            printf("[PDO] 从站%d TxPDO: 0x6041+0x6064+0x60F4\n", slave);
+        }
+    }
+
+    // SOEM 读取更新后的 PDO 映射，自动分配 IOmap 偏移
+    ecx_config_map_group(&ctx, IOmap, 0);
+    ecx_configdc(&ctx);
+
+    for(int i=1;i<=ctx.slavecount;i++){
+        ecx_dcsync0(&ctx,i,TRUE,cycletime,0);
+    }
+
+    printf("[ECAT] trun to PRE_OP!\n");
+    for(int i=0;i<AXIS_NUM;i++){
+        for(int s=0;s<g_axis[i].slave_count;s++){
+          uint16_t slave=g_axis[i].slave_ids[s];
+          if(slave==0) continue;
+
+          ctx.slavelist[slave].state=EC_STATE_PRE_OP;
+          ecx_writestate(&ctx,slave);
+          ecx_statecheck(&ctx,slave,EC_STATE_PRE_OP,EC_TIMEOUTSTATE);
+
+          uint16_t sync_mode=2;
+          int sz=sizeof(sync_mode);
+          int r1=ecx_SDOwrite(&ctx,slave,0x1C32,0x01,FALSE,sz,&sync_mode,EC_TIMEOUTRXM);
+          int r2=ecx_SDOwrite(&ctx,slave,0x1C33,0x01,FALSE,sz,&sync_mode,EC_TIMEOUTRXM);
+          if(r1>0&&r2>0){
+              printf("success to 0x1C32=2\n",g_axis[i].axis_name);
+          }else{
+              printf("fail to 0x1C32=2\n",g_axis[i].axis_name);
+          }
+          ctx.slavelist[slave].state=EC_STATE_SAFE_OP;
+          ecx_writestate(&ctx,slave);
+          ecx_statecheck(&ctx,slave,EC_STATE_SAFE_OP,EC_TIMEOUTSTATE);
+        }
+    }
+
+    for(int i=0;i<AXIS_NUM;i++){
+        for(int s=0;s<g_axis[i].slave_count;s++){
+          uint16_t slave=g_axis[i].slave_ids[s];
+          if(slave==0) continue;
+
+          uint8_t time_value=1;
+          int8_t time_index=-3;
+          int r1=ecx_SDOwrite(&ctx,slave,0x60C2,0x01,FALSE,1,&time_value,EC_TIMEOUTRXM);
+          int r2=ecx_SDOwrite(&ctx,slave,0x60C2,0x02,FALSE,1,&time_index,EC_TIMEOUTRXM);
+
+          if(r1>0&&r2>0){
+              printf("success 0x60C2\n",g_axis[i].axis_name);
+          }else{
+              printf("fail to 0x60C2\n",g_axis[i].axis_name);
+          }
+        }
+    }
+
+    expectedWKC = ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
+    printf("[ECAT] PDO映射+DC配置完成，期望WKC值：%d\n", expectedWKC);
+
+    for (int i = 0; i < AXIS_NUM; i++)
+    {
+        for(int s=0;s<g_axis[i].slave_count;s++){
+            uint16_t slave=g_axis[i].slave_ids[s];
+            ctx.slavelist[slave].state = EC_STATE_SAFE_OP;
+            ecx_writestate(&ctx, slave);
+            if (ecx_statecheck(&ctx, slave, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE) != EC_STATE_SAFE_OP)
+            {
+               printf("[ECAT错误] %s 无法进入SAFE_OP状态！\n", g_axis[i].axis_name);
+               ecx_close(&ctx);
+               exit(-1);
+            }
+        }
+    }
+    printf("[ECAT] 所有轴已进入SAFE_OP状态，开始SDO配置\n");
+
+    for (int i = 0; i < AXIS_NUM; i++)
+    {
+        axis_sdo_config_pp(i);
+    }
+
+    mappingdone = 1;
+    dorun = 1;
+    osal_usleep(1000000);
+
+    ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
+    ecx_writestate(&ctx, 0);
+    if (ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE) != EC_STATE_OPERATIONAL)
+    {
+        printf("[ECAT错误] 无法进入全局OP状态！\n");
+        ecx_close(&ctx);
+        exit(-1);
+    }
+
+    inOP = 1;
+    printf("[ECAT] 全局OP状态进入成功，五轴伺服系统启动完成！\n");
+}
+
+
+
+========================================
+--- 完整文件上下文: src/planner.c ---
+========================================
+#include "planner.h"
+
+// ====================================================================
+// 7 段式 S 曲线 (Jerk Control) — 绝对解析式预计算
+// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// 所有内部物理量单位：mm/ms, mm/ms^2, mm/ms^3 → 时间自然为 ms
+// ====================================================================
+
+// 默认 Jerk：5000 mm/s^3 → mm/ms^3
+#define DEFAULT_JERK_MS3  (5000.0 / 1.0e9)
+// 二分查找迭代次数
+#define SCURVE_BISECT_ITERS  20
+// 前瞻精确求解迭代次数
+#define LOOKAHEAD_BISECT_ITERS  24
+
+// --------------------------------------------------------------------
+// 加速段 v_s → v_m 的时序与距离
+// 输出: tj = jerk段时长(T1=T3), ta = 匀加速时长(T2), *S_out = 距离
+// --------------------------------------------------------------------
+static void compute_acc_profile(double v_s, double v_m, double a_max, double jerk,
+                                double *tj, double *ta, double *S_out)
+{
+    double dv = v_m - v_s;
+    if (dv <= 1e-12 || jerk <= 1e-15 || a_max <= 1e-15) {
+        *tj = 0.0; *ta = 0.0; *S_out = 0.0; return;
+    }
+    double tj_max = a_max / jerk;
+    double dv_j   = 0.5 * jerk * tj_max * tj_max;
+
+    if (dv < 2.0 * dv_j) {
+        // 退化：加速度峰值 < a_max
+        *tj = sqrt(dv / jerk);
+        *ta = 0.0;
+        *S_out = v_s * 2.0 * (*tj) + jerk * (*tj) * (*tj) * (*tj);
+    } else {
+        *tj = tj_max;
+        *ta = (dv - 2.0 * dv_j) / a_max;
+        double t = *tj, a = *ta;
+        *S_out = v_s * (2.0*t + a) + a_max*t*t + 1.5*a_max*t*a + 0.5*a_max*a*a;
+    }
+}
+
+// --------------------------------------------------------------------
+// 减速段 v_m → v_e 的时序与距离
+// 输出: tj = jerk段时长(T5=T7), td = 匀减速时长(T6), *S_out = 距离
+// --------------------------------------------------------------------
+static void compute_dec_profile(double v_m, double v_e, double d_max, double jerk,
+                                double *tj, double *td, double *S_out)
+{
+    double dv = v_m - v_e;
+    if (dv <= 1e-12 || jerk <= 1e-15 || d_max <= 1e-15) {
+        *tj = 0.0; *td = 0.0; *S_out = 0.0; return;
+    }
+    double tj_max = d_max / jerk;
+    double dv_j   = 0.5 * jerk * tj_max * tj_max;
+
+    if (dv < 2.0 * dv_j) {
+        *tj = sqrt(dv / jerk);
+        *td = 0.0;
+        *S_out = v_m * 2.0 * (*tj) - jerk * (*tj) * (*tj) * (*tj);
+    } else {
+        *tj = tj_max;
+        *td = (dv - 2.0 * dv_j) / d_max;
+        double t = *tj, d = *td;
+        *S_out = v_m * (2.0*t + d) - d_max*t*t - 1.5*d_max*t*d - 0.5*d_max*d*d;
+    }
+}
+
+// --------------------------------------------------------------------
+// 精确求解：给定 v_end 和可用距离 S，求最大 v_start
+//   使得 S 曲线减速 (v_start → v_end) 恰好 fits in S
+// @Context: Non-RealTime Background Thread
+// --------------------------------------------------------------------
+static double solve_max_vstart_scurve(double v_end, double S,
+                                       double d_max, double jerk, double v_ceil)
+{
+    double lo = v_end, hi = fmax(v_end, v_ceil);
+    for (int i = 0; i < LOOKAHEAD_BISECT_ITERS; i++) {
+        double mid = 0.5 * (lo + hi);
+        double tj, td, S_test;
+        compute_dec_profile(mid, v_end, d_max, jerk, &tj, &td, &S_test);
+        if (S_test > S) hi = mid; else lo = mid;
+    }
+    return lo;
+}
+
+// --------------------------------------------------------------------
+// 精确求解：给定 v_start 和可用距离 S，求最大 v_end
+//   使得 S 曲线加速 (v_start → v_end) 恰好 fits in S
+// @Context: Non-RealTime Background Thread
+// --------------------------------------------------------------------
+static double solve_max_vend_scurve(double v_start, double S,
+                                     double a_max, double jerk, double v_ceil)
+{
+    double lo = v_start, hi = fmax(v_start, v_ceil);
+    for (int i = 0; i < LOOKAHEAD_BISECT_ITERS; i++) {
+        double mid = 0.5 * (lo + hi);
+        double tj, ta, S_test;
+        compute_acc_profile(v_start, mid, a_max, jerk, &tj, &ta, &S_test);
+        if (S_test > S) hi = mid; else lo = mid;
+    }
+    return lo;
+}
+
+// --------------------------------------------------------------------
+// 获取段的等效 jerk（段 jerk > 0 则取段值，否则取默认）
+// --------------------------------------------------------------------
+static inline double seg_effective_jerk(const TrajectorySegment_t *seg)
+{
+    return (seg->jerk > 1e-15) ? seg->jerk : DEFAULT_JERK_MS3;
+}
+
+// ====================================================================
+// G64 向心加速度过弯模型
+// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// ====================================================================
+double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *curr)
+{
+    if (prev->cmd_type == CMD_TYPE_MCODE || curr->cmd_type == CMD_TYPE_MCODE) {
+        return 0.0;
+    }
+
+    double cos_theta = 0.0;
+    for (int i = 0; i < AXIS_NUM; i++) {
+        cos_theta += prev->dir_vec[i] * curr->dir_vec[i];
+    }
+    if (cos_theta > 1.0)  cos_theta = 1.0;
+    if (cos_theta < -1.0) cos_theta = -1.0;
+
+    if (cos_theta >= 0.999) return fmin(prev->v_max, curr->v_max);
+    if (cos_theta <= -0.999) return 0.0;
+
+    double alpha = acos(cos_theta);
+    double denom = 1.0 - cos(alpha * 0.5);
+    if (denom <= 1e-6) denom = 1e-6;
+
+    double v_allow = sqrt(g_planner_config.max_centripetal_acc
+                        * (g_planner_config.corner_tolerance / denom));
+    if (isnan(v_allow) || isinf(v_allow) || v_allow < 0.0) v_allow = 0.0;
+
+    return fmin(v_allow, fmin(prev->v_max, curr->v_max));
+}
+
+// ====================================================================
+// Look-Ahead 前瞻核心引擎（精确 S 曲线距离求解版）
+// @Context: Non-RealTime Background Thread (parser 或 看门狗)
+// @Thread-Safety: 由 planner_mutex 保护，禁止 RT 线程调用！
+// ====================================================================
+void planner_recalculate(int force_flush)
+{
+    pthread_mutex_lock(&planner_mutex);
+
+    int tail = g_cmd_queue.tail;
+    int head = g_cmd_queue.head;
+    int count = (head - tail + QUEUE_SIZE) % QUEUE_SIZE;
+    if (count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+
+    // ---- plan_tail 结界 ----
+    int plan_tail = tail;
+    while (plan_tail != head &&
+           atomic_load_explicit(&g_cmd_queue.buffer[plan_tail].is_ready,
+                                memory_order_acquire) == 1) {
+        plan_tail = (plan_tail + 1) % QUEUE_SIZE;
+    }
+    int plan_count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
+    if (plan_count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+
+    // ---- 0. 初始化未释放段 ----
+    {
+        int c = plan_tail;
+        while (c != head) {
+            if (atomic_load_explicit(&g_cmd_queue.buffer[c].is_ready,
+                                     memory_order_acquire) == 0) {
+                g_cmd_queue.buffer[c].v_start = 0.0;
+                g_cmd_queue.buffer[c].v_end   = 0.0;
+            }
+            c = (c + 1) % QUEUE_SIZE;
+        }
+    }
+
+    // ================================================================
+    // 前瞻速度平滑（精确 S 曲线距离求解，废弃 K 系数）
+    // 直接调用 compute_dec_profile / compute_acc_profile + 二分搜索
+    // 精确计算 S 曲线真实刹车/加速距离。
+    // ================================================================
+    if (plan_count >= 3) {
+        int safe_tail = (plan_tail + 1) % QUEUE_SIZE;
+        int curr = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+        g_cmd_queue.buffer[curr].v_end = 0.0;
+
+        // ---- 1. 反向扫描 ----
+        while (curr != safe_tail) {
+            int prev = (curr - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev];
+            TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
+
+            double v_junc = calculate_junction_speed(s_prev, s_curr);
+            double d_max  = fmax(s_curr->dec, 1e-9);
+            double J_c    = seg_effective_jerk(s_curr);
+
+            double max_v_start = solve_max_vstart_scurve(
+                s_curr->v_end, s_curr->total_distance,
+                d_max, J_c, s_curr->v_target);
+
+            s_curr->v_start = fmin(v_junc, fmin(max_v_start, s_curr->v_target));
+            s_prev->v_end = s_curr->v_start;
+            curr = prev;
+        }
+
+        // plan_tail 衔接
+        if (plan_tail != tail) {
+            int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            double v_junc = calculate_junction_speed(
+                &g_cmd_queue.buffer[prev_idx], &g_cmd_queue.buffer[plan_tail]);
+            TrajectorySegment_t *sp = &g_cmd_queue.buffer[plan_tail];
+            double d_max = fmax(sp->dec, 1e-9);
+            double J_p   = seg_effective_jerk(sp);
+
+            double max_vs = solve_max_vstart_scurve(
+                sp->v_end, sp->total_distance,
+                d_max, J_p, sp->v_target);
+
+            sp->v_start = fmin(v_junc, fmin(max_vs, sp->v_target));
+        }
+
+        // ---- 2. 正向扫描 ----
+        curr = plan_tail;
+
+        while (curr != (head - 1 + QUEUE_SIZE) % QUEUE_SIZE) {
+            TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
+            int next = (curr + 1) % QUEUE_SIZE;
+
+            double a_max = fmax(s_curr->acc, 1e-9);
+            double J_c   = seg_effective_jerk(s_curr);
+
+            double max_v_end = solve_max_vend_scurve(
+                s_curr->v_start, s_curr->total_distance,
+                a_max, J_c, s_curr->v_target);
+
+            s_curr->v_end = fmin(s_curr->v_end, max_v_end);
+            s_curr->v_end = fmin(s_curr->v_end, s_curr->v_target);
+            g_cmd_queue.buffer[next].v_start = s_curr->v_end;
+            curr = next;
+        }
+    }
+
+    // ---- plan_count == 2 ----
+    if (plan_count == 2) {
+        int seg0 = plan_tail;
+        int seg1 = (plan_tail + 1) % QUEUE_SIZE;
+        TrajectorySegment_t *s0 = &g_cmd_queue.buffer[seg0];
+        TrajectorySegment_t *s1 = &g_cmd_queue.buffer[seg1];
+
+        double v_junc = calculate_junction_speed(s0, s1);
+        v_junc = fmin(v_junc, fmin(s0->v_target, s1->v_target));
+
+        double a0 = fmax(s0->acc, 1e-9);
+        double J0 = seg_effective_jerk(s0);
+        double max_ve0 = solve_max_vend_scurve(
+            s0->v_start, s0->total_distance, a0, J0, s0->v_target);
+        s0->v_end = fmin(v_junc, fmin(max_ve0, s0->v_target));
+
+        double d1 = fmax(s1->dec, 1e-9);
+        double J1 = seg_effective_jerk(s1);
+        double max_vs1 = solve_max_vstart_scurve(
+            s1->v_end, s1->total_distance, d1, J1, s1->v_target);
+        s1->v_start = fmin(s0->v_end, fmin(max_vs1, s1->v_target));
+        s0->v_end = s1->v_start;
+
+        if (plan_tail != tail) {
+            int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            double vj = calculate_junction_speed(&g_cmd_queue.buffer[prev_idx], s0);
+            double d0 = fmax(s0->dec, 1e-9);
+            double J0b = seg_effective_jerk(s0);
+            double max_vs0 = solve_max_vstart_scurve(
+                s0->v_end, s0->total_distance, d0, J0b, s0->v_target);
+            s0->v_start = fmin(vj, fmin(max_vs0, s0->v_target));
+        }
+    }
+
+    // ---- plan_count == 1 ----
+    if (plan_count == 1 && plan_tail != tail) {
+        int prev_idx = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+        TrajectorySegment_t *sp = &g_cmd_queue.buffer[plan_tail];
+        double v_junc = calculate_junction_speed(&g_cmd_queue.buffer[prev_idx], sp);
+        double d_max = fmax(sp->dec, 1e-9);
+        double J_sp  = seg_effective_jerk(sp);
+        double max_vs = solve_max_vstart_scurve(
+            sp->v_end, sp->total_distance, d_max, J_sp, sp->v_target);
+        sp->v_start = fmin(v_junc, fmin(max_vs, sp->v_target));
+    }
+
+    // ================================================================
+    // 3. 7段式 S 曲线绝对解析式预计算
+    //    严禁 ceil()！所有时间为精确 double ms。
+    //    planner 直接把 7 段入口状态全部算好，RT 线程只做查表插值。
+    // ================================================================
+    {
+        double J_default = DEFAULT_JERK_MS3;
+        int curr = plan_tail;
+
+        while (curr != head) {
+            TrajectorySegment_t *seg = &g_cmd_queue.buffer[curr];
+
+            // ---- M 代码 / 零距离：直接归零 ----
+            if (seg->cmd_type == CMD_TYPE_MCODE || seg->total_distance <= 1e-6) {
+                seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+                seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
+                seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+                seg->v4=0; seg->v5=0; seg->v6=0;
+                seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+                seg->s4=0; seg->s5=0; seg->s6=0;
+                seg->j1=0; seg->a2=0; seg->j3=0;
+                seg->j5=0; seg->a6=0; seg->j7=0;
+                seg->T_total = 1.0;
+                seg->total_distance = 0.0;
+                curr = (curr + 1) % QUEUE_SIZE;
+                continue;
+            }
+
+            double v_s   = seg->v_start;
+            double v_e   = seg->v_end;
+            double v_m   = seg->v_target;
+            double a_max = fmax(seg->acc, 1e-9);
+            double d_max = fmax(seg->dec, 1e-9);
+            double S     = seg->total_distance;
+            double J     = (seg->jerk > 1e-15) ? seg->jerk : J_default;
+
+            // 安全钳制
+            if (v_m < v_s) v_m = v_s;
+            if (v_m < v_e) v_m = v_e;
+            seg->v_target = v_m;
+
+            // ---- 步骤 1：计算加速段和减速段的 (tj, ta/td, S) ----
+            double tj_a, ta, S_acc;
+            double tj_d, td, S_dec;
+
+            compute_acc_profile(v_s, v_m, a_max, J, &tj_a, &ta, &S_acc);
+            compute_dec_profile(v_m, v_e, d_max, J, &tj_d, &td, &S_dec);
+
+            double t_cru;
+
+            // ---- 步骤 2：距离校验 ----
+            if (S_acc + S_dec <= S + 1e-9) {
+                t_cru = (v_m > 1e-12) ? (S - S_acc - S_dec) / v_m : 0.0;
+            } else {
+                // 二分查找 v_m_real
+                double lo = fmax(v_s, v_e);
+                double hi = v_m;
+
+                // ---- 防爆熔断：若最低速度仍超距，强制归零并反向传播 ----
+                {
+                    double sa_test, sd_test, dummy1, dummy2;
+                    compute_acc_profile(v_s, lo, a_max, J,
+                                        &dummy1, &dummy2, &sa_test);
+                    compute_dec_profile(lo, v_e, d_max, J,
+                                        &dummy1, &dummy2, &sd_test);
+                    if (sa_test + sd_test > S) {
+                        // 前瞻给死局，触发熔断
+                        v_s = 0.0; v_e = 0.0; lo = 0.0;
+                        seg->v_start = 0.0; seg->v_end = 0.0;
+
+                        // 反向传播：修改前驱段 v_end 以保持速度连续性
+                        // 仅修改尚未释放的前驱段
+                        if (curr != plan_tail) {
+                            int prev_idx = (curr - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+                            TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev_idx];
+                            if (atomic_load_explicit(&s_prev->is_ready,
+                                                     memory_order_acquire) == 0) {
+                                s_prev->v_end = 0.0;
+                            }
+                        }
+                    }
+                }
+
+                for (int iter = 0; iter < SCURVE_BISECT_ITERS; iter++) {
+                    double mid = 0.5 * (lo + hi);
+                    double sa, sd, d1, d2;
+                    compute_acc_profile(v_s, mid, a_max, J, &d1, &d2, &sa);
+                    compute_dec_profile(mid, v_e, d_max, J, &d1, &d2, &sd);
+                    if (sa + sd > S) hi = mid; else lo = mid;
+                }
+
+                v_m = lo;
+                seg->v_target = v_m;
+                compute_acc_profile(v_s, v_m, a_max, J, &tj_a, &ta, &S_acc);
+                compute_dec_profile(v_m, v_e, d_max, J, &tj_d, &td, &S_dec);
+                t_cru = 0.0;
+            }
+
+            if (t_cru < 0.0) t_cru = 0.0;
+
+            // ---- 步骤 3：预计算 7 段入口状态 ----
+            // 各段持续时间
+            double dt1 = tj_a;       // T1: 加加速
+            double dt2 = ta;         // T2: 匀加速
+            double dt3 = tj_a;       // T3: 减加速 (=T1, 对称)
+            double dt4 = t_cru;      // T4: 匀速
+            double dt5 = tj_d;       // T5: 加减速
+            double dt6 = td;         // T6: 匀减速
+            double dt7 = tj_d;       // T7: 减减速 (=T5, 对称)
+
+            // 累计时间节点
+            seg->T1 = dt1;
+            seg->T2 = seg->T1 + dt2;
+            seg->T3 = seg->T2 + dt3;
+            seg->T4 = seg->T3 + dt4;
+            seg->T5 = seg->T4 + dt5;
+            seg->T6 = seg->T5 + dt6;
+            seg->T7 = seg->T6 + dt7;
+            seg->T_total = seg->T7;
+
+            // 各段控制量
+            double jrk_a = (dt1 > 1e-12) ? J : 0.0;
+            double jrk_d = (dt5 > 1e-12) ? J : 0.0;
+            double a_peak = jrk_a * dt1;   // T1 结束时的加速度峰值
+            double d_peak = jrk_d * dt5;   // T5 结束时的减速度峰值
+            seg->j1 =  jrk_a;              // T1: jerk > 0
+            seg->a2 =  a_peak;             // T2: 恒定加速度 = a_peak
+            seg->j3 = -jrk_a;              // T3: jerk < 0（加速度下降）
+            seg->j5 = -jrk_d;              // T5: jerk < 0（减速度上升）
+            seg->a6 = -d_peak;             // T6: 恒定减速度 = -d_peak
+            seg->j7 =  jrk_d;              // T7: jerk > 0（减速度下降）
+
+            // 各段入口速度
+            seg->v0 = v_s;
+            seg->v1 = v_s + 0.5 * jrk_a * dt1 * dt1;
+            seg->v2 = seg->v1 + a_peak * dt2;
+            seg->v3 = v_m;                              // = seg->v2 + 0.5*jrk_a*dt3^2
+            seg->v4 = v_m;                              // 匀速不变
+            seg->v5 = v_m - 0.5 * jrk_d * dt5 * dt5;
+            seg->v6 = seg->v5 - d_peak * dt6;
+            // v7 = v_e（不存，由 v6 + 0.5*j7*dt7^2 推出）
+
+            // 各段入口位移（解析积分）
+            // T1: s = v0*t + j1*t^3/6     T2: s = v1*t + a2*t^2/2
+            // T3: s = v2*t + j3*t^3/6      T4: s = v3*t (匀速)
+            // T5: s = v4*t + j5*t^3/6      T6: s = v5*t + a6*t^2/2
+            // T7: s = v6*t + j7*t^3/6
+            seg->s0 = 0.0;
+            seg->s1 = seg->s0 + seg->v0*dt1 + seg->j1*dt1*dt1*dt1/6.0;
+            seg->s2 = seg->s1 + seg->v1*dt2 + 0.5*seg->a2*dt2*dt2;
+            seg->s3 = seg->s2 + seg->v2*dt3 + 0.5*seg->a2*dt3*dt3 + seg->j3*dt3*dt3*dt3/6.0;
+            seg->s4 = seg->s3 + seg->v3*dt4;
+            seg->s5 = seg->s4 + seg->v4*dt5 + seg->j5*dt5*dt5*dt5/6.0;
+            seg->s6 = seg->s5 + seg->v5*dt6 + 0.5*seg->a6*dt6*dt6;
+
+            // NaN / Inf 熔断（总时长上限 30s）
+            if (isnan(seg->T_total) || isinf(seg->T_total)
+                || seg->T_total <= 0.0 || seg->T_total > 30000.0) {
+                seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+                seg->T5=0; seg->T6=0; seg->T7=0;
+                seg->T_total = 1.0;
+                seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+                seg->v4=0; seg->v5=0; seg->v6=0;
+                seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+                seg->s4=0; seg->s5=0; seg->s6=0;
+                seg->j1=0; seg->a2=0; seg->j3=0;
+                seg->j5=0; seg->a6=0; seg->j7=0;
+                seg->total_distance = 0.0;
+                seg->v_target = 0.0;
+            }
+
+            curr = (curr + 1) % QUEUE_SIZE;
+        }
+    }
+
+    // ================================================================
+    // 4. 释放标志
+    // ================================================================
+    if (force_flush || plan_count < 3) {
+        int mark_curr = plan_tail;
+        while (mark_curr != head) {
+            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready,
+                                  1, memory_order_release);
+            mark_curr = (mark_curr + 1) % QUEUE_SIZE;
+        }
+    } else {
+        int safe_release_head = (head - 2 + QUEUE_SIZE) % QUEUE_SIZE;
+        if (g_cmd_queue.buffer[(head - 1 + QUEUE_SIZE) % QUEUE_SIZE].cmd_type
+            == CMD_TYPE_MCODE) {
+            safe_release_head = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+        }
+        int mark_curr = plan_tail;
+        while (mark_curr != safe_release_head) {
+            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready,
+                                  1, memory_order_release);
+            mark_curr = (mark_curr + 1) % QUEUE_SIZE;
+        }
+    }
+
+    pthread_mutex_unlock(&planner_mutex);
+}
+
+

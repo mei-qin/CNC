@@ -9,8 +9,9 @@
 #include "axis_cfg.h"
 
 #define RAPID_SPEED_MM_MIN 3000.0 // G00 快速移动速度（mm/min），可根据需要调整
-#define DEFAULT_ACC 100.0 // 默认加速度（mm/s^2），可根据需要调整
-#define DEFAULT_DEC 100.0 // 默认减速度（mm/s^2），可根据需要调整
+#define DEFAULT_ACC  100.0   // 默认加速度（mm/s^2）
+#define DEFAULT_DEC  100.0   // 默认减速度（mm/s^2）
+#define DEFAULT_JERK 5000.0  // 默认加加速度（mm/s^3）
 
 typedef struct {
     double current_pos[AXIS_NUM];

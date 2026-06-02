@@ -199,6 +199,7 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     double final_speed_ratio = 1.0;
     double final_acc_ratio   = 1.0;
     double final_dec_ratio   = 1.0;
+    double final_jerk_ratio  = 1.0;
 
     for(int i = 0; i < AXIS_NUM; i++){
         if(fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
@@ -208,18 +209,21 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
         double req_v_mm = speed_sec_mm * axis_ratio_mm;
         double req_a_mm = acc_sec_mm   * axis_ratio_mm;
         double req_d_mm = dec_sec_mm   * axis_ratio_mm;
+        double req_j_mm = DEFAULT_JERK * axis_ratio_mm;
 
-        double req_v, req_a, req_d;
+        double req_v, req_a, req_d, req_j;
         if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
             double safe_r = fmax(g_axis[i].equivalent_radius, 1e-4);
             double conv = DEG_TO_RAD * safe_r;
             req_v = req_v_mm / conv;
             req_a = req_a_mm / conv;
             req_d = req_d_mm / conv;
+            req_j = req_j_mm / conv;
         } else {
             req_v = req_v_mm;
             req_a = req_a_mm;
             req_d = req_d_mm;
+            req_j = req_j_mm;
         }
 
         if(g_axis[i].max_speed > 0.0 && req_v > g_axis[i].max_speed){
@@ -234,25 +238,42 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
             double r = g_axis[i].max_dec / req_d;
             if(r < final_dec_ratio) final_dec_ratio = r;
         }
+        if(g_axis[i].max_jerk > 0.0 && req_j > g_axis[i].max_jerk){
+            double r = g_axis[i].max_jerk / req_j;
+            if(r < final_jerk_ratio) final_jerk_ratio = r;
+        }
     }
 
     // 短板限幅：物理防爆墙，限幅后无论多小都必须服从，绝不允许再抬高！
     speed_sec_mm *= final_speed_ratio;
     acc_sec_mm   *= final_acc_ratio;
     dec_sec_mm   *= final_dec_ratio;
+    double jerk_sec_mm = DEFAULT_JERK * final_jerk_ratio;
 
     // 数学安全下限（限幅之后，仅防除零/NaN；规划器内部有 fmax(x,1e-6) 二次兜底）
     if(speed_sec_mm < 1e-6) speed_sec_mm = 1e-6;
     if(acc_sec_mm < 1e-6)   acc_sec_mm   = 1e-6;
     if(dec_sec_mm < 1e-6)   dec_sec_mm   = 1e-6;
+    if(jerk_sec_mm < 1e-6)  jerk_sec_mm  = 1e-6;
 
-    // 单位转换: mm/s → mm/ms, mm/s^2 → mm/ms^2
+    // 单位转换: mm/s → mm/ms, mm/s^2 → mm/ms^2, mm/s^3 → mm/ms^3
     seg->v_target = speed_sec_mm / 1000.0;
     seg->acc = acc_sec_mm / 1000000.0;
     seg->dec = dec_sec_mm / 1000000.0;
+    seg->jerk = jerk_sec_mm / 1.0e9;
     seg->v_start = 0.0;
     seg->v_end = 0.0;
     seg->v_max = seg->v_target;
+
+    // 7段式 S 曲线绝对解析参数初始化（由 planner_recalculate 填充）
+    seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+    seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
+    seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+    seg->v4=0; seg->v5=0; seg->v6=0;
+    seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+    seg->s4=0; seg->s5=0; seg->s6=0;
+    seg->j1=0; seg->a2=0; seg->j3=0;
+    seg->j5=0; seg->a6=0; seg->j7=0;
 
     // 所有安全检查通过，方可推进光标
     for(int i=0;i<AXIS_NUM;i++){
@@ -292,10 +313,14 @@ int api_push_mcode(int m_code, double s_value)
     seg->v_end         = 0.0;
     seg->acc           = 0.0;
     seg->dec           = 0.0;
-    seg->t_total       = 0;
-    seg->t_acc         = 0;
-    seg->t_dec         = 0;
-    seg->t_cru         = 0;
+    seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+    seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
+    seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+    seg->v4=0; seg->v5=0; seg->v6=0;
+    seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+    seg->s4=0; seg->s5=0; seg->s6=0;
+    seg->j1=0; seg->a2=0; seg->j3=0;
+    seg->j5=0; seg->a6=0; seg->j7=0;
 
     g_cmd_queue.head = next_head;
     planner_recalculate(0);
@@ -382,6 +407,7 @@ void axis_sys_init(void)
         g_axis[i].max_speed = 200.0;  // mm/s
         g_axis[i].max_acc   = 200.0;  // mm/s^2
         g_axis[i].max_dec   = 200.0;  // mm/s^2
+        g_axis[i].max_jerk  = 5000.0; // mm/s^3
         // 旋转轴等效半径默认值：用户须通过 SMC_ConfigAxisDynamics 覆盖
         g_axis[i].equivalent_radius = 0.0; // 0.0 表示未配置，退化回原始行为
     }

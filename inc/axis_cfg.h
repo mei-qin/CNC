@@ -156,6 +156,7 @@ typedef struct {
     double max_speed;     // 单轴最大允许速度 (mm/s 或 deg/s)
     double max_acc;       // 单轴最大允许加速度 (mm/s^2 或 deg/s^2)
     double max_dec;       // 单轴最大允许减速度 (mm/s^2 或 deg/s^2)
+    double max_jerk;      // 单轴最大加加速度 (mm/s^3 或 deg/s^3)，默认 5000.0
     double equivalent_radius; // 旋转轴的物理半径，单位: mm (用于弧长换算: mm = deg * (PI/180) * radius)
 
     // ③  软件限位参数（可选，视驱动器支持情况而定）
@@ -192,7 +193,7 @@ typedef enum{
 }FeedHoldState_t;
 
 typedef struct{
-    int is_moving;
+    _Atomic int is_moving;
 
     double start_pos[AXIS_NUM];
     double target_pos[AXIS_NUM];
@@ -201,8 +202,6 @@ typedef struct{
     double current_pos[AXIS_NUM];
     double v_max,v_start,v_end;
 
-    int32_t total_time_ms;
-    int32_t current_time_ms;
     double virtual_time_ms;
     double time_scale;
     FeedHoldState_t hold_state;
@@ -210,10 +209,16 @@ typedef struct{
     _Atomic int alarm_reset_request;
 
     double total_distance;
-    int32_t t_acc;
-    int32_t t_dec;
-    int32_t t_cru;
-    //int32_t t_total;
+
+    // ---- 7段式 S 曲线绝对解析参数（由 planner 预计算，RT 线程只读）----
+    // T[n] = 第 n 阶段结束时的累计虚拟时间（ms），T7 = 总时长
+    double T1, T2, T3, T4, T5, T6, T7;
+    // v[n] = 第 n 阶段入口处的瞬时速度（mm/ms）
+    double v0, v1, v2, v3, v4, v5, v6;
+    // s[n] = 第 n 阶段入口处的累计位移（mm）
+    double s0, s1, s2, s3, s4, s5, s6;
+    // 各阶段控制量：j=jerk(mm/ms^3), a=加速度(mm/ms^2)
+    double j1, a2, j3, j5, a6, j7;
 
     double v_target;
     double acc;
@@ -226,14 +231,11 @@ typedef struct{
 }Interpolator_t;
 
 /*
- * Interpolator_t 字段说明（补充，便于维护）
- * - is_moving: 是否处于运动中
- * - start_pos/target_pos/current_pos: 各轴的起始/目标/当前位置（工程单位）
- * - dir_vec: 运动方向单位向量
- * - v_max/v_start/v_end: 速度上限与起始/结束速度
- * - total_time_ms/current_time_ms: 轨迹总时长与已运行时间（ms）
- * - t_acc/t_dec/t_cru: 加速/减速/巡航时间（ms）
- * - v_target/acc/dec: 目标速度与加/减速
+ * Interpolator_t 字段说明（绝对解析式 S 曲线版）
+ * RT 线程通过 virtual_time_ms 与 T1~T7 比较确定当前阶段，
+ * 使用预计算的 v[n]/s[n]/控制量 进行无状态绝对解析求 s。
+ * T1=加加速结束, T2=匀加速结束, T3=减加速结束, T4=匀速结束,
+ * T5=加减速结束, T6=匀减速结束, T7=减减速结束=总时长。
  */
 
 typedef struct{
@@ -253,14 +255,17 @@ typedef struct{
     double v_start;
     double v_end;
 
-    int32_t t_acc;
-    int32_t t_dec;
-    int32_t t_cru;
-    int32_t t_total;
+    // ---- 7段式 S 曲线绝对解析参数（由 planner 预计算）----
+    double T1, T2, T3, T4, T5, T6, T7;
+    double v0, v1, v2, v3, v4, v5, v6;
+    double s0, s1, s2, s3, s4, s5, s6;
+    double j1, a2, j3, j5, a6, j7;
+    double T_total;  // = T7，总时长（ms）
 
     double v_target;
     double acc;
     double dec;
+    double jerk;
 }TrajectorySegment_t;
 
 
