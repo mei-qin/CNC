@@ -42,39 +42,37 @@ int SMC_InitAndStart(const char *netif_name)
 
 void SMC_Close(void)
 {
-    printf("\n[SMC_API] 收到关闭请求，执行安全下电流程...\n");
-    dorun = 0; // 通知实时线程切断动力
-    osal_usleep(2000000); 
+    printf("\n[SMC_API] 收到关闭请求，触发优雅下电时序...\n");
 
-    // 关机流程 
-    for (int i = 0; i < AXIS_NUM; i++) {
-      for(int s=0;s<g_axis[i].slave_count;s++){
-         axis_pdo_write(g_axis[i].slave_ids[s], CW_SWITCH_ON ,0); 
-       }
+    // 请求 RT 线程进入优雅下电状态机（抱闸闭合 + CiA402 降级）
+    dorun = 2;
+
+    // 阻塞等待 RT 线程完成下电状态机（最多 3 秒）
+    int wait_cycles = 30;
+    while (dorun != 0 && wait_cycles > 0) {
+        osal_usleep(100000);
+        wait_cycles--;
     }
-    ecx_send_processdata(&ctx);
-    osal_usleep(50000); 
-
-    for (int i = 0; i < AXIS_NUM; i++) {
-      for(int s=0;s<g_axis[i].slave_count;s++){
-         axis_pdo_write(g_axis[i].slave_ids[s], CW_SHUTDOWN ,0); 
-       }
+    if (dorun != 0) {
+        printf("[SMC_API] ⚠ 优雅下电超时（3s），强制降级！\n");
+        dorun = 0;
+        osal_usleep(200000);
+    } else {
+        printf("[SMC_API] RT 线程优雅下电完成。\n");
     }
-    ecx_send_processdata(&ctx);
-    osal_usleep(100000); 
 
-    // 降级与关闭
+    // 降级 EtherCAT 状态机：OP → SAFE_OP → INIT
     ctx.slavelist[0].state = EC_STATE_SAFE_OP;
     ecx_writestate(&ctx, 0);
     if (ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE) != EC_STATE_SAFE_OP) {
         printf("[ECAT警告] 切换SAFE_OP失败，但继续执行降级流程\n");
     }
     ctx.slavelist[0].state = EC_STATE_INIT;
-    ecx_writestate(&ctx, 0);     
+    ecx_writestate(&ctx, 0);
     if (ecx_statecheck(&ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE) != EC_STATE_INIT) {
         printf("[ECAT警告] 切换INIT失败，但继续关闭主站\n");
     }
-    ecx_close(&ctx); 
+    ecx_close(&ctx);
     printf("[SMC_API] 系统已安全关闭！\n");
 }
 

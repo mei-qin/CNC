@@ -124,7 +124,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
         add_time_ns(&ts, cycletime + toff);
         osal_monotonic_sleep(&ts);
 
-        if(dorun>0){
+        if(dorun == 1){
             cycle++;
             wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
@@ -540,12 +540,58 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             ecx_mbxhandler(&ctx, 0, 4);
             ecx_send_processdata(&ctx);
 
-        }else{
-            g_interpolator.is_waiting_mcode=0;
-            g_interpolator.mcode_wait_timer=0;
-            for(int i=0;i<AXIS_NUM;i++){
-               g_axis[i]._follow_err_timer=0;
+        }else if(dorun == 2){
+            // ================================================================
+            // 优雅下电状态机（1ms 实时心跳不断！）
+            // @Context: 1ms Hard-RT Thread (EtherCAT)
+            // @Danger: NO BLOCKING, NO MATH.H, NO PRINTF, NO MALLOC.
+            // 抱闸闭合期间维持 EtherCAT 心跳，防止通信丢失。
+            // ================================================================
+            wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+
+            static int shutdown_step = 0;
+            static int shutdown_counter = 0;
+
+            if(shutdown_step == 0){
+                // Step 0: 抱闸闭合等待期 — 维持位置锁定 500ms
+                for(int i=0;i<AXIS_NUM;i++){
+                    for(int s=0;s<g_axis[i].slave_count;s++){
+                        int slave_id=g_axis[i].slave_ids[s];
+                        int32_t act=axis_pdo_read_pos(slave_id);
+                        axis_pdo_write(slave_id, CW_SWITCH_ON, act);
+                    }
+                }
+                ecx_send_processdata(&ctx);
+                shutdown_counter++;
+                if(shutdown_counter >= 500){
+                    shutdown_step = 1;
+                    shutdown_counter = 0;
+                }
             }
+            else if(shutdown_step == 1){
+                // Step 1: CiA402 降级 — 切断动力，等待驱动器确认
+                int all_ready = 1;
+                for(int i=0;i<AXIS_NUM;i++){
+                    for(int s=0;s<g_axis[i].slave_count;s++){
+                        int slave_id=g_axis[i].slave_ids[s];
+                        int32_t act=axis_pdo_read_pos(slave_id);
+                        axis_pdo_write(slave_id, CW_SHUTDOWN, act);
+                        uint16 sw = axis_pdo_read_sw(slave_id);
+                        if((sw & SW_MASK) != SW_SHUTDOWN_RDY) all_ready = 0;
+                    }
+                }
+                ecx_send_processdata(&ctx);
+                shutdown_counter++;
+                if(all_ready || shutdown_counter >= 1000){
+                    // 所有轴已降级或超时，交还控制权给 SMC_Close
+                    dorun = 0;
+                    shutdown_step = 0;
+                    shutdown_counter = 0;
+                }
+            }
+
+        }else{
+            // dorun == 0: 心跳兜底（SMC_Close 执行 EtherCAT 降级期间的过渡态）
             for(int i=0;i<AXIS_NUM;i++){
                for(int s=0;s<g_axis[i].slave_count;s++){
                 int slave_id=g_axis[i].slave_ids[s];
