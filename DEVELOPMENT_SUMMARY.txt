@@ -1,7 +1,7 @@
 ================================================================
   CNC 五轴数控系统 — 代码开发总结报告
   分支: CNC_V1
-  生成时间: 2026-06-03
+  生成时间: 2026-06-04
 ================================================================
 
 一、提交历史 (从初始到最新)
@@ -20,6 +20,7 @@ ebf3d98  feat: Phase 1 安全闭环 — 软限位接入、跟随误差监控、R
 49b7173  feat: 虚拟时间平滑急停 + CiA402故障自动恢复 + 安全闭环加固
 d1d9be0  feat: 7段S曲线精确前瞻 + jerk短板限幅 + 安全加固
 8a56ecb  feat: 优雅下电时序 — 抱闸闭合心跳维持 + CiA402降级状态机
+2d34538  fix: 动态轴映射安全加固 — NULL防护/越界校验/buffer溢出修复
 
 二、功能增量总览
 ================================================================
@@ -228,6 +229,58 @@ d1d9be0  feat: 7段S曲线精确前瞻 + jerk短板限幅 + 安全加固
    - FOLLOW_ERR_MAX_PULSE 硬限超差立即截断插补器 (is_moving=0)
 
 
+【commit 2d34538】动态轴映射 + G93进给模式 + 规划器动态安全释放窗口
+----------------------------------------------------------------
+涉及文件: axis_cfg.h, axis_ctrl.h, gcode_parser.h, global_def.h,
+          axis_ctrl.c, ecat_core.c, gcode_parser.c, main.c,
+          planner.c, smc_api.c
+
+1. 动态轴映射表 (axis_ctrl.c, global_def.h, gcode_parser.c)
+   - 新增 g_axis_map[26]: 'A'-'Z' → 轴索引, -1=未映射
+   - SMC_ConfigAxisTopology 自动注册首字母映射
+   - gcode_parser 运动轴解析改为查表，废弃硬编码 X/Y/Z/A/B case
+   - 圆弧插补平面轴索引改为动态查表 (idx_x/idx_y/idx_z)
+   - 安全加固: NULL/空字符串校验, toupper 强转 unsigned char,
+     strncpy sizeof()-1 + 手动补 '\0'
+
+2. G-code 解析器重构 — 模态状态 + G93/G94 + P/Q/R (gcode_parser.c)
+   - 废弃 is_G00/is_G01/is_G02/is_G03 逐行标志,
+     改用 g_state.motion_mode 模态持续 (0=G00, 1=G01, 2=G02, 3=G03)
+   - 新增 feed_mode: FEED_MODE_G93(倒数时间), FEED_MODE_G94(每分钟)
+   - G93: F = 1/T_min, 由距离反推实际速度 v = dist / T_sec
+   - M代码扩展参数: P/Q/R, api_push_mcode 签名扩展为 5 参数
+   - 非运动组 G 代码拦截: G04/G10/G28/G92 置 is_non_motion_g=1,
+     阻止误触发运动下发
+   - 螺旋弧真实长度: sqrt(弧长² + 非平面轴位移²), 含旋转轴等效换算
+   - 零半径退化: 起终点重合则真无操作, 否则退化为直线 (G93 兼容)
+   - buffer 溢出防护: strncpy(buffer, ..., sizeof(buffer)-1) + '\0'
+
+3. 规划器动态安全释放窗口 (planner.c)
+   - 废弃 plan_count < 3 释放启发式, 改用精确 S 曲线制动距离判定
+   - compute_stop_distance(v, d_max, jerk): 调用 compute_dec_profile 精确求解
+   - 从队列尾部向前累加距离, 满足 accum >= S_stop 时标记安全边界
+   - M代码屏障: 扫描遇 CMD_TYPE_MCODE 立即截断
+   - LOOKAHEAD_MAX_SEGMENTS=100: 段数上限防无限扫描
+   - 7段预计算仅对安全窗口内段执行 (safe_release_head 边界)
+   - recompute_scurve_profile(): 单段重算, 前瞻熔断后反向传播
+     修改前驱段 v_end 时同步重算其 7段入口状态
+
+4. 微段快进 (ecat_core.c)
+   - T_total < 0.5ms 的微段: 废弃 rt_log 报错, 改为直接快进
+     current_pos = target_pos (无插补消耗)
+
+5. 解析器卡死二级看门狗 (ecat_core.c)
+   - 路径 A: 解析器已停 → 不限段数, 全部 force_flush (废除 count<3)
+   - 路径 B: 解析器标记运行但队列首尾无进展 → 2s 超时 force_flush
+   - STUCK_THRESHOLD=200 (200 × 10ms = 2s)
+
+6. 默认动力学参数调整 (main.c, gcode_parser.h)
+   - 线性轴速度: 500→50 mm/s, 加速度: 2000→200 mm/s²
+   - 旋转轴速度: 180→18 deg/s, 加速度: 720→72 deg/s²
+   - DEFAULT_ACC/DEC: 100→50 mm/s²
+   - A/B 轴脉冲当量: 1000→2777.7778 pulse/deg
+
+
 【commit 8a56ecb】优雅下电时序 — 抱闸闭合心跳维持 + CiA402降级状态机
 ----------------------------------------------------------------
 涉及文件: smc_api.c, ecat_core.c
@@ -276,17 +329,22 @@ d1d9be0  feat: 7段S曲线精确前瞻 + jerk短板限幅 + 安全加固
     (CSP 位置命令下发, 7段S曲线绝对解析插补, 跟随误差监控 0x60F4,
      龙门同步检测, CiA402 状态机, 优雅下电状态机 dorun==2)
   ecat_thread_chk     — 10ms 非实时线程
-    (从站状态检测, RT 日志异步输出, 队列饥饿看门狗)
+    (从站状态检测, RT 日志异步输出, 队列饥饿看门狗,
+     解析器卡死二级检测 2s 超时)
   parser_thread_func  — 非实时解析线程
-    (G 代码文件逐行解析, 推入命令队列)
+    (G 代码文件逐行解析, 模态状态管理, G93/G94 进给模式,
+     动态轴映射查表, 推入命令队列)
 
 数据流:
-  G代码文件 -> parse_gcode_line -> api_push_trajectory/api_push_mcode
+  G代码文件 -> parse_gcode_line (模态状态+动态轴映射+G93/G94)
+    -> api_push_trajectory/api_push_mcode (P/Q/R扩展)
     -> CommandQueue_t -> planner_recalculate (mutex + plan_tail结界)
+    -> 动态安全释放窗口 (精确制动距离 + M代码屏障 + 段数上限100)
     -> 7段S曲线精确前瞻 (solve_max_vstart/vend_scurve 二分搜索)
     -> atomic_store_release(is_ready=1)
     -> ecat_thread_rt atomic_load_acquire -> 弹出段
     -> Interpolator_t 7段绝对解析插补 (T1-T7 多项式求值)
+    -> 微段快进 (T_total<0.5ms 直接snap)
     -> 各轴 current_cmd_pos -> PDO 写入 -> 驱动器
 
 插补架构 (7段式 S 曲线):
@@ -356,17 +414,24 @@ TxPDO 映射 (每从站 10 字节):
   - dorun==2 状态机: 抱闸闭合 500ms + CiA402 降级 ≤1000ms
   - 全程 1ms EtherCAT 心跳不断, 修复 Z 轴下电通信丢失
 
+[已完成] 动态轴映射 + G93/G94 进给模式 + 规划器动态安全释放窗口
+  - g_axis_map[26]: 'A'-'Z' → 轴索引, 解析器/圆弧插补统一查表
+  - G-code 模态状态: motion_mode 持续, feed_mode 支持 G93(倒数时间)/G94(每分钟)
+  - G93 进给速度: F=1/T_min, 距离反推实际速度, 螺旋弧真实长度计算
+  - M代码扩展参数 P/Q/R, 非运动组 G 代码拦截 (G04/G10/G28/G92)
+  - 规划器: 废弃 plan_count<3, 改用精确制动距离 + M代码屏障 + 段数上限100
+  - 微段快进: T_total<0.5ms 直接 snap 到目标位置
+  - 解析器卡死二级看门狗: 2s 无进展触发 force_flush
+
 
 五、已知限制与后续计划
 ================================================================
 
 Phase 4 (高级功能):
   - 刀具半径补偿 (G41/G42)
-  - 多段预读缓冲优化 (当前 plan_count<3 立即释放)
   - 实时进给率倍率 (Feed Override)
   - 电子齿轮/凸轮模式
-  - G28 机械原点复归 / G93 进给率模式
-  - G17/G18/G19 平面选择
+  - G28 机械原点复归
   - 故障记录持久化
 
 ================================================================
