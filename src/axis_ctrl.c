@@ -8,6 +8,7 @@
 #include "gcode_parser.h"
 /************************ 全局变量定义（仅轴相关，其余在ecat_core.c） ************************/
 AxisCtrl_t g_axis[AXIS_NUM];            // 五轴核心数组，全局唯一定义
+int g_axis_map[26];                     // 动态轴映射表：'A'-'Z' → 轴索引，-1=未映射
 int g_all_axis_op_ready = 0;            // 五轴均使能就绪标志
 int g_all_axis_reach = 0;               // 五轴均目标到达标志
 Interpolator_t g_interpolator={0};
@@ -286,7 +287,7 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
 }
 
 
-int api_push_mcode(int m_code, double s_value)
+int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value)
 {
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
         printf("[SAFETY] 系统报警中，拒绝入队M代码指令！\n");
@@ -306,6 +307,9 @@ int api_push_mcode(int m_code, double s_value)
     seg->cmd_type      = CMD_TYPE_MCODE;
     seg->m_code        = m_code;
     seg->s_value       = s_value;
+    seg->p_value       = p_value;
+    seg->q_value       = q_value;
+    seg->r_value       = r_value;
     seg->is_ready      = 0;
     seg->total_distance = 0.0;
     seg->v_target      = 0.0;
@@ -386,6 +390,7 @@ void axis_sys_init(void)
 
     // 1. 轴数据结构初始化
     memset(g_axis,0,sizeof(g_axis));
+    for(int i=0;i<26;i++) g_axis_map[i]=-1; // 轴映射表全部置为未映射
 
     // 2. 插补器和命令队列初始化
     memset(&g_interpolator,0,sizeof(Interpolator_t));

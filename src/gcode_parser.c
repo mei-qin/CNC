@@ -5,10 +5,10 @@
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
 
-GCodeState_t g_state = {{0}, 1000.0, 1, 17}; // 全局G-code状态变量，默认XY平面
+GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94}; // motion_mode=1(G01), feed_mode=G94
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
 extern int api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
-extern int api_push_mcode(int m_code, double s_value);
+extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
 
 const char* skip_spaces(const char* str)
 {
@@ -19,19 +19,18 @@ const char* skip_spaces(const char* str)
 int parse_gcode_line(const char *gcode_line)
 {
     char buffer[128];
-    strncpy(buffer, gcode_line, sizeof(buffer));
-    
-    int is_G00=0,is_G01=0,is_G02=0,is_G03=0;
+    strncpy(buffer, gcode_line, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
     int has_move=0;
-    //int has_x=0,has_y=0,has_z=0;
     int has_axis[AXIS_NUM]={0};
-
     double val_axis[AXIS_NUM]={0};
-    //double val_x=0,val_y=0,val_z=0;
-    double offset_i=0.0,offset_j=0.0,offset_k=0.0;// 圆弧中心相对起点的偏移量，G02/G03专用
-    int m_code=-1;        // M代码编号（-1表示无M代码）
-    double s_value=0.0;   // S值（主轴转速等）
-
+    double offset_i=0.0,offset_j=0.0,offset_k=0.0; // 圆弧偏移：非模态，逐行清零
+    int m_code=-1;
+    double s_value=0.0;
+    double p_value=0.0, q_value=0.0, r_value=0.0; // M代码扩展参数
+    int is_non_motion_g=0; // 非运动组拦截锁：G04/G10/G28/G92 等
+    int has_f=0;           // F 值存在标志（G93 非模态校验）
 
     char *p=buffer;
     while(*p!='\0'){
@@ -40,51 +39,61 @@ int parse_gcode_line(const char *gcode_line)
 
         char letter=toupper(*p);
         p++;
-
-        double value=strtod(p, &p); // 解析数字，p会更新到数字后面的位置
+        double value=strtod(p, &p);
 
         switch(letter){
             case 'G':
-                if(value==0.0) is_G00=1;
-                else if(value==1.0) is_G01=1;
-                else if(value==90.0) g_state.is_absolute=1;
-                else if(value==91.0) g_state.is_absolute=0;
-                else if(value==2.0) is_G02=1;
-                else if(value==3.0) is_G03=1;
+                if(value==0.0)      g_state.motion_mode=0; // G00 快速
+                else if(value==1.0) g_state.motion_mode=1; // G01 直线
+                else if(value==2.0) g_state.motion_mode=2; // G02 顺弧
+                else if(value==3.0) g_state.motion_mode=3; // G03 逆弧
+                else if(value==4.0)  is_non_motion_g=1;    // G04 暂停
+                else if(value==10.0) is_non_motion_g=1;    // G10 数据设定
                 else if(value==17.0) g_state.active_plane=17;
                 else if(value==18.0) g_state.active_plane=18;
                 else if(value==19.0) g_state.active_plane=19;
-                  
+                else if(value==28.0) is_non_motion_g=1;    // G28 返回参考点
+                else if(value==90.0) g_state.is_absolute=1;
+                else if(value==91.0) g_state.is_absolute=0;
+                else if(value==92.0) is_non_motion_g=1;    // G92 坐标偏移
+                else if(value==93.0) g_state.feed_mode=FEED_MODE_G93; // G93 倒数时间
+                else if(value==94.0) g_state.feed_mode=FEED_MODE_G94; // G94 每分钟
                 break;
-            case 'X':val_axis[0]=value;has_move=1;has_axis[0]=1; break;
-            case 'Y':val_axis[1]=value;has_move=1;has_axis[1]=1; break;
-            case 'Z':val_axis[2]=value;has_move=1;has_axis[2]=1; break;
-            case 'A':if(AXIS_NUM>3){val_axis[3]=value;has_move=1;has_axis[3]=1;} break;
-            case 'B':if(AXIS_NUM>4){val_axis[4]=value;has_move=1;has_axis[4]=1;} break;
-            case 'F':g_state.feedrate_mm_min=value;break;
-            case 'I':offset_i=value;break;
-            case 'J':offset_j=value;break;
-            case 'K':offset_k=value;break;
+            case 'F':g_state.feedrate_mm_min=value;has_f=1;break;
+            case 'I':offset_i=value;has_move=1;break;
+            case 'J':offset_j=value;has_move=1;break;
+            case 'K':offset_k=value;has_move=1;break;
             case 'M':m_code=(int)value;break;
+            case 'P':p_value=value;break;
+            case 'Q':q_value=value;break;
+            case 'R':r_value=value;break;
             case 'S':s_value=value;break;
             default:
-                // 其他命令暂不处理
+                // 动态轴映射：任何 A-Z 字母若在 g_axis_map 中有映射则视为运动轴
+                if(letter >= 'A' && letter <= 'Z'){
+                    int idx = g_axis_map[letter - 'A'];
+                    if(idx >= 0 && idx < AXIS_NUM){
+                        val_axis[idx] = value;
+                        has_move = 1;
+                        has_axis[idx] = 1;
+                    }
+                    // 未映射字母静默忽略（可能是注释残留或非标指令）
+                }
                 break;
         }
-
     }
 
     // 处理M代码：压入队列作为同步屏障
     if (m_code >= 0) {
-        if(api_push_mcode(m_code, s_value) < 0){
+        if(api_push_mcode(m_code, s_value, p_value, q_value, r_value) < 0){
             printf("[Parser] M代码入队失败(报警)，中止当前文件！\n");
             return -1;
         }
-        printf("[Parser] 解析M代码: M%02d S%.1f\n", m_code, s_value);
+        printf("[Parser] 解析M代码: M%02d S%.1f P%.1f Q%.1f R%.1f\n", m_code, s_value, p_value, q_value, r_value);
     }
 
-    if(is_G00||is_G01||is_G02||is_G03||has_move){
-
+    // 运动门控：仅当本行包含显式轴运动且非运动参数指令时才触发轨迹下发
+    if(has_move && !is_non_motion_g){
         double target_pos[AXIS_NUM];
         double start_pos[AXIS_NUM];
 
@@ -95,11 +104,9 @@ int parse_gcode_line(const char *gcode_line)
             }else{
                 target_pos[i]=g_state.current_pos[i]+(has_axis[i]?val_axis[i]:0);
             }
-
         }
 
-        double run_speed_mm=is_G00?RAPID_SPEED_MM_MIN:g_state.feedrate_mm_min;
-
+        // 坐标变换：逻辑坐标 → 机械坐标
         double machine_target_pos[AXIS_NUM];
         double machine_start_pos[AXIS_NUM];
 
@@ -114,43 +121,80 @@ int parse_gcode_line(const char *gcode_line)
             }
         }
 
+        // 多轴等效距离计算（用于 G93 速度反推）
+        double dist_total = 0.0;
+        for(int i=0;i<AXIS_NUM;i++){
+            double delta = machine_target_pos[i] - machine_start_pos[i];
+            if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
+                // 旋转轴：角度 → 弧长 (mm)
+                delta = delta * (PI / 180.0) * g_axis[i].equivalent_radius;
+            }
+            dist_total += delta * delta;
+        }
+        dist_total = sqrt(dist_total);
 
-        if(is_G02||is_G03){
+        // 进给速度计算：G00 始终快速，G93 按时间反推，G94 直取 F 值
+        double run_speed_mm;   // mm/min
+        double g93_T_sec = 0.0;
+
+        if(g_state.motion_mode == 0){
+            run_speed_mm = RAPID_SPEED_MM_MIN;
+        } else if(g_state.feed_mode == FEED_MODE_G93){
+            if(!has_f){
+                printf("[Parser] G93 模式下每行运动指令必须显式给出 F 值！\n");
+                return -1;
+            }
+            if(g_state.feedrate_mm_min <= 1e-6){
+                printf("[Parser] G93 F值过小(%.6f)，除零风险，拒绝下发！\n", g_state.feedrate_mm_min);
+                return -1;
+            }
+            g93_T_sec = 60.0 / g_state.feedrate_mm_min;
+            double v_req = dist_total / g93_T_sec;
+            if(v_req < 1e-6) v_req = 1e-6;
+            run_speed_mm = v_req * 60.0;
+        } else {
+            run_speed_mm = g_state.feedrate_mm_min;
+        }
+
+        if(g_state.motion_mode==2 || g_state.motion_mode==3){
             double off_1st, off_2nd;
             switch(g_state.active_plane){
-                case 18: off_1st=offset_k; off_2nd=offset_i; break; // ZX: K→Z, I→X
-                case 19: off_1st=offset_j; off_2nd=offset_k; break; // YZ: J→Y, K→Z
-                default: off_1st=offset_i; off_2nd=offset_j; break; // XY: I→X, J→Y
+                case 18: off_1st=offset_k; off_2nd=offset_i; break;
+                case 19: off_1st=offset_j; off_2nd=offset_k; break;
+                default: off_1st=offset_i; off_2nd=offset_j; break;
             }
             if(generate_arc_trajectory(machine_start_pos,
                                     machine_target_pos,
                                     off_1st, off_2nd,
-                                    is_G02, run_speed_mm) < 0){
+                                    g_state.motion_mode==2, run_speed_mm, g93_T_sec) < 0){
                 printf("[Parser] 圆弧入队失败(报警)，中止当前文件！\n");
                 return -1;
             }
 
-        } else{
-
+        } else {
             double speed_mm_sec=run_speed_mm/60.0;
-
             if(api_push_trajectory(machine_target_pos,speed_mm_sec,DEFAULT_ACC,DEFAULT_DEC) < 0){
                 printf("[Parser] 运动指令入队失败(报警)，中止当前文件！\n");
                 return -1;
             }
-
         }
 
         for(int i=0;i<AXIS_NUM;i++){
             g_state.current_pos[i]=target_pos[i];
         }
 
-        printf("[Parser] 解析命令: %s -> 目标 (%.3f, %.3f, %.3f) mm, 速度 %.1f mm/min\n",
-                buffer, target_pos[0], target_pos[1], target_pos[2], run_speed_mm);
-
-
-
+        // 动态打印：按 g_axis_map 映射输出已配置轴的标签与数值
+        printf("[Parser] %s -> ", buffer);
+        const char axis_labels[] = "XYZABCUVW";
+        for(int k=0;k<9;k++){
+            int idx = g_axis_map[axis_labels[k] - 'A'];
+            if(idx >= 0 && idx < AXIS_NUM){
+                printf("%c=%.3f ", axis_labels[k], target_pos[idx]);
+            }
+        }
+        printf("F=%.1f\n", run_speed_mm);
     }
+
     return 0;
 }
 
@@ -216,22 +260,35 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
 
 // @Context: Non-RealTime Background Thread (parser)
 // offset_1st / offset_2nd: 圆心相对于起点在平面第一轴/第二轴方向的偏移
+// feedrate_mm_min: G94 进给速度 (mm/min)，G93 模式下仅零半径退化时使用
+// g93_T_sec: G93 模式下整段圆弧的可用时间(秒)，<=0 表示 G94 模式
 // 返回值: 0=成功, -1=入队被拒(报警)
 int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
                              double offset_1st, double offset_2nd,
-                             int is_CW,double feedrate_mm_min)
+                             int is_CW,double feedrate_mm_min,double g93_T_sec)
 {
-    // ---- 动态轴映射 ----
-    int ax1, ax2;
-    if((g_state.active_plane == 18 || g_state.active_plane == 19) && AXIS_NUM < 3){
-        printf("[Parser] G%d 需要3轴以上，当前 AXIS_NUM=%d，拒绝执行！\n",
-               g_state.active_plane, AXIS_NUM);
-        return -1;
-    }
+    // ---- 动态平面轴映射：查表获取 X/Y/Z 的真实轴索引 ----
+    int idx_x = g_axis_map['X' - 'A'];
+    int idx_y = g_axis_map['Y' - 'A'];
+    int idx_z = g_axis_map['Z' - 'A'];
+    int ax1 = -1, ax2 = -1;
+
     switch(g_state.active_plane){
-        case 18: ax1=2; ax2=0; break; // ZX: 第一轴Z, 第二轴X
-        case 19: ax1=1; ax2=2; break; // YZ: 第一轴Y, 第二轴Z
-        default: ax1=0; ax2=1; break; // XY: 第一轴X, 第二轴Y
+        case 18: // ZX平面
+            if(idx_z < 0 || idx_z >= AXIS_NUM || idx_x < 0 || idx_x >= AXIS_NUM){
+                printf("[Parser] G18 ZX平面要求 X/Z 轴均已映射！\n"); return -1;
+            }
+            ax1=idx_z; ax2=idx_x; break;
+        case 19: // YZ平面
+            if(idx_y < 0 || idx_y >= AXIS_NUM || idx_z < 0 || idx_z >= AXIS_NUM){
+                printf("[Parser] G19 YZ平面要求 Y/Z 轴均已映射！\n"); return -1;
+            }
+            ax1=idx_y; ax2=idx_z; break;
+        default: // XY平面
+            if(idx_x < 0 || idx_x >= AXIS_NUM || idx_y < 0 || idx_y >= AXIS_NUM){
+                printf("[Parser] G17 XY平面要求 X/Y 轴均已映射！\n"); return -1;
+            }
+            ax1=idx_x; ax2=idx_y; break;
     }
 
     // ---- 1. 圆心坐标 ----
@@ -240,7 +297,23 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
 
     // ---- 2. 半径 ----
     double radius = hypot(start_pos[ax1] - cx, start_pos[ax2] - cy);
-    if(radius < 0.001) return 0;
+    if(radius < 0.001) {
+        // 零半径退化：起终点重合则真无操作，否则退化为直线以防位置漂移
+        double dist_sq = 0.0;
+        for(int j = 0; j < AXIS_NUM; j++){
+            double d = end_pos[j] - start_pos[j];
+            dist_sq += d * d;
+        }
+        if(dist_sq < 1e-12) return 0;
+        double speed_mm_sec;
+        if(g93_T_sec > 1e-9){
+            speed_mm_sec = sqrt(dist_sq) / g93_T_sec;
+            if(speed_mm_sec < 1e-6) speed_mm_sec = 1e-6;
+        }else{
+            speed_mm_sec = feedrate_mm_min / 60.0;
+        }
+        return api_push_trajectory(end_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
+    }
 
     // ---- 3. 起始/结束角度 ----
     double theta_start = atan2(start_pos[ax2] - cy, start_pos[ax1] - cx);
@@ -255,14 +328,34 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
 
     double total_angle = theta_end - theta_start;
 
-    // ---- 5. 分段数 ----
+    // ---- 5. 分段数与切向速度 ----
     double arc_length = fabs(total_angle) * radius;
     int num_segments = (int)ceil(arc_length / ARC_SEGMENT_LENGTH_MM);
     if(num_segments < 1) num_segments = 1;
 
-    double angle_step = total_angle / num_segments;
-    double speed_mm_sec = feedrate_mm_min / 60.0;
+    // 螺旋真实空间长度 = sqrt(弧长² + 非平面轴位移²)
+    double non_plane_dist_sq = 0.0;
+    for(int j = 0; j < AXIS_NUM; j++){
+        if(j != ax1 && j != ax2){
+            double delta = end_pos[j] - start_pos[j];
+            if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
+            }
+            non_plane_dist_sq += delta * delta;
+        }
+    }
+    double helical_length = sqrt(arc_length * arc_length + non_plane_dist_sq);
 
+    // G93: 用螺旋真实长度 / T_sec 反推速度，保证绝对时间到达
+    double speed_mm_sec;
+    if(g93_T_sec > 1e-9){
+        speed_mm_sec = helical_length / g93_T_sec;
+        if(speed_mm_sec < 1e-6) speed_mm_sec = 1e-6;
+    }else{
+        speed_mm_sec = feedrate_mm_min / 60.0;
+    }
+
+    double angle_step = total_angle / num_segments;
     double next_pos[AXIS_NUM];
 
     // ---- 6. 逐点插补 ----
@@ -293,6 +386,7 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
         }
     }
 
-    printf("[Parser] 生成了 %d 个圆弧插补点 (平面 G%d)\n", num_segments, g_state.active_plane);
+    printf("[Parser] 生成了 %d 个圆弧插补点 (平面 G%d, 速度 %.2f mm/s)\n",
+           num_segments, g_state.active_plane, speed_mm_sec);
     return 0;
 }

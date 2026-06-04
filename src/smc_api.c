@@ -107,21 +107,35 @@ void SMC_AbortProcessing() { g_parser_ctrl.abort_request = 1; }
 
 
 
-int SMC_ConfigAxisTopology(int axis_idx, const char* name,int is_dual_drive,int master_id,int slave_id){
+// @Context: Non-RealTime Background Thread
+// @Thread-Safety: 写入 g_axis[] 和 g_axis_map[]，仅允许初始化阶段调用
+int SMC_ConfigAxisTopology(int axis_idx, const char* axis_name,int is_dual_drive,int master_id,int slave_id){
     if(axis_idx < 0 || axis_idx >= AXIS_NUM) {
         printf("[SMC_API] 轴索引越界！输入索引：%d，最大索引：%d\n", axis_idx, AXIS_NUM-1);
         return -1;
     }
-    strncpy(g_axis[axis_idx].axis_name,name, 15);
+    if(axis_name == NULL || axis_name[0] == '\0') {
+        printf("[SMC_API] 轴名不能为空！轴索引：%d\n", axis_idx);
+        return -1;
+    }
+    strncpy(g_axis[axis_idx].axis_name, axis_name, sizeof(g_axis[axis_idx].axis_name) - 1);
+    g_axis[axis_idx].axis_name[sizeof(g_axis[axis_idx].axis_name) - 1] = '\0';
+
+    // 动态轴映射：提取轴名首字母 → 映射到轴索引
+    char first = toupper((unsigned char)axis_name[0]);
+    if(first >= 'A' && first <= 'Z'){
+        g_axis_map[first - 'A'] = axis_idx;
+    }
+
     if(is_dual_drive){
         g_axis[axis_idx].slave_ids[0]=master_id;
         g_axis[axis_idx].slave_ids[1]=slave_id;
         g_axis[axis_idx].slave_count=2;
-        printf("[SMC_API] 配置 %s 为双驱，主ID: %d, 从ID: %d\n", name, master_id, slave_id);
+        printf("[SMC_API] 配置 %s 为双驱，主ID: %d, 从ID: %d\n", axis_name, master_id, slave_id);
     }else{
         g_axis[axis_idx].slave_ids[0]=master_id;
         g_axis[axis_idx].slave_count=1;
-        printf("[SMC_API] 配置 %s 为单驱，主ID: %d\n", name, master_id);
+        printf("[SMC_API] 配置 %s 为单驱，主ID: %d\n", axis_name, master_id);
     }
     return 0;
 }

@@ -66,22 +66,22 @@ int main(int argc, char *argv[])
     SMC_ConfigPulsePerUnit(SMC_AXIS_X, 10000.0); // 1 mm = 10000 脉冲
     SMC_ConfigPulsePerUnit(SMC_AXIS_Y, 10000.0); // 1 mm = 10000 脉冲
     SMC_ConfigPulsePerUnit(SMC_AXIS_Z, 1000.0);  // 1 mm = 1000 脉冲
-    SMC_ConfigPulsePerUnit(SMC_AXIS_A, 1000.0); // 1 度 = 1000 脉冲
-    SMC_ConfigPulsePerUnit(SMC_AXIS_B, 1000.0); // 1 度 = 1000 脉冲
+    SMC_ConfigPulsePerUnit(SMC_AXIS_A, 2777.7778); // 1 度 = 1000 脉冲
+    SMC_ConfigPulsePerUnit(SMC_AXIS_B, 2777.7778); // 1 度 = 1000 脉冲
 
     // ==========================================
     // 4. 动力学约束与量纲护城河配置 (极其核心)
     // 参数: (轴号, 类型[0线/1旋], 最大速度, 最大加速度, 最大减速度, 等效半径)
     // ==========================================
     // 线性轴 (速度 mm/s, 加速度 mm/s^2)
-    SMC_ConfigAxisDynamics(SMC_AXIS_X, 0, 500.0, 2000.0, 2000.0, 0.0);
-    SMC_ConfigAxisDynamics(SMC_AXIS_Y, 0, 500.0, 2000.0, 2000.0, 0.0);
-    SMC_ConfigAxisDynamics(SMC_AXIS_Z, 0, 300.0, 1000.0, 1000.0, 0.0); // Z轴带主轴较重，参数保守
+    SMC_ConfigAxisDynamics(SMC_AXIS_X, 0, 50.0, 200.0, 200.0, 0.0);
+    SMC_ConfigAxisDynamics(SMC_AXIS_Y, 0, 50.0, 200.0, 200.0, 0.0);
+    SMC_ConfigAxisDynamics(SMC_AXIS_Z, 0, 30.0, 100.0, 100.0, 0.0); // Z轴带主轴较重，参数保守
     
     // 旋转轴 (速度 度/s, 加速度 度/s^2, 等效半径 mm/deg)
     // 假设 A 轴挂载的工件半径约 50mm，B 轴旋转盘半径约 80mm
-    SMC_ConfigAxisDynamics(SMC_AXIS_A, 1, 180.0, 720.0, 720.0, 50.0); 
-    SMC_ConfigAxisDynamics(SMC_AXIS_B, 1, 180.0, 720.0, 720.0, 80.0);
+    SMC_ConfigAxisDynamics(SMC_AXIS_A, 1, 18.0, 72.0, 72.0, 50.0); 
+    SMC_ConfigAxisDynamics(SMC_AXIS_B, 1, 18.0, 72.0, 72.0, 80.0);
 
     // ==========================================
     // 5. 规划器参数与安全预警配置

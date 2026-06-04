@@ -246,6 +246,9 @@ typedef struct{
     int cmd_type;       // CMD_TYPE_MOTION 或 CMD_TYPE_MCODE
     int m_code;         // M代码编号（如 3=M03, 5=M05）
     double s_value;     // S值（如主轴转速）
+    double p_value;     // P参数（激光功率、宏程序参数等）
+    double q_value;     // Q参数
+    double r_value;     // R参数
 
     double total_distance;
     double dir_vec[AXIS_NUM];

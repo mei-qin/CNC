@@ -29,6 +29,7 @@ extern int g_all_axis_enabled;
 extern int64 ec_DCtime;                 // SOEM 提供的全局变量，单位 ns
 /************************ 五轴全局核心变量 ************************/
 extern AxisCtrl_t g_axis[AXIS_NUM];     // 五轴控制数组（核心！）
+extern int g_axis_map[26];              // 动态轴映射表：'A'-'Z' → 轴索引，-1=未映射
 extern int g_all_axis_op_ready;         // 全局标志：五轴均使能就绪
 extern int g_all_axis_reach;            // 全局标志：五轴均目标到达
 extern int g_csp_ready; 

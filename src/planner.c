@@ -1,4 +1,5 @@
 #include "planner.h"
+#include "gcode_parser.h"
 
 // ====================================================================
 // 7 段式 S 曲线 (Jerk Control) — 绝对解析式预计算
@@ -12,6 +13,8 @@
 #define SCURVE_BISECT_ITERS  20
 // 前瞻精确求解迭代次数
 #define LOOKAHEAD_BISECT_ITERS  24
+// 动态预读最大段数
+#define LOOKAHEAD_MAX_SEGMENTS  100
 
 // --------------------------------------------------------------------
 // 加速段 v_s → v_m 的时序与距离
@@ -108,6 +111,155 @@ static double solve_max_vend_scurve(double v_start, double S,
 static inline double seg_effective_jerk(const TrajectorySegment_t *seg)
 {
     return (seg->jerk > 1e-15) ? seg->jerk : DEFAULT_JERK_MS3;
+}
+
+// --------------------------------------------------------------------
+// 精确 S 曲线制动距离 (v → 0)
+// @Context: Non-RealTime Background Thread
+// --------------------------------------------------------------------
+static double compute_stop_distance(double v, double d_max, double jerk)
+{
+    if (v <= 1e-12 || d_max <= 1e-15 || jerk <= 1e-15) return 0.0;
+    double tj, td, S;
+    compute_dec_profile(v, 0.0, d_max, jerk, &tj, &td, &S);
+    return S;
+}
+
+// --------------------------------------------------------------------
+// 重算单段的 7 段式 S 曲线预计算（含内部距离熔断）
+// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// 注意：此函数不执行反向传播，仅保证本段 T1~T7 与 v_start/v_end 自洽
+// --------------------------------------------------------------------
+static void recompute_scurve_profile(TrajectorySegment_t *seg)
+{
+    if (seg->cmd_type == CMD_TYPE_MCODE || seg->total_distance <= 1e-6) {
+        seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+        seg->T5=0; seg->T6=0; seg->T7=0; seg->T_total=0;
+        seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+        seg->v4=0; seg->v5=0; seg->v6=0;
+        seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+        seg->s4=0; seg->s5=0; seg->s6=0;
+        seg->j1=0; seg->a2=0; seg->j3=0;
+        seg->j5=0; seg->a6=0; seg->j7=0;
+        seg->T_total = 1.0;
+        seg->total_distance = 0.0;
+        return;
+    }
+
+    double v_s   = seg->v_start;
+    double v_e   = seg->v_end;
+    double v_m   = seg->v_target;
+    double a_max = fmax(seg->acc, 1e-9);
+    double d_max = fmax(seg->dec, 1e-9);
+    double S     = seg->total_distance;
+    double J     = (seg->jerk > 1e-15) ? seg->jerk : DEFAULT_JERK_MS3;
+
+    if (v_m < v_s) v_m = v_s;
+    if (v_m < v_e) v_m = v_e;
+    seg->v_target = v_m;
+
+    double tj_a, ta, S_acc;
+    double tj_d, td, S_dec;
+
+    compute_acc_profile(v_s, v_m, a_max, J, &tj_a, &ta, &S_acc);
+    compute_dec_profile(v_m, v_e, d_max, J, &tj_d, &td, &S_dec);
+
+    double t_cru;
+
+    if (S_acc + S_dec <= S + 1e-9) {
+        t_cru = (v_m > 1e-12) ? (S - S_acc - S_dec) / v_m : 0.0;
+    } else {
+        double lo = fmax(v_s, v_e);
+        double hi = v_m;
+
+        /* 内部距离熔断：若最低可行速度仍超距，钳制到 0 */
+        {
+            double sa_test, sd_test, d1, d2;
+            compute_acc_profile(v_s, lo, a_max, J, &d1, &d2, &sa_test);
+            compute_dec_profile(lo, v_e, d_max, J, &d1, &d2, &sd_test);
+            if (sa_test + sd_test > S) {
+                v_s = 0.0; v_e = 0.0; lo = 0.0;
+                seg->v_start = 0.0; seg->v_end = 0.0;
+            }
+        }
+
+        for (int iter = 0; iter < SCURVE_BISECT_ITERS; iter++) {
+            double mid = 0.5 * (lo + hi);
+            double sa, sd, d1, d2;
+            compute_acc_profile(v_s, mid, a_max, J, &d1, &d2, &sa);
+            compute_dec_profile(mid, v_e, d_max, J, &d1, &d2, &sd);
+            if (sa + sd > S) hi = mid; else lo = mid;
+        }
+
+        v_m = lo;
+        seg->v_target = v_m;
+        compute_acc_profile(v_s, v_m, a_max, J, &tj_a, &ta, &S_acc);
+        compute_dec_profile(v_m, v_e, d_max, J, &tj_d, &td, &S_dec);
+        t_cru = 0.0;
+    }
+
+    if (t_cru < 0.0) t_cru = 0.0;
+
+    double dt1 = tj_a;
+    double dt2 = ta;
+    double dt3 = tj_a;
+    double dt4 = t_cru;
+    double dt5 = tj_d;
+    double dt6 = td;
+    double dt7 = tj_d;
+
+    seg->T1 = dt1;
+    seg->T2 = seg->T1 + dt2;
+    seg->T3 = seg->T2 + dt3;
+    seg->T4 = seg->T3 + dt4;
+    seg->T5 = seg->T4 + dt5;
+    seg->T6 = seg->T5 + dt6;
+    seg->T7 = seg->T6 + dt7;
+    seg->T_total = seg->T7;
+
+    double jrk_a = (dt1 > 1e-12) ? J : 0.0;
+    double jrk_d = (dt5 > 1e-12) ? J : 0.0;
+    double a_peak = jrk_a * dt1;
+    double d_peak = jrk_d * dt5;
+
+    seg->j1 =  jrk_a;
+    seg->a2 =  a_peak;
+    seg->j3 = -jrk_a;
+    seg->j5 = -jrk_d;
+    seg->a6 = -d_peak;
+    seg->j7 =  jrk_d;
+
+    seg->v0 = v_s;
+    seg->v1 = v_s + 0.5 * jrk_a * dt1 * dt1;
+    seg->v2 = seg->v1 + a_peak * dt2;
+    seg->v3 = v_m;
+    seg->v4 = v_m;
+    seg->v5 = v_m - 0.5 * jrk_d * dt5 * dt5;
+    seg->v6 = seg->v5 - d_peak * dt6;
+
+    seg->s0 = 0.0;
+    seg->s1 = seg->s0 + seg->v0*dt1 + seg->j1*dt1*dt1*dt1/6.0;
+    seg->s2 = seg->s1 + seg->v1*dt2 + 0.5*seg->a2*dt2*dt2;
+    seg->s3 = seg->s2 + seg->v2*dt3 + 0.5*seg->a2*dt3*dt3 + seg->j3*dt3*dt3*dt3/6.0;
+    seg->s4 = seg->s3 + seg->v3*dt4;
+    seg->s5 = seg->s4 + seg->v4*dt5 + seg->j5*dt5*dt5*dt5/6.0;
+    seg->s6 = seg->s5 + seg->v5*dt6 + 0.5*seg->a6*dt6*dt6;
+
+    /* NaN / Inf 熔断（总时长上限 30s） */
+    if (isnan(seg->T_total) || isinf(seg->T_total)
+        || seg->T_total <= 0.0 || seg->T_total > 30000.0) {
+        seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
+        seg->T5=0; seg->T6=0; seg->T7=0;
+        seg->T_total = 1.0;
+        seg->v0=0; seg->v1=0; seg->v2=0; seg->v3=0;
+        seg->v4=0; seg->v5=0; seg->v6=0;
+        seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
+        seg->s4=0; seg->s5=0; seg->s6=0;
+        seg->j1=0; seg->a2=0; seg->j3=0;
+        seg->j5=0; seg->a6=0; seg->j7=0;
+        seg->total_distance = 0.0;
+        seg->v_target = 0.0;
+    }
 }
 
 // ====================================================================
@@ -291,15 +443,59 @@ void planner_recalculate(int force_flush)
     }
 
     // ================================================================
-    // 3. 7段式 S 曲线绝对解析式预计算
+    // 3. 动态安全释放窗口 — 精确 S 曲线制动距离判定
+    //    从队列尾部向前累加距离，找到满足刹停要求的最远安全边界。
+    //    条件：(a) accum >= S_stop(v_target)  (b) M代码屏障
+    //          (c) LOOKAHEAD_MAX_SEGMENTS      (d) force_flush / 解析器已停
+    // ================================================================
+    int safe_release_head;  // 含：此索引及之前的段均可释放
+    {
+        safe_release_head = (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE; // 默认不释放
+
+        if (force_flush || !g_parser_ctrl.is_running) {
+            // 强制清空或解析器已停：全部释放
+            safe_release_head = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+        } else {
+            double accum = 0.0;
+            int scan = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            int seg_count = 0;
+
+            while (scan != (plan_tail - 1 + QUEUE_SIZE) % QUEUE_SIZE) {
+                TrajectorySegment_t *seg = &g_cmd_queue.buffer[scan];
+
+                // M代码屏障：前序段到此为止均可安全释放
+                if (seg->cmd_type == CMD_TYPE_MCODE) {
+                    safe_release_head = scan;
+                    break;
+                }
+
+                accum += seg->total_distance;
+                seg_count++;
+
+                double J = seg_effective_jerk(seg);
+                double d_max = fmax(seg->dec, 1e-9);
+                double S_stop = compute_stop_distance(seg->v_target, d_max, J);
+
+                if (accum >= S_stop || seg_count >= LOOKAHEAD_MAX_SEGMENTS) {
+                    safe_release_head = scan;
+                    break;
+                }
+
+                scan = (scan - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            }
+        }
+    }
+
+    // ================================================================
+    // 4. 7段式 S 曲线预计算（仅对安全窗口内的段执行）
     //    严禁 ceil()！所有时间为精确 double ms。
-    //    planner 直接把 7 段入口状态全部算好，RT 线程只做查表插值。
     // ================================================================
     {
         double J_default = DEFAULT_JERK_MS3;
         int curr = plan_tail;
+        int safe_end = (safe_release_head + 1) % QUEUE_SIZE;
 
-        while (curr != head) {
+        while (curr != safe_end) {
             TrajectorySegment_t *seg = &g_cmd_queue.buffer[curr];
 
             // ---- M 代码 / 零距离：直接归零 ----
@@ -356,18 +552,16 @@ void planner_recalculate(int force_flush)
                     compute_dec_profile(lo, v_e, d_max, J,
                                         &dummy1, &dummy2, &sd_test);
                     if (sa_test + sd_test > S) {
-                        // 前瞻给死局，触发熔断
                         v_s = 0.0; v_e = 0.0; lo = 0.0;
                         seg->v_start = 0.0; seg->v_end = 0.0;
 
-                        // 反向传播：修改前驱段 v_end 以保持速度连续性
-                        // 仅修改尚未释放的前驱段
                         if (curr != plan_tail) {
                             int prev_idx = (curr - 1 + QUEUE_SIZE) % QUEUE_SIZE;
                             TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev_idx];
                             if (atomic_load_explicit(&s_prev->is_ready,
                                                      memory_order_acquire) == 0) {
                                 s_prev->v_end = 0.0;
+                                recompute_scurve_profile(s_prev);
                             }
                         }
                     }
@@ -391,16 +585,14 @@ void planner_recalculate(int force_flush)
             if (t_cru < 0.0) t_cru = 0.0;
 
             // ---- 步骤 3：预计算 7 段入口状态 ----
-            // 各段持续时间
-            double dt1 = tj_a;       // T1: 加加速
-            double dt2 = ta;         // T2: 匀加速
-            double dt3 = tj_a;       // T3: 减加速 (=T1, 对称)
-            double dt4 = t_cru;      // T4: 匀速
-            double dt5 = tj_d;       // T5: 加减速
-            double dt6 = td;         // T6: 匀减速
-            double dt7 = tj_d;       // T7: 减减速 (=T5, 对称)
+            double dt1 = tj_a;
+            double dt2 = ta;
+            double dt3 = tj_a;
+            double dt4 = t_cru;
+            double dt5 = tj_d;
+            double dt6 = td;
+            double dt7 = tj_d;
 
-            // 累计时间节点
             seg->T1 = dt1;
             seg->T2 = seg->T1 + dt2;
             seg->T3 = seg->T2 + dt3;
@@ -410,33 +602,25 @@ void planner_recalculate(int force_flush)
             seg->T7 = seg->T6 + dt7;
             seg->T_total = seg->T7;
 
-            // 各段控制量
             double jrk_a = (dt1 > 1e-12) ? J : 0.0;
             double jrk_d = (dt5 > 1e-12) ? J : 0.0;
-            double a_peak = jrk_a * dt1;   // T1 结束时的加速度峰值
-            double d_peak = jrk_d * dt5;   // T5 结束时的减速度峰值
-            seg->j1 =  jrk_a;              // T1: jerk > 0
-            seg->a2 =  a_peak;             // T2: 恒定加速度 = a_peak
-            seg->j3 = -jrk_a;              // T3: jerk < 0（加速度下降）
-            seg->j5 = -jrk_d;              // T5: jerk < 0（减速度上升）
-            seg->a6 = -d_peak;             // T6: 恒定减速度 = -d_peak
-            seg->j7 =  jrk_d;              // T7: jerk > 0（减速度下降）
+            double a_peak = jrk_a * dt1;
+            double d_peak = jrk_d * dt5;
+            seg->j1 =  jrk_a;
+            seg->a2 =  a_peak;
+            seg->j3 = -jrk_a;
+            seg->j5 = -jrk_d;
+            seg->a6 = -d_peak;
+            seg->j7 =  jrk_d;
 
-            // 各段入口速度
             seg->v0 = v_s;
             seg->v1 = v_s + 0.5 * jrk_a * dt1 * dt1;
             seg->v2 = seg->v1 + a_peak * dt2;
-            seg->v3 = v_m;                              // = seg->v2 + 0.5*jrk_a*dt3^2
-            seg->v4 = v_m;                              // 匀速不变
+            seg->v3 = v_m;
+            seg->v4 = v_m;
             seg->v5 = v_m - 0.5 * jrk_d * dt5 * dt5;
             seg->v6 = seg->v5 - d_peak * dt6;
-            // v7 = v_e（不存，由 v6 + 0.5*j7*dt7^2 推出）
 
-            // 各段入口位移（解析积分）
-            // T1: s = v0*t + j1*t^3/6     T2: s = v1*t + a2*t^2/2
-            // T3: s = v2*t + j3*t^3/6      T4: s = v3*t (匀速)
-            // T5: s = v4*t + j5*t^3/6      T6: s = v5*t + a6*t^2/2
-            // T7: s = v6*t + j7*t^3/6
             seg->s0 = 0.0;
             seg->s1 = seg->s0 + seg->v0*dt1 + seg->j1*dt1*dt1*dt1/6.0;
             seg->s2 = seg->s1 + seg->v1*dt2 + 0.5*seg->a2*dt2*dt2;
@@ -466,23 +650,12 @@ void planner_recalculate(int force_flush)
     }
 
     // ================================================================
-    // 4. 释放标志
+    // 5. 原子释放安全窗口内的段
     // ================================================================
-    if (force_flush || plan_count < 3) {
+    {
         int mark_curr = plan_tail;
-        while (mark_curr != head) {
-            atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready,
-                                  1, memory_order_release);
-            mark_curr = (mark_curr + 1) % QUEUE_SIZE;
-        }
-    } else {
-        int safe_release_head = (head - 2 + QUEUE_SIZE) % QUEUE_SIZE;
-        if (g_cmd_queue.buffer[(head - 1 + QUEUE_SIZE) % QUEUE_SIZE].cmd_type
-            == CMD_TYPE_MCODE) {
-            safe_release_head = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
-        }
-        int mark_curr = plan_tail;
-        while (mark_curr != safe_release_head) {
+        int release_end = (safe_release_head + 1) % QUEUE_SIZE;
+        while (mark_curr != release_end) {
             atomic_store_explicit(&g_cmd_queue.buffer[mark_curr].is_ready,
                                   1, memory_order_release);
             mark_curr = (mark_curr + 1) % QUEUE_SIZE;

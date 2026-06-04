@@ -358,7 +358,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         if(seg.T_total > 0.5){
                             g_interpolator.is_moving=1;
                         }else{
-                            rt_log("invalid trajectory segment: T_total=%.3f",seg.T_total);
+                            // 微段快进：T_total 过小无法插补，直接快进到目标位置
+                            for(int j=0;j<AXIS_NUM;j++){
+                                g_interpolator.current_pos[j]=g_interpolator.target_pos[j];
+                            }
+                            rt_log("micro-segment snap: T_total=%.3f dist=%.6f",seg.T_total,seg.total_distance);
                         }
                     }
                 }
@@ -614,6 +618,11 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
     static volatile int last_queue_head = -1;
     static int starvation_counter = 0;
     #define STARVATION_THRESHOLD 5  // 5 × 10ms = 50ms 无新指令视为饥饿
+    // 解析器卡死二级检测
+    static volatile int last_stuck_head = -1;
+    static volatile int last_stuck_tail = -1;
+    static int stuck_counter = 0;
+    #define STUCK_THRESHOLD 200  // 200 × 10ms = 2s 队列无任何进展视为卡死
 
     while (1)
     {
@@ -639,11 +648,12 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
         }
 
         // ---- 队列饥饿看门狗 ----
-        // 仅在解析器已关闭（无新文件读入）时才允许触发强制释放
-        // 防止文件 I/O 阻塞或网络抖动导致的误强行结段
+        // 路径 A：解析器已停止 → 队列中任意数量的未释放段均需强制释放
+        // 路径 B：解析器标记为运行但实际卡死 → 二级超时兜底
         {
             int count = (g_cmd_queue.head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
-            if(count > 0 && count < 3 && !g_parser_ctrl.is_running) {
+            if(count > 0 && !g_parser_ctrl.is_running) {
+                // 路径 A：解析器已停，不限段数
                 if(g_cmd_queue.head == last_queue_head) {
                     starvation_counter++;
                     if(starvation_counter >= STARVATION_THRESHOLD) {
@@ -654,9 +664,26 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
                     starvation_counter = 0;
                     last_queue_head = g_cmd_queue.head;
                 }
+            } else if(count > 0) {
+                // 路径 B：解析器仍标记运行，但队列首尾均无进展 → 可能卡死
+                if(g_cmd_queue.head == last_stuck_head &&
+                   g_cmd_queue.tail == last_stuck_tail) {
+                    stuck_counter++;
+                    if(stuck_counter >= STUCK_THRESHOLD) {
+                        planner_recalculate(1);
+                        stuck_counter = 0;
+                    }
+                } else {
+                    stuck_counter = 0;
+                    last_stuck_head = g_cmd_queue.head;
+                    last_stuck_tail = g_cmd_queue.tail;
+                }
             } else {
                 starvation_counter = 0;
+                stuck_counter = 0;
                 last_queue_head = g_cmd_queue.head;
+                last_stuck_head = g_cmd_queue.head;
+                last_stuck_tail = g_cmd_queue.tail;
             }
         }
 
