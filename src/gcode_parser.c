@@ -1,11 +1,12 @@
 #include "gcode_parser.h"
 #include "global_def.h"
 #include "axis_ctrl.h"
+#include "kinematics.h"
 #include <math.h>
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
 
-GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94}; // motion_mode=1(G01), feed_mode=G94
+GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0}; // rtcp_enabled=0
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
 extern int api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
@@ -14,6 +15,34 @@ const char* skip_spaces(const char* str)
 {
     while(*str==' '||*str=='\t') str++;
     return str;
+}
+
+// @Context: Non-RealTime Background Thread
+// @Safe: 纯坐标变换，调用 Kinematics_Inverse 纯函数。
+// 动态适配 AC / BC / ABC 构型：
+//   - X/Y/Z 必须全部映射，否则无法逆解
+//   - A/B/C 未映射时角度取 0.0，不影响已配置的旋转轴
+static void apply_rtcp_to_pos(double pos[AXIS_NUM])
+{
+    int idx_x = g_axis_map['X' - 'A'];
+    int idx_y = g_axis_map['Y' - 'A'];
+    int idx_z = g_axis_map['Z' - 'A'];
+    int idx_a = g_axis_map['A' - 'A'];
+    int idx_b = g_axis_map['B' - 'A'];
+    int idx_c = g_axis_map['C' - 'A'];
+
+    // 线性轴是逆解的前提，旋转轴缺失不影响
+    if(idx_x < 0 || idx_y < 0 || idx_z < 0) return;
+
+    double tip[3] = { pos[idx_x], pos[idx_y], pos[idx_z] };
+    double rot_a = (idx_a >= 0) ? pos[idx_a] : 0.0;
+    double rot_b = (idx_b >= 0) ? pos[idx_b] : 0.0;
+    double rot_c = (idx_c >= 0) ? pos[idx_c] : 0.0;
+    double joint[3];
+    Kinematics_Inverse(tip, rot_a, rot_b, rot_c, joint);
+    pos[idx_x] = joint[0];
+    pos[idx_y] = joint[1];
+    pos[idx_z] = joint[2];
 }
 
 int parse_gcode_line(const char *gcode_line)
@@ -31,11 +60,23 @@ int parse_gcode_line(const char *gcode_line)
     double p_value=0.0, q_value=0.0, r_value=0.0; // M代码扩展参数
     int is_non_motion_g=0; // 非运动组拦截锁：G04/G10/G28/G92 等
     int has_f=0;           // F 值存在标志（G93 非模态校验）
+    int is_G53_this_block=0;  // G53 非模态机械坐标：仅影响本行
 
     char *p=buffer;
     while(*p!='\0'){
         p=(char*)skip_spaces(p);
         if(*p=='\0') break;
+
+        // 括号注释 (...) — 支持 M03(LSON) 等紧贴写法
+        if(*p=='('){
+            while(*p!=')' && *p!='\0') p++;
+            if(*p==')') p++;
+            continue;
+        }
+        // 分号 / 百分号：后续全部忽略
+        if(*p==';' || *p=='%') break;
+        // 换行符：行尾自然结束
+        if(*p=='\n' || *p=='\r') break;
 
         char letter=toupper(*p);
         p++;
@@ -56,8 +97,11 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==90.0) g_state.is_absolute=1;
                 else if(value==91.0) g_state.is_absolute=0;
                 else if(value==92.0) is_non_motion_g=1;    // G92 坐标偏移
+                else if(value==53.0) is_G53_this_block=1;  // G53 非模态机械坐标
                 else if(value==93.0) g_state.feed_mode=FEED_MODE_G93; // G93 倒数时间
                 else if(value==94.0) g_state.feed_mode=FEED_MODE_G94; // G94 每分钟
+                else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
+                else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
                 break;
             case 'F':g_state.feedrate_mm_min=value;has_f=1;break;
             case 'I':offset_i=value;has_move=1;break;
@@ -94,31 +138,50 @@ int parse_gcode_line(const char *gcode_line)
 
     // 运动门控：仅当本行包含显式轴运动且非运动参数指令时才触发轨迹下发
     if(has_move && !is_non_motion_g){
-        double target_pos[AXIS_NUM];
+        double target_pos[AXIS_NUM];   // 逻辑坐标（工件坐标系）
         double start_pos[AXIS_NUM];
-
-        for(int i=0;i<AXIS_NUM;i++){
-            start_pos[i]=g_state.current_pos[i];
-            if(g_state.is_absolute){
-                target_pos[i]=has_axis[i]?val_axis[i]:g_state.current_pos[i];
-            }else{
-                target_pos[i]=g_state.current_pos[i]+(has_axis[i]?val_axis[i]:0);
-            }
-        }
-
-        // 坐标变换：逻辑坐标 → 机械坐标
         double machine_target_pos[AXIS_NUM];
         double machine_start_pos[AXIS_NUM];
 
-        for(int i=0;i<AXIS_NUM;i++){
-            if(g_coord_mgr.current_coord==COORD_G53){
-                machine_target_pos[i]=target_pos[i];
-                machine_start_pos[i]=start_pos[i];
-            }else{
-                int idx=g_coord_mgr.current_coord-1;
-                machine_target_pos[i]=target_pos[i]+g_coord_mgr.work_offsets[idx][i];
-                machine_start_pos[i]=start_pos[i]+g_coord_mgr.work_offsets[idx][i];
+        // 工件坐标偏置查询（G53 行内标记不影响模态 WCS）
+        int wcs_idx = (g_coord_mgr.current_coord >= COORD_G54 &&
+                       g_coord_mgr.current_coord <= COORD_G59)
+                      ? (g_coord_mgr.current_coord - 1) : -1;
+
+        if(is_G53_this_block){
+            // G53 非模态：val_axis 是机械绝对坐标，强制 G90，忽略 G91
+            for(int i=0;i<AXIS_NUM;i++){
+                double w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                start_pos[i] = g_state.current_pos[i];
+                machine_start_pos[i] = start_pos[i] + w;
+                machine_target_pos[i] = has_axis[i] ? val_axis[i] : machine_start_pos[i];
+                // 反推逻辑坐标，保证下一行回到正常模式时起点不撕裂
+                target_pos[i] = machine_target_pos[i] - w;
             }
+        }else{
+            // 正常模式：val_axis 是逻辑坐标，按 G90/G91 计算
+            for(int i=0;i<AXIS_NUM;i++){
+                start_pos[i] = g_state.current_pos[i];
+                if(g_state.is_absolute){
+                    target_pos[i] = has_axis[i] ? val_axis[i] : g_state.current_pos[i];
+                }else{
+                    target_pos[i] = g_state.current_pos[i] + (has_axis[i] ? val_axis[i] : 0);
+                }
+            }
+            for(int i=0;i<AXIS_NUM;i++){
+                double w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                machine_target_pos[i] = target_pos[i] + w;
+                machine_start_pos[i] = start_pos[i] + w;
+            }
+        }
+
+        // RTCP 逆解注入：G43.4 开启时，将刀尖坐标转换为物理机床坐标
+        // 直线运动：对起点和终点做逆解，物理距离用于速度计算
+        // 圆弧运动：起点/终点保留工件坐标，由 arc generator 逐点逆解
+        if(g_state.rtcp_enabled &&
+           g_state.motion_mode != 2 && g_state.motion_mode != 3){
+            apply_rtcp_to_pos(machine_target_pos);
+            apply_rtcp_to_pos(machine_start_pos);
         }
 
         // 多轴等效距离计算（用于 G93 速度反推）
@@ -312,6 +375,9 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
         }else{
             speed_mm_sec = feedrate_mm_min / 60.0;
         }
+        if(g_state.rtcp_enabled){
+            apply_rtcp_to_pos(end_pos);
+        }
         return api_push_trajectory(end_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
     }
 
@@ -379,6 +445,11 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
             for(int j = 0; j < AXIS_NUM; j++){
                 next_pos[j] = end_pos[j];
             }
+        }
+
+        // RTCP 逐点逆解：每个插补点用自身的旋转轴角度补偿 XYZ
+        if(g_state.rtcp_enabled){
+            apply_rtcp_to_pos(next_pos);
         }
 
         if(api_push_trajectory(next_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC) < 0){

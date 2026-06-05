@@ -57,8 +57,8 @@ int main(int argc, char *argv[])
     SMC_ConfigAxisTopology(SMC_AXIS_X, "X轴", 0, 5, 0);
     SMC_ConfigAxisTopology(SMC_AXIS_Y, "Y轴", 1, 3, 4); // Y轴双驱 (主站3, 从站4)
     SMC_ConfigAxisTopology(SMC_AXIS_Z, "Z轴", 0, 6, 0);
-    SMC_ConfigAxisTopology(SMC_AXIS_A, "A轴", 0, 1, 0);
-    SMC_ConfigAxisTopology(SMC_AXIS_B, "B轴", 0, 2, 0);
+    SMC_ConfigAxisTopology(SMC_AXIS_A, "B轴", 0, 1, 0);
+    SMC_ConfigAxisTopology(SMC_AXIS_B, "C轴", 0, 2, 0);
 
     // ==========================================
     // 3. 脉冲当量配置 (1 单位对应多少个脉冲)

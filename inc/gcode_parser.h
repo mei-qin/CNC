@@ -24,6 +24,7 @@ typedef struct {
     int active_plane;      // 当前工作平面: 17=XY(默认), 18=ZX, 19=YZ
     int motion_mode;       // 运动组模态状态: 0=G00, 1=G01, 2=G02, 3=G03
     int feed_mode;         // 进给模式: FEED_MODE_G93 或 FEED_MODE_G94
+    int rtcp_enabled;      // G43.4 RTCP刀尖跟随: 0=关闭, 1=开启
 } GCodeState_t;
 
 typedef struct{
