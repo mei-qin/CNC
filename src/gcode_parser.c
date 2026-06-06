@@ -5,6 +5,7 @@
 #include <math.h>
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
+#define RTCP_LINEAR_SEGMENT_MM 0.5 // RTCP直线微段打碎步长，单位mm
 
 GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0}; // rtcp_enabled=0
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
@@ -43,6 +44,84 @@ static void apply_rtcp_to_pos(double pos[AXIS_NUM])
     pos[idx_x] = joint[0];
     pos[idx_y] = joint[1];
     pos[idx_z] = joint[2];
+}
+
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: 纯坐标变换 + 调用 api_push_trajectory（队列写入，线程安全）。
+// RTCP 直线微段打碎：当直线段包含旋转轴运动时，按 0.5mm 等效步长
+// 将逻辑空间直线打碎成微小段，逐点做逆解后入队，消除刀尖弧形挖坑效应。
+// 无旋转变化时退化为单次逆解入队。
+int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[AXIS_NUM],
+                                    double run_speed_mm, double g93_T_sec)
+{
+    int idx_a = g_axis_map['A' - 'A'];
+    int idx_b = g_axis_map['B' - 'A'];
+    int idx_c = g_axis_map['C' - 'A'];
+
+    // 判定旋转轴是否有变化
+    int has_rotation = 0;
+    if(idx_a >= 0 && fabs(end_pos[idx_a] - start_pos[idx_a]) > 1e-6) has_rotation = 1;
+    if(idx_b >= 0 && fabs(end_pos[idx_b] - start_pos[idx_b]) > 1e-6) has_rotation = 1;
+    if(idx_c >= 0 && fabs(end_pos[idx_c] - start_pos[idx_c]) > 1e-6) has_rotation = 1;
+
+    // 无旋转变化：单次逆解入队
+    if(!has_rotation){
+        double phys_end[AXIS_NUM];
+        memcpy(phys_end, end_pos, sizeof(double) * AXIS_NUM);
+        apply_rtcp_to_pos(phys_end);
+        double speed_mm_sec = run_speed_mm / 60.0;
+        return api_push_trajectory(phys_end, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
+    }
+
+    // 有旋转变化：计算等效空间距离（含旋转轴弧长折算）
+    double dist_eq = 0.0;
+    for(int i = 0; i < AXIS_NUM; i++){
+        double delta = end_pos[i] - start_pos[i];
+        if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
+            delta = delta * (PI / 180.0) * g_axis[i].equivalent_radius;
+        }
+        dist_eq += delta * delta;
+    }
+    dist_eq = sqrt(dist_eq);
+
+    int num_segments = (int)ceil(dist_eq / RTCP_LINEAR_SEGMENT_MM);
+    if(num_segments < 1) num_segments = 1;
+
+    // 速度计算：G93 按等效距离反推，G94 直取
+    double speed_mm_sec;
+    if(g93_T_sec > 1e-9){
+        speed_mm_sec = dist_eq / g93_T_sec;
+        if(speed_mm_sec < 1e-6) speed_mm_sec = 1e-6;
+    } else {
+        speed_mm_sec = run_speed_mm / 60.0;
+    }
+
+    // 逐点插值 + 逆解 + 入队（跳过起点 i=0，从 i=1 开始）
+    for(int i = 1; i <= num_segments; i++){
+        double ratio = (double)i / (double)num_segments;
+        double interp_pos[AXIS_NUM];
+
+        // 逻辑空间 N 维线性插值
+        for(int j = 0; j < AXIS_NUM; j++){
+            interp_pos[j] = start_pos[j] + (end_pos[j] - start_pos[j]) * ratio;
+        }
+
+        // 末段强制对齐终点，消除浮点累积误差
+        if(i == num_segments){
+            memcpy(interp_pos, end_pos, sizeof(double) * AXIS_NUM);
+        }
+
+        // 逐点 RTCP 逆解
+        apply_rtcp_to_pos(interp_pos);
+
+        if(api_push_trajectory(interp_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC) < 0){
+            return -1;
+        }
+    }
+
+    printf("[Parser] RTCP直线打碎: %d 段 (等效距离 %.2f mm, 速度 %.2f mm/s)\n",
+           num_segments, dist_eq, speed_mm_sec);
+    return 0;
 }
 
 int parse_gcode_line(const char *gcode_line)
@@ -175,14 +254,8 @@ int parse_gcode_line(const char *gcode_line)
             }
         }
 
-        // RTCP 逆解注入：G43.4 开启时，将刀尖坐标转换为物理机床坐标
-        // 直线运动：对起点和终点做逆解，物理距离用于速度计算
-        // 圆弧运动：起点/终点保留工件坐标，由 arc generator 逐点逆解
-        if(g_state.rtcp_enabled &&
-           g_state.motion_mode != 2 && g_state.motion_mode != 3){
-            apply_rtcp_to_pos(machine_target_pos);
-            apply_rtcp_to_pos(machine_start_pos);
-        }
+        // RTCP 逆解：圆弧由 arc generator 逐点逆解，直线由 generate_linear_rtcp_trajectory 处理
+        // 不再在此处对起终点做硬算，避免旋转运动时中间轨迹挖坑
 
         // 多轴等效距离计算（用于 G93 速度反推）
         double dist_total = 0.0;
@@ -234,6 +307,14 @@ int parse_gcode_line(const char *gcode_line)
                 return -1;
             }
 
+        } else if(g_state.rtcp_enabled){
+            // RTCP 直线：微段打碎 + 逐点逆解
+            if(generate_linear_rtcp_trajectory(machine_start_pos,
+                                               machine_target_pos,
+                                               run_speed_mm, g93_T_sec) < 0){
+                printf("[Parser] RTCP直线入队失败(报警)，中止当前文件！\n");
+                return -1;
+            }
         } else {
             double speed_mm_sec=run_speed_mm/60.0;
             if(api_push_trajectory(machine_target_pos,speed_mm_sec,DEFAULT_ACC,DEFAULT_DEC) < 0){

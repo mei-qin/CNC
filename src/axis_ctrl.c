@@ -39,9 +39,8 @@ void api_sync_planner_cursor(){
 }
 
 double api_get_cursor(int axis_idx){
-
+    if(axis_idx < 0 || axis_idx >= AXIS_NUM) return 0.0;
     return plan_cursor[axis_idx];
-    
 }
 
 
@@ -281,6 +280,8 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
         plan_cursor[i]=target_pos[i];
     }
 
+    // 写屏障：确保段数据在 head 指针更新前对所有核可见
+    atomic_thread_fence(memory_order_release);
     g_cmd_queue.head = next_head;
     planner_recalculate(0);
     return 0;
@@ -326,6 +327,8 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->j1=0; seg->a2=0; seg->j3=0;
     seg->j5=0; seg->a6=0; seg->j7=0;
 
+    // 写屏障：确保段数据在 head 指针更新前对所有核可见
+    atomic_thread_fence(memory_order_release);
     g_cmd_queue.head = next_head;
     planner_recalculate(0);
     return 0;

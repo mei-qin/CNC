@@ -41,4 +41,6 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg);
 int  generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
                              double offset_1st, double offset_2nd,
                              int is_CW,double feedrate_mm_min,double g93_T_sec);
+int  generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
+                                     double run_speed_mm,double g93_T_sec);
 #endif // GCODE_PARSER_H

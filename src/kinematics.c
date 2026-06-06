@@ -24,21 +24,22 @@ void Kinematics_Inverse(double tip_xyz[3], double rot_a, double rot_b, double ro
     double y = tip_xyz[1];
     double z = tip_xyz[2];
 
-    // P_machine = R_Y(B) * R_X(A) * R_Z(C) * P_workpiece
-    // 分步展开，避免矩阵临时变量：
+    // P_machine = R_Y(-B) * R_X(-A) * R_Z(-C) * P_workpiece
+    // 逆转补偿：cos(-θ)=cos(θ), sin(-θ)=-sin(θ)
+    // 顺序：先绕 Z 逆转(-C) → 绕 X 逆转(-A) → 绕 Y 逆转(-B)
 
-    // Step 1: R_Z(C) * P_tip
-    double x1 =  cC * x - sC * y;
-    double y1 =  sC * x + cC * y;
+    // Step 1: R_Z(-C) * P_tip
+    double x1 =  cC * x + sC * y;
+    double y1 = -sC * x + cC * y;
     double z1 =  z;
 
-    // Step 2: R_X(A) * P1
+    // Step 2: R_X(-A) * P1
     double x2 =  x1;
-    double y2 =  cA * y1 - sA * z1;
-    double z2 =  sA * y1 + cA * z1;
+    double y2 =  cA * y1 + sA * z1;
+    double z2 = -sA * y1 + cA * z1;
 
-    // Step 3: R_Y(B) * P2
-    joint_xyz[0] =  cB * x2 + sB * z2;
+    // Step 3: R_Y(-B) * P2
+    joint_xyz[0] =  cB * x2 - sB * z2;
     joint_xyz[1] =  y2;
-    joint_xyz[2] = -sB * x2 + cB * z2;
+    joint_xyz[2] =  sB * x2 + cB * z2;
 }

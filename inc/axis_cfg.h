@@ -81,11 +81,6 @@ typedef uint16_t uint16;
 #define CSP_OFFSET         0       // 轨迹偏移（脉冲）
 
 //#define LOGICAL_AXIS_NUM 5
-#define AXIS_X 0
-#define AXIS_Y 1
-#define AXIS_Z 2
-#define AXIS_A 3
-#define AXIS_B 4
 #define AXIS_ALL -1
 
 #define MAX_SLAVES_PER_AXIS 2

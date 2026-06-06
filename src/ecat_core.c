@@ -410,7 +410,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     output_cw=CW_SHUTDOWN;
                     if(g_axis[i].cia_step_delay==1){
                         int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
-                        g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                        double ppu=g_axis[i].pulse_per_unit;
+                        g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                     }
                     if(g_axis[i].cia_step_delay>50&&((sw&SW_MASK)==SW_SHUTDOWN_RDY)){
                         g_axis[i].cia_step++;
@@ -423,7 +424,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     output_cw=CW_SWITCH_ON;
                     if(g_axis[i].cia_step_delay==1){
                         int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
-                        g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                        double ppu=g_axis[i].pulse_per_unit;
+                        g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                     }
                     if(g_axis[i].cia_step_delay>50&&((sw&SW_MASK)==SW_SWITCHED_ON)){
                         if(llabs(timeerror)<80000){
@@ -438,7 +440,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     output_cw=CW_ENABLE_OP;
                     if(g_axis[i].cia_step_delay==1){
                         int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
-                        g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                        double ppu=g_axis[i].pulse_per_unit;
+                        g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                     }
                     if((sw&SW_MASK)==SW_OP_ENABLED){
                         g_axis[i].cia_step_delay++;
@@ -447,7 +450,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             g_axis[i].cia_step++;
 
                             int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
-                            g_axis[i].current_cmd_pos=(double)raw_pulse/g_axis[i].pulse_per_unit;
+                            double ppu=g_axis[i].pulse_per_unit;
+                            g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                             api_sync_planner_cursor();
                         }
                     }
