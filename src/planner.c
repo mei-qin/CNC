@@ -15,6 +15,9 @@
 #define LOOKAHEAD_BISECT_ITERS  24
 // 前瞻深度上限：防止单次规划段数过多阻塞入队
 #define LOOKAHEAD_MAX_DEPTH  200
+// 拐角圆角平滑引擎参数
+#define FILLET_SUB_SEGMENTS  3
+#define FILLET_SAFETY_RATIO  0.4
 
 // --------------------------------------------------------------------
 // 加速段 v_s → v_m 的时序与距离
@@ -294,6 +297,188 @@ double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *
 }
 
 // ====================================================================
+// Corner Rounding 预处理引擎 (Fillet Arc Insertion)
+// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// @Math: 给定连续两段直线 L1(方向D1)和 L2(方向D2)，夹角 theta = acos(D1·D2)
+//   半外角 alpha = (PI-theta)/2
+//   容差 delta = R*(1/sin_alpha - 1) → R = delta*sin_alpha/(1-sin_alpha)
+//   切点距 d = R*cot_alpha，限制 d <= 0.4*min(L1,L2)
+//   圆弧用 SLERP 离散为 FILLET_SUB_SEGMENTS 个微小直线段插入队列
+// ====================================================================
+static int planner_fillet_preprocess(int plan_tail, int old_head)
+{
+    double delta = g_planner_config.corner_tolerance;
+    if (delta <= 1e-6) return old_head; // 容差禁用，跳过
+
+    int head = old_head;
+    int count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
+    if (count < 2) return head;
+
+    // 反向扫描：从队尾向队首逐对处理，避免插入后索引漂移
+    int i = (plan_tail + count - 1) % QUEUE_SIZE;
+    while (i != plan_tail) {
+        int prev = (i - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+        TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev];
+        TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[i];
+
+        // ---- 门控：跳过已释放 / M代码 / 零距离 / 已平滑段 ----
+        if (atomic_load_explicit(&s_prev->is_ready, memory_order_acquire) == 1
+         || atomic_load_explicit(&s_curr->is_ready, memory_order_acquire) == 1
+         || s_prev->cmd_type != CMD_TYPE_MOTION
+         || s_curr->cmd_type != CMD_TYPE_MOTION
+         || s_prev->is_fillet == 1
+         || s_curr->is_fillet == 1
+         || s_prev->total_distance <= 1e-6
+         || s_curr->total_distance <= 1e-6) {
+            i = prev; continue;
+        }
+
+        // ---- 1. 夹角计算 ----
+        double cos_theta = 0.0;
+        for (int j = 0; j < AXIS_NUM; j++)
+            cos_theta += s_prev->dir_vec[j] * s_curr->dir_vec[j];
+        if (cos_theta >  1.0) cos_theta =  1.0;
+        if (cos_theta < -1.0) cos_theta = -1.0;
+        if (cos_theta >= 0.999 || cos_theta <= -0.999) { i = prev; continue; }
+
+        double theta   = acos(cos_theta);
+        double half_ex = (M_PI - theta) * 0.5;   // 半外角
+        double sin_ha  = sin(half_ex);
+        double cos_ha  = cos(half_ex);
+        if (sin_ha <= 1e-6) { i = prev; continue; }
+
+        // ---- 2. 圆弧半径 R 与切点距 d ----
+        double R = delta * sin_ha / (1.0 - sin_ha);
+        double d = R * cos_ha / sin_ha;
+        double d_limit = FILLET_SAFETY_RATIO * fmin(s_prev->total_distance,
+                                                     s_curr->total_distance);
+        if (d > d_limit) { d = d_limit; R = d * sin_ha / cos_ha; }
+        if (d < 1e-6 || R < 1e-6) { i = prev; continue; }
+
+        // ---- 3. 队列空间检查 ----
+        int queue_used = (head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
+        if (QUEUE_SIZE - 1 - queue_used < FILLET_SUB_SEGMENTS) break;
+
+        // ---- 4. 几何计算：顶点 / 切点 / 圆心 ----
+        //   V = s_prev 终点 (拐角顶点)
+        //   T1 = V - d*D1   T2 = V + d*D2
+        //   bisector = (-D1+D2)/|...|   C = V + (R/sin_ha)*bisector
+        double V[AXIS_NUM], T1[AXIS_NUM], T2[AXIS_NUM], C[AXIS_NUM];
+        double bisec[AXIS_NUM];
+        double bisec_sq = 0.0;
+        for (int j = 0; j < AXIS_NUM; j++) {
+            V[j] = s_prev->target_pos[j];
+            bisec[j] = -s_prev->dir_vec[j] + s_curr->dir_vec[j];
+            bisec_sq += bisec[j] * bisec[j];
+        }
+        double bisec_len = sqrt(bisec_sq);
+        if (bisec_len < 1e-12) { i = prev; continue; }
+
+        double bisec_d = R / sin_ha;
+        for (int j = 0; j < AXIS_NUM; j++) {
+            bisec[j] /= bisec_len;
+            T1[j] = V[j] - d * s_prev->dir_vec[j];
+            T2[j] = V[j] + d * s_curr->dir_vec[j];
+            C[j] = V[j] + bisec_d * bisec[j];
+        }
+
+        // ---- 5. SLERP 几何预校验（在队列操作之前，失败可直接 continue）----
+        double r1[AXIS_NUM], r2[AXIS_NUM];
+        double r1sq = 0.0, r2sq = 0.0;
+        for (int j = 0; j < AXIS_NUM; j++) {
+            r1[j] = T1[j] - C[j]; r1sq += r1[j]*r1[j];
+            r2[j] = T2[j] - C[j]; r2sq += r2[j]*r2[j];
+        }
+        double r1m = sqrt(r1sq), r2m = sqrt(r2sq);
+        if (r1m < 1e-12 || r2m < 1e-12) { i = prev; continue; }
+
+        double dot_rr = 0.0;
+        for (int j = 0; j < AXIS_NUM; j++)
+            dot_rr += (r1[j]/r1m) * (r2[j]/r2m);
+        if (dot_rr >  1.0) dot_rr =  1.0;
+        if (dot_rr < -1.0) dot_rr = -1.0;
+        double arc_angle = acos(dot_rr);
+        double sin_arc   = sin(arc_angle);
+        if (sin_arc < 1e-12) sin_arc = 1e-12;
+
+        // ---- 6. 环形队列段平移（从 head-1 倒序搬至 i，前移 K 位）----
+        {
+            int src = (head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            int stop = (prev + QUEUE_SIZE) % QUEUE_SIZE;
+            while (src != stop) {
+                int dst = (src + FILLET_SUB_SEGMENTS) % QUEUE_SIZE;
+                g_cmd_queue.buffer[dst] = g_cmd_queue.buffer[src];
+                src = (src - 1 + QUEUE_SIZE) % QUEUE_SIZE;
+            }
+        }
+        head = (head + FILLET_SUB_SEGMENTS) % QUEUE_SIZE;
+
+        // ---- 7. 缩短段 prev：终点退到切点 T1 ----
+        s_prev->total_distance -= d;
+        for (int j = 0; j < AXIS_NUM; j++)
+            s_prev->target_pos[j] = T1[j];
+
+        // ---- 8. 生成圆弧子段 (SLERP 离散) ----
+        //   写入位置 i..i+K-1 (平移留下的空位)，s_curr 在 i+K
+        {
+            TrajectorySegment_t tmpl = *s_curr;
+            tmpl.cmd_type  = CMD_TYPE_MOTION;
+            tmpl.is_fillet = 1;  // 标记为圆弧子段，防止重复平滑
+            tmpl.m_code    = 0;
+            atomic_store_explicit(&tmpl.is_ready, 0, memory_order_relaxed);
+            tmpl.v_start = 0.0; tmpl.v_end = 0.0;
+            tmpl.T1=0; tmpl.T2=0; tmpl.T3=0; tmpl.T4=0;
+            tmpl.T5=0; tmpl.T6=0; tmpl.T7=0; tmpl.T_total=0;
+
+            double prev_pt[AXIS_NUM];
+            memcpy(prev_pt, T1, sizeof(double)*AXIS_NUM);
+
+            for (int k = 0; k < FILLET_SUB_SEGMENTS; k++) {
+                int si = (i + k) % QUEUE_SIZE;
+                TrajectorySegment_t *fs = &g_cmd_queue.buffer[si];
+                *fs = tmpl;
+
+                double pt[AXIS_NUM];
+                if (k == FILLET_SUB_SEGMENTS - 1) {
+                    memcpy(pt, T2, sizeof(double)*AXIS_NUM);
+                } else {
+                    double t  = (double)(k + 1) / (double)FILLET_SUB_SEGMENTS;
+                    double s1 = sin((1.0-t)*arc_angle) / sin_arc;
+                    double s2 = sin(t*arc_angle) / sin_arc;
+                    for (int j = 0; j < AXIS_NUM; j++)
+                        pt[j] = C[j] + s1*r1[j] + s2*r2[j];
+                }
+
+                double seg_d = 0.0;
+                for (int j = 0; j < AXIS_NUM; j++) {
+                    fs->target_pos[j] = pt[j];
+                    double dx = pt[j] - prev_pt[j];
+                    seg_d += dx*dx;
+                }
+                seg_d = sqrt(seg_d);
+                fs->total_distance = seg_d;
+                if (seg_d > 1e-9) {
+                    for (int j = 0; j < AXIS_NUM; j++)
+                        fs->dir_vec[j] = (pt[j]-prev_pt[j]) / seg_d;
+                }
+                memcpy(prev_pt, pt, sizeof(double)*AXIS_NUM);
+            }
+        }
+
+        // ---- 9. 缩短段 curr（已平移到 i+K）：起点退到切点 T2 ----
+        {
+            int ni = (i + FILLET_SUB_SEGMENTS) % QUEUE_SIZE;
+            g_cmd_queue.buffer[ni].total_distance -= d;
+        }
+
+        i = prev; // 继续向前扫描
+    }
+
+    g_cmd_queue.head = head;
+    return head;
+}
+
+// ====================================================================
 // Deep Look-Ahead 前瞻核心引擎
 // @Context: Non-RealTime Background Thread (parser 或 看门狗)
 // @Thread-Safety: 由 planner_mutex 保护，禁止 RT 线程调用！
@@ -324,6 +509,11 @@ void planner_recalculate(int force_flush)
     }
     int plan_count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
     if (plan_count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+
+    // ---- 1.5 拐角圆角平滑预处理 ----
+    head = planner_fillet_preprocess(plan_tail, head);
+    count = (head - tail + QUEUE_SIZE) % QUEUE_SIZE;
+    plan_count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
 
     // ---- 2. 分批上限：截断有效规划窗口 ----
     int eff_head = head;

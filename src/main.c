@@ -7,32 +7,49 @@
 #include "smc_api.h"
 
 // ============================================================================
-// 辅助函数：阻塞等待运动完成，并实时刷新坐标大屏
+// 动态轴坐标信息构建（安全 snprintf 拼接，防溢出）
 // ============================================================================
-void wait_and_print_status() {
-    usleep(100000); // 稍微延时，等待指令进入队列
+static const char g_axis_letters[] = "XYZABCUVW";
 
-    while(SMC_IsParserRunning() || !SMC_IsMotionDone()) {
-        double px = SMC_GetLogicalPos('X');
-        double py = SMC_GetLogicalPos('Y');
-        double pz = SMC_GetLogicalPos('Z');
-        double pa = SMC_GetLogicalPos('A');
-        double pb = SMC_GetLogicalPos('B');
-        int q_cnt = SMC_GetQueueCount();
-
-        printf("\r[监控大屏] 队列:%3d | X:%8.3f mm  Y:%8.3f mm  Z:%8.3f mm  A:%8.3f °  B:%8.3f °  ",
-               q_cnt, px, py, pz, pa, pb);
-        fflush(stdout);
-        usleep(50000); // 50ms 刷新率 (20FPS)
+static void build_axis_info_str(char* buf, int buf_size) {
+    int offset = 0;
+    buf[0] = '\0';
+    for(int i = 0; g_axis_letters[i] != '\0'; i++) {
+        char letter = g_axis_letters[i];
+        if(!SMC_IsAxisConfigured(letter)) continue;
+        double pos = SMC_GetLogicalPos(letter);
+        int idx = g_axis_map[letter - 'A'];
+        const char *unit = (g_axis[idx].axis_type == 1) ? "\xc2\xb0" : "mm";
+        int remaining = buf_size - offset;
+        if(remaining <= 1) break;
+        int written = snprintf(buf + offset, remaining,
+                                "%c:%8.3f %s  ", letter, pos, unit);
+        if(written < 0 || written >= remaining) break;
+        offset += written;
     }
+}
 
-    // 运动彻底结束，打印最终坐标
-    printf("\r[监控大屏] 队列:%3d | X:%8.3f mm  Y:%8.3f mm  Z:%8.3f mm  A:%8.3f °  B:%8.3f °  ",
-           0,
-           SMC_GetLogicalPos('X'), SMC_GetLogicalPos('Y'),
-           SMC_GetLogicalPos('Z'), SMC_GetLogicalPos('A'),
-           SMC_GetLogicalPos('B'));
-    printf("\n[提示] 运动已安全完成！\n");
+// ============================================================================
+// 辅助函数：阻塞等待运动完成，并实时刷新动态状态栏
+// ============================================================================
+static void print_status_line(void) {
+    char status_str[16];
+    char axis_info[256];
+    SMC_GetSystemStatusStr(status_str, sizeof(status_str));
+    build_axis_info_str(axis_info, sizeof(axis_info));
+    int q_cnt = SMC_GetQueueCount();
+    printf("\r\033[K[%-5s] Q:%3d | %s", status_str, q_cnt, axis_info);
+    fflush(stdout);
+}
+
+void wait_and_print_status() {
+    usleep(100000);
+    while(SMC_IsParserRunning() || !SMC_IsMotionDone()) {
+        print_status_line();
+        usleep(50000);
+    }
+    print_status_line();
+    printf("\n");
 }
 
 int main(int argc, char *argv[])
@@ -195,9 +212,7 @@ int main(int argc, char *argv[])
                 if (SMC_RunGCodeFile("test.txt") == 0) {
 
                     for(int i=0; i<30; i++) {
-                        printf("\r[正常加工] X:%8.3f Y:%8.3f A:%8.3f ",
-                               SMC_GetLogicalPos('X'), SMC_GetLogicalPos('Y'), SMC_GetLogicalPos('A'));
-                        fflush(stdout);
+                        print_status_line();
                         usleep(100000);
                     }
 
@@ -205,9 +220,7 @@ int main(int argc, char *argv[])
                     SMC_PauseProcessing();
 
                     for(int i=0; i<30; i++) {
-                        printf("\r[暂停停稳] X:%8.3f Y:%8.3f (机床锁定中) ",
-                               SMC_GetLogicalPos('X'), SMC_GetLogicalPos('Y'));
-                        fflush(stdout);
+                        print_status_line();
                         usleep(100000);
                     }
 

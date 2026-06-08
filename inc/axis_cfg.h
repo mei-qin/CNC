@@ -239,6 +239,7 @@ typedef struct{
     int32_t speed;
 
     int cmd_type;       // CMD_TYPE_MOTION 或 CMD_TYPE_MCODE
+    int is_fillet;      // 1=拐角圆弧子段 (corner rounding 预处理跳过)
     int m_code;         // M代码编号（如 3=M03, 5=M05）
     double s_value;     // S值（如主轴转速）
     double p_value;     // P参数（激光功率、宏程序参数等）

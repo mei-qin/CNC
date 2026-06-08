@@ -50,6 +50,7 @@ static void apply_rtcp_to_pos(double pos[AXIS_NUM])
 // @Safe: 纯坐标变换 + 调用 api_push_trajectory（队列写入，线程安全）。
 // RTCP 直线微段打碎：当直线段包含旋转轴运动时，按 0.5mm 等效步长
 // 将逻辑空间直线打碎成微小段，逐点做逆解后入队，消除刀尖弧形挖坑效应。
+// 每微段按 逻辑时间预算 / 物理距离 计算下发速度，保证刀尖进给率。
 // 无旋转变化时退化为单次逆解入队。
 int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[AXIS_NUM],
                                     double run_speed_mm, double g93_T_sec)
@@ -87,16 +88,18 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
     int num_segments = (int)ceil(dist_eq / RTCP_LINEAR_SEGMENT_MM);
     if(num_segments < 1) num_segments = 1;
 
-    // 速度计算：G93 按等效距离反推，G94 直取
-    double speed_mm_sec;
+    // 每微段逻辑时间预算：保证刀尖按编程进给率匀速运动
+    double dt_per_seg;
     if(g93_T_sec > 1e-9){
-        speed_mm_sec = dist_eq / g93_T_sec;
-        if(speed_mm_sec < 1e-6) speed_mm_sec = 1e-6;
+        dt_per_seg = g93_T_sec / (double)num_segments;
     } else {
-        speed_mm_sec = run_speed_mm / 60.0;
+        double seg_logical_dist = dist_eq / (double)num_segments;
+        double feed_mm_sec = run_speed_mm / 60.0;
+        if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
+        dt_per_seg = seg_logical_dist / feed_mm_sec;
     }
 
-    // 逐点插值 + 逆解 + 入队（跳过起点 i=0，从 i=1 开始）
+    // 逐点插值 + 逆解 + 物理速度计算 + 入队
     for(int i = 1; i <= num_segments; i++){
         double ratio = (double)i / (double)num_segments;
         double interp_pos[AXIS_NUM];
@@ -114,13 +117,27 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         // 逐点 RTCP 逆解
         apply_rtcp_to_pos(interp_pos);
 
-        if(api_push_trajectory(interp_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC) < 0){
+        // 计算本微段物理距离（等效半径折算旋转轴弧长）
+        double phys_dist_sq = 0.0;
+        for(int j = 0; j < AXIS_NUM; j++){
+            double delta = interp_pos[j] - api_get_cursor(j);
+            if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
+            }
+            phys_dist_sq += delta * delta;
+        }
+        double phys_dist = sqrt(phys_dist_sq);
+
+        // 物理下发速度 = 物理距离 / 时间预算
+        double phys_speed = (dt_per_seg > 1e-9) ? phys_dist / dt_per_seg : 1e-6;
+        if(phys_speed < 1e-6) phys_speed = 1e-6;
+
+        if(api_push_trajectory(interp_pos, phys_speed, DEFAULT_ACC, DEFAULT_DEC) < 0){
             return -1;
         }
     }
 
-    printf("[Parser] RTCP直线打碎: %d 段 (等效距离 %.2f mm, 速度 %.2f mm/s)\n",
-           num_segments, dist_eq, speed_mm_sec);
+    printf("[Parser] RTCP直线打碎: %d 段 (等效距离 %.2f mm)\n", num_segments, dist_eq);
     return 0;
 }
 
@@ -181,6 +198,7 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==94.0) g_state.feed_mode=FEED_MODE_G94; // G94 每分钟
                 else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
                 else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
+                else if(value>=54.0 && value<=59.0) g_coord_mgr.current_coord = (int)value - 53; // 54->1(G54), 55->2(G55)...
                 break;
             case 'F':g_state.feedrate_mm_min=value;has_f=1;break;
             case 'I':offset_i=value;has_move=1;break;
@@ -449,17 +467,52 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
             dist_sq += d * d;
         }
         if(dist_sq < 1e-12) return 0;
-        double speed_mm_sec;
-        if(g93_T_sec > 1e-9){
-            speed_mm_sec = sqrt(dist_sq) / g93_T_sec;
-            if(speed_mm_sec < 1e-6) speed_mm_sec = 1e-6;
-        }else{
-            speed_mm_sec = feedrate_mm_min / 60.0;
-        }
+
         if(g_state.rtcp_enabled){
+            // 零半径退化 + RTCP：按逻辑时间预算 ÷ 物理距离计算下发速度
+            double logical_dist_sq = 0.0;
+            for(int j = 0; j < AXIS_NUM; j++){
+                double delta = end_pos[j] - start_pos[j];
+                if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                    delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
+                }
+                logical_dist_sq += delta * delta;
+            }
+            double logical_dist = sqrt(logical_dist_sq);
+
             apply_rtcp_to_pos(end_pos);
+
+            double phys_dist_sq = 0.0;
+            for(int j = 0; j < AXIS_NUM; j++){
+                double delta = end_pos[j] - api_get_cursor(j);
+                if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                    delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
+                }
+                phys_dist_sq += delta * delta;
+            }
+            double phys_dist = sqrt(phys_dist_sq);
+
+            double dt;
+            if(g93_T_sec > 1e-9){
+                dt = g93_T_sec;
+            } else {
+                double feed_mm_sec = feedrate_mm_min / 60.0;
+                if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
+                dt = (logical_dist > 1e-9) ? logical_dist / feed_mm_sec : 1.0;
+            }
+            double phys_speed = (dt > 1e-9) ? phys_dist / dt : 1e-6;
+            if(phys_speed < 1e-6) phys_speed = 1e-6;
+            return api_push_trajectory(end_pos, phys_speed, DEFAULT_ACC, DEFAULT_DEC);
+        } else {
+            double speed_mm_sec;
+            if(g93_T_sec > 1e-9){
+                speed_mm_sec = sqrt(dist_sq) / g93_T_sec;
+                if(speed_mm_sec < 1e-6) speed_mm_sec = 1e-6;
+            }else{
+                speed_mm_sec = feedrate_mm_min / 60.0;
+            }
+            return api_push_trajectory(end_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
         }
-        return api_push_trajectory(end_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
     }
 
     // ---- 3. 起始/结束角度 ----
@@ -502,6 +555,19 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
         speed_mm_sec = feedrate_mm_min / 60.0;
     }
 
+    // RTCP 每微段逻辑时间预算
+    double dt_per_seg = 0.0;
+    if(g_state.rtcp_enabled){
+        if(g93_T_sec > 1e-9){
+            dt_per_seg = g93_T_sec / (double)num_segments;
+        } else {
+            double seg_logical_dist = helical_length / (double)num_segments;
+            double feed_mm_sec = feedrate_mm_min / 60.0;
+            if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
+            dt_per_seg = seg_logical_dist / feed_mm_sec;
+        }
+    }
+
     double angle_step = total_angle / num_segments;
     double next_pos[AXIS_NUM];
 
@@ -528,12 +594,27 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
             }
         }
 
-        // RTCP 逐点逆解：每个插补点用自身的旋转轴角度补偿 XYZ
+        double seg_speed;
         if(g_state.rtcp_enabled){
+            // RTCP 逐点逆解 + 物理速度修正
             apply_rtcp_to_pos(next_pos);
+
+            double phys_dist_sq = 0.0;
+            for(int j = 0; j < AXIS_NUM; j++){
+                double delta = next_pos[j] - api_get_cursor(j);
+                if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                    delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
+                }
+                phys_dist_sq += delta * delta;
+            }
+            double phys_dist = sqrt(phys_dist_sq);
+            seg_speed = (dt_per_seg > 1e-9) ? phys_dist / dt_per_seg : 1e-6;
+            if(seg_speed < 1e-6) seg_speed = 1e-6;
+        } else {
+            seg_speed = speed_mm_sec;
         }
 
-        if(api_push_trajectory(next_pos, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC) < 0){
+        if(api_push_trajectory(next_pos, seg_speed, DEFAULT_ACC, DEFAULT_DEC) < 0){
             return -1;
         }
     }

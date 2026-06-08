@@ -251,6 +251,29 @@ int SMC_GetQueueCount() {
     return (g_cmd_queue.head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
 }
 
+// @Thread-Safety: 只读 g_axis_map[]，初始化后不变
+int SMC_IsAxisConfigured(char axis_letter) {
+    char c = toupper((unsigned char)axis_letter);
+    if(c < 'A' || c > 'Z') return 0;
+    return (g_axis_map[c - 'A'] >= 0) ? 1 : 0;
+}
+
+// @Thread-Safety: 使用 atomic_load_explicit 读取原子变量，
+// 普通 int 变量 (is_paused/is_running) 为 UI 显示容许短暂撕裂，不会触发总线错误
+void SMC_GetSystemStatusStr(char* out_str, int max_len) {
+    if(out_str == NULL || max_len <= 0) return;
+    if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire) == 1) {
+        snprintf(out_str, max_len, "ALARM");
+    } else if(g_parser_ctrl.is_paused == 1) {
+        snprintf(out_str, max_len, "HOLD");
+    } else if(g_parser_ctrl.is_running == 1 ||
+              atomic_load_explicit(&g_interpolator.is_moving, memory_order_acquire) == 1) {
+        snprintf(out_str, max_len, "RUN");
+    } else {
+        snprintf(out_str, max_len, "IDLE");
+    }
+}
+
 // ================== 运动控制 ==================
 void SMC_SetZero(char axis_letter) {
     if(axis_letter == SMC_AXIS_ALL) { api_set_zero(AXIS_ALL); return; }

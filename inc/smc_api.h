@@ -52,6 +52,13 @@ int SMC_IsMotionDone(void);
 // 获取底层 FIFO 队列堆积的指令数量 (用于UI进度条)
 int SMC_GetQueueCount(void);
 
+// 查询指定轴字母是否已配置映射 (1=已映射, 0=未配置)
+int SMC_IsAxisConfigured(char axis_letter);
+
+// 获取系统当前运行状态字符串 (ALARM / HOLD / RUN / IDLE)
+// out_str: 输出缓冲区, max_len: 缓冲区最大长度(含 '\0')
+void SMC_GetSystemStatusStr(char* out_str, int max_len);
+
 
 // =======================================================
 // 运动控制 API

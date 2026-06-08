@@ -110,6 +110,8 @@ void api_move_relative(int axis_idx,double distance,double speed){
 }
 
 
+// @Context: Non-RealTime Background Thread (parser / 上层管理线程)
+// @Thread-Safety: planner_mutex 保护队列 head 读写临界区
 int api_push_trajectory(double target_pos[AXIS_NUM],
                          double speed_sec_mm, double acc_sec_mm, double dec_sec_mm)
 {
@@ -120,7 +122,6 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     if(!g_all_axis_op_ready) return -1;
     if(!check_soft_limits(target_pos)) return -1;
 
-    // 拦截负速度/零速度：进给速度是标量，非正数属于上层逻辑错误
     if(speed_sec_mm <= 0.0) {
         printf("[SAFETY] 进给速度 %.3f mm/s 非正数，拒绝执行！\n", speed_sec_mm);
         return -1;
@@ -132,7 +133,6 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
         delta_raw[i]=target_pos[i]-plan_cursor[i];
     }
 
-    // Pre-check: 拦截未配置动力学的轴（max_speed==0 表示未初始化）
     for(int i=0;i<AXIS_NUM;i++){
         if(fabs(delta_raw[i]) > 0.0001 && g_axis[i].max_speed <= 0.0) {
             printf("[SAFETY] %s 轴动力学未配置(max_speed=0)，拒绝执行运动指令！\n",
@@ -142,8 +142,6 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     }
 
     // ---- 第二步：统一量纲 → 等效毫米位移 ----
-    // equivalent_radius: 旋转轴物理半径(mm)
-    // 弧长 = deg × (π/180) × radius → mm
     double delta_mm[AXIS_NUM];
     for(int i=0;i<AXIS_NUM;i++){
         if(g_axis[i].axis_type == 1){
@@ -166,36 +164,13 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     double dist = sqrt(dist_sq);
     if(dist < 1e-6) dist = 0.0;
 
-    // Wait for queue slot: 报警/急停时 RT 线程停止消费，必须打破死锁
-    int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
-    while (next_head == g_cmd_queue.tail) {
-        if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
-        osal_usleep(1000);
-        next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
-    }
-
-    TrajectorySegment_t *seg = &g_cmd_queue.buffer[g_cmd_queue.head];
-    seg->is_ready = 0;
-    seg->cmd_type = CMD_TYPE_MOTION;
-    seg->m_code = 0;
-    seg->s_value = 0.0;
-    seg->total_distance = dist;
-
-    // ---- 第四步：纯净几何空间方向向量（无量纲）----
+    // 方向向量（预计算，mutex 内直接拷贝）
+    double dir_vec[AXIS_NUM];
     for(int i=0;i<AXIS_NUM;i++){
-        seg->target_pos[i]=target_pos[i];
-        if(dist > 1e-6){
-            seg->dir_vec[i] = delta_mm[i] / dist;
-        }else{
-            seg->dir_vec[i] = 0;
-        }
+        dir_vec[i] = (dist > 1e-6) ? delta_mm[i] / dist : 0.0;
     }
 
-    // ---- 第五步：短板效应限幅（量纲纯净 ratio 缩放）----
-    // axis_ratio_mm = |delta_mm[i]|/dist: 纯空间无量纲投影比
-    // 空间分配速度 req_v_mm = v × axis_ratio_mm (mm/s)
-    // 旋转轴逆解: req_v = req_v_mm / equivalent_radius → deg/s
-    // 线性轴直取: req_v = req_v_mm → mm/s
+    // ---- 第四步：短板效应限幅（纯配置量运算，无需 mutex）----
     double final_speed_ratio = 1.0;
     double final_acc_ratio   = 1.0;
     double final_dec_ratio   = 1.0;
@@ -244,19 +219,42 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
         }
     }
 
-    // 短板限幅：物理防爆墙，限幅后无论多小都必须服从，绝不允许再抬高！
     speed_sec_mm *= final_speed_ratio;
     acc_sec_mm   *= final_acc_ratio;
     dec_sec_mm   *= final_dec_ratio;
     double jerk_sec_mm = DEFAULT_JERK * final_jerk_ratio;
 
-    // 数学安全下限（限幅之后，仅防除零/NaN；规划器内部有 fmax(x,1e-6) 二次兜底）
     if(speed_sec_mm < 1e-6) speed_sec_mm = 1e-6;
     if(acc_sec_mm < 1e-6)   acc_sec_mm   = 1e-6;
     if(dec_sec_mm < 1e-6)   dec_sec_mm   = 1e-6;
     if(jerk_sec_mm < 1e-6)  jerk_sec_mm  = 1e-6;
 
-    // 单位转换: mm/s → mm/ms, mm/s^2 → mm/ms^2, mm/s^3 → mm/ms^3
+    // === 队列临界区：planner_mutex 保护 head 读写 ===
+    // 防止 planner_fillet_preprocess 在后台修改 head 导致竞态覆写
+    pthread_mutex_lock(&planner_mutex);
+
+    int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
+    while (next_head == g_cmd_queue.tail) {
+        pthread_mutex_unlock(&planner_mutex);
+        if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
+        osal_usleep(1000);
+        pthread_mutex_lock(&planner_mutex);
+        next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
+    }
+
+    TrajectorySegment_t *seg = &g_cmd_queue.buffer[g_cmd_queue.head];
+    seg->is_ready = 0;
+    seg->cmd_type = CMD_TYPE_MOTION;
+    seg->is_fillet = 0;
+    seg->m_code = 0;
+    seg->s_value = 0.0;
+    seg->total_distance = dist;
+
+    for(int i=0;i<AXIS_NUM;i++){
+        seg->target_pos[i]=target_pos[i];
+        seg->dir_vec[i] = dir_vec[i];
+    }
+
     seg->v_target = speed_sec_mm / 1000.0;
     seg->acc = acc_sec_mm / 1000000.0;
     seg->dec = dec_sec_mm / 1000000.0;
@@ -275,19 +273,23 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     seg->j1=0; seg->a2=0; seg->j3=0;
     seg->j5=0; seg->a6=0; seg->j7=0;
 
-    // 所有安全检查通过，方可推进光标
     for(int i=0;i<AXIS_NUM;i++){
         plan_cursor[i]=target_pos[i];
     }
 
-    // 写屏障：确保段数据在 head 指针更新前对所有核可见
     atomic_thread_fence(memory_order_release);
     g_cmd_queue.head = next_head;
+
+    pthread_mutex_unlock(&planner_mutex);
+
+    // planner_recalculate 内部自行加锁，必须在 unlock 之后调用
     planner_recalculate(0);
     return 0;
 }
 
 
+// @Context: Non-RealTime Background Thread (parser / 上层管理线程)
+// @Thread-Safety: planner_mutex 保护队列 head 读写临界区
 int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value)
 {
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
@@ -295,10 +297,15 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
         return -1;
     }
     if(!g_all_axis_op_ready) return -1;
+
+    pthread_mutex_lock(&planner_mutex);
+
     int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     while (next_head == g_cmd_queue.tail) {
+        pthread_mutex_unlock(&planner_mutex);
         if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
         osal_usleep(1000);
+        pthread_mutex_lock(&planner_mutex);
         next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     }
 
@@ -327,9 +334,11 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->j1=0; seg->a2=0; seg->j3=0;
     seg->j5=0; seg->a6=0; seg->j7=0;
 
-    // 写屏障：确保段数据在 head 指针更新前对所有核可见
     atomic_thread_fence(memory_order_release);
     g_cmd_queue.head = next_head;
+
+    pthread_mutex_unlock(&planner_mutex);
+
     planner_recalculate(0);
     return 0;
 }
@@ -344,14 +353,10 @@ int is_trajectory_finished(){
     return 0;
 }
 
+// @Context: Non-RealTime Background Thread (parser 文件解析结束调用)
+// @Thread-Safety: 由 planner_recalculate 内部持有 planner_mutex
 void api_flush_planner(){
-    pthread_mutex_lock(&planner_mutex);
-    int curr=g_cmd_queue.tail;
-    while(curr!=g_cmd_queue.head){
-        atomic_store_explicit(&g_cmd_queue.buffer[curr].is_ready, 1, memory_order_release);
-        curr=(curr+1)%QUEUE_SIZE;
-    }
-    pthread_mutex_unlock(&planner_mutex);
+    planner_recalculate(1);  // force_flush=1: 全量速度规划 + S曲线预计算 + 原子释放
 }
 
 void api_motion_pause(){
