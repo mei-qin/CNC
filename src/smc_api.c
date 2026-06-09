@@ -3,6 +3,7 @@
 #include "ecat_core.h"
 #include "axis_ctrl.h"
 #include "gcode_parser.h"
+#include "kinematics.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -235,6 +236,36 @@ int SMC_ConfigPlannerParams(double tolerance, double max_centripetal_acc){
     printf("[SMC_API] 规划器参数: tolerance=%.4f, centripetal_acc=%.1f\n",
            tolerance, max_centripetal_acc);
     return 0;
+}
+
+// @Context: Non-RealTime Background Thread (初始化阶段调用)
+// @Thread-Safety: 写入运动学全局偏置，仅允许停机时配置
+void SMC_ConfigKinematicsOffset(double tool_len, double pivot_x, double pivot_y, double pivot_z) {
+    g_kin_config.tool_offset[0] = 0.0;
+    g_kin_config.tool_offset[1] = 0.0;
+    g_kin_config.tool_offset[2] = tool_len; // 沿 -Z 方向
+    g_kin_config.pivot_offset[0] = pivot_x;
+    g_kin_config.pivot_offset[1] = pivot_y;
+    g_kin_config.pivot_offset[2] = pivot_z;
+    printf("[SMC_API] 运动学偏置: tool_len=%.2f mm, pivot=(%.2f, %.2f, %.2f) mm\n",
+           tool_len, pivot_x, pivot_y, pivot_z);
+}
+
+// @Context: Non-RealTime Background Thread (初始化阶段调用)
+// @Thread-Safety: 写入运动学全局配置，仅允许停机时配置
+void SMC_ConfigKinematics(int type,
+                          int r1_idx, int r1_axis,
+                          int r2_idx, int r2_axis,
+                          double tool_off[3], double pivot_off[3]) {
+    g_kin_config.type      = type;
+    g_kin_config.rot_1_idx = r1_idx;
+    g_kin_config.rot_1_axis = r1_axis;
+    g_kin_config.rot_2_idx = r2_idx;
+    g_kin_config.rot_2_axis = r2_axis;
+    memcpy(g_kin_config.tool_offset, tool_off, sizeof(double) * 3);
+    memcpy(g_kin_config.pivot_offset, pivot_off, sizeof(double) * 3);
+    printf("[SMC_API] 运动学构型: type=%d, R1=[idx=%d,axis=%d], R2=[idx=%d,axis=%d]\n",
+           type, r1_idx, r1_axis, r2_idx, r2_axis);
 }
 
 // ================== 坐标与状态 ==================

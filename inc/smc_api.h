@@ -97,6 +97,22 @@ int SMC_ConfigAxisDynamics(char axis_letter, int type, double max_v, double max_
 // 配置规划器参数（G64 拐角容差、最大向心加速度）
 int SMC_ConfigPlannerParams(double tolerance, double max_centripetal_acc);
 
+// 配置运动学偏置参数（BC 双摆头: 刀具长度 + B→C 旋转中心偏置）
+// tool_len:    刀具长度 (mm), 沿主轴 -Z 方向
+// pivot_x/y/z: C 轴旋转中心到 B 轴旋转中心的物理偏置 (mm)
+void SMC_ConfigKinematicsOffset(double tool_len, double pivot_x, double pivot_y, double pivot_z);
+
+// 配置通用五轴运动学构型 (Head-Head / Table-Table / Mixed)
+// type:        构型枚举 (KIN_HEAD_HEAD / KIN_TABLE_TABLE / KIN_MIXED)
+// r1_idx/axis: 第 1 旋转轴的底层索引和旋转维度 (0=X,1=Y,2=Z)
+// r2_idx/axis: 第 2 旋转轴的底层索引和旋转维度
+// tool_off:    主轴面到刀尖的偏置 [3] (mm)
+// pivot_off:   两旋转中心之间的偏置 [3] (mm)
+void SMC_ConfigKinematics(int type,
+                          int r1_idx, int r1_axis,
+                          int r2_idx, int r2_axis,
+                          double tool_off[3], double pivot_off[3]);
+
 
 #ifdef __cplusplus
 }

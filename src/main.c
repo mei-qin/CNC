@@ -74,7 +74,7 @@ int main(int argc, char *argv[])
     SMC_ConfigAxisTopology("X轴", 0, 5, 0);
     SMC_ConfigAxisTopology("Y轴", 1, 3, 4); // Y轴双驱 (主站3, 从站4)
     SMC_ConfigAxisTopology("Z轴", 0, 6, 0);
-    SMC_ConfigAxisTopology("A轴", 0, 1, 0);
+    SMC_ConfigAxisTopology("C轴", 0, 1, 0);
     SMC_ConfigAxisTopology("B轴", 0, 2, 0);
 
     // ==========================================
@@ -83,7 +83,7 @@ int main(int argc, char *argv[])
     SMC_ConfigPulsePerUnit('X', 10000.0);   // 1 mm = 10000 脉冲
     SMC_ConfigPulsePerUnit('Y', 10000.0);   // 1 mm = 10000 脉冲
     SMC_ConfigPulsePerUnit('Z', 1000.0);    // 1 mm = 1000 脉冲
-    SMC_ConfigPulsePerUnit('A', 2777.7778); // 1 度 = 2777.8 脉冲
+    SMC_ConfigPulsePerUnit('C', 2777.7778); // 1 度 = 2777.8 脉冲
     SMC_ConfigPulsePerUnit('B', 2777.7778); // 1 度 = 2777.8 脉冲
 
     // ==========================================
@@ -95,8 +95,24 @@ int main(int argc, char *argv[])
     SMC_ConfigAxisDynamics('Z', 0, 30.0, 100.0, 100.0, 0.0); // Z轴带主轴较重，参数保守
 
     // 旋转轴 (速度 度/s, 加速度 度/s^2, 等效半径 mm)
-    SMC_ConfigAxisDynamics('A', 1, 18.0, 72.0, 72.0, 50.0);
+    SMC_ConfigAxisDynamics('C', 1, 18.0, 72.0, 72.0, 50.0);
     SMC_ConfigAxisDynamics('B', 1, 18.0, 72.0, 72.0, 80.0);
+
+    // ==========================================
+    // 4.5 启动通用五轴运动学引擎 (Kinematics Chain)
+    // ==========================================
+    // 假设：刀具长度 150mm，上方 B 轴旋转中心离下方 C 轴旋转中心的高度差为 200mm
+    double tool_off[3]  = {0.0, 0.0, 150.0};
+    double pivot_off[3] = {0.0, 0.0, 200.0};
+
+    // 配置为 Head-Head 构型：
+    // 第 1 旋转轴：B 轴 (映射表找索引)，绕 Y 轴旋转 (1)
+    // 第 2 旋转轴：C 轴 (映射表找索引)，绕 Z 轴旋转 (2)
+    SMC_ConfigKinematicsOffset(150.0, 0.0, 0.0, 200.0); // 供记录用
+    SMC_ConfigKinematics(KIN_HEAD_HEAD, 
+                         g_axis_map['B'-'A'], 1, 
+                         g_axis_map['C'-'A'], 2, 
+                         tool_off, pivot_off);
 
     // ==========================================
     // 5. 规划器参数与安全预警配置
