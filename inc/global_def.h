@@ -4,6 +4,8 @@
 #include "soem/soem.h"
 #include "axis_cfg.h"
 #include "gcode_parser.h"
+#include "trace_logger.h"
+#include "sim_engine.h"
 #include <pthread.h>
 /************************ SOEM全局核心变量（b3_drive原有） ************************/
 extern ecx_contextt ctx;                // SOEM主站上下文
@@ -11,6 +13,7 @@ extern uint8 IOmap[4096];               // PDO映射缓冲区（所有轴共用�
 extern OSAL_THREAD_HANDLE thread_rt;    // 实时线程句柄
 extern OSAL_THREAD_HANDLE thread_chk;   // 故障检查线程句柄
 extern OSAL_THREAD_HANDLE thread_parser; // G-code解析线程句柄
+extern OSAL_THREAD_HANDLE thread_bspline; // B-Spline平滑线程句柄
 
 extern int expectedWKC;                 // SOEM期望WKC值
 extern int wkc;                         // 实际WKC值
@@ -40,8 +43,11 @@ extern ParserControl_t g_parser_ctrl;     // 全局G-code解析控制变量
 extern double g_pulse_per_unit[AXIS_NUM]; // 每轴脉冲/单位（如mm）转换系数
 extern CoordManager_t g_coord_mgr; // 坐标系管理器
 extern RtLog_t g_rt_log;           // 实时线程环形日志缓冲
+extern TraceQueue_t g_trace_queue; // 无锁轨迹探针队列
+extern sim_logger_t g_sim_logger;  // 仿真模式双缓冲轨迹采集器
 extern PlannerConfig_t g_planner_config; // 规划器全局参数
 extern pthread_mutex_t planner_mutex;    // 规划器互斥锁（parser线程 vs 看门狗线程）
 extern _Atomic int g_sys_alarm_state;    // 系统报警状态: 0=正常, 1=软停机报警中
+extern int g_sim_mode;                   // 仿真模式: 1=纯软件仿真, 0=真实硬件
 
 #endif // GLOBAL_DEF_H

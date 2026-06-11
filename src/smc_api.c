@@ -4,6 +4,8 @@
 #include "axis_ctrl.h"
 #include "gcode_parser.h"
 #include "kinematics.h"
+#include "bspline_engine.h"
+#include "trace_logger.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -35,7 +37,35 @@ int SMC_InitAndStart(const char *netif_name)
         printf("[SMC_API] G-code解析线程创建失败！\n"); return -1;
     }
 
-    ecat_bringup((char*)netif_name);
+    BSpline_Init();
+    if(BSpline_StartThread() < 0){
+        printf("[SMC_API] B-Spline平滑线程启动失败！\n"); return -1;
+    }
+
+    TraceLogger_Init();
+    if(TraceLogger_StartThread() < 0){
+        printf("[SMC_API] 轨迹探针线程启动失败！\n"); return -1;
+    }
+
+    // 仿真模式: 启动高频双缓冲轨迹采集器
+    if (g_sim_mode) {
+        if (sim_engine_init("sim_trace.bin", 1) != 0) {
+            printf("[SMC_API] 仿真轨迹采集器初始化失败！\n"); return -1;
+        }
+        if (sim_engine_start() != 0) {
+            printf("[SMC_API] 仿真轨迹落盘线程启动失败！\n"); return -1;
+        }
+    }
+
+    if (g_sim_mode) {
+        // ---- 仿真模式: 跳过 EtherCAT 硬件初始化 ----
+        printf("[SMC_API] 仿真模式: 跳过 ecat_bringup\n");
+        mappingdone = 1;
+        dorun = 1;
+        g_all_axis_op_ready = 1;
+    } else {
+        ecat_bringup((char*)netif_name);
+    }
 
     printf("[SMC_API] 等待伺服全轴使能并进入 CSP 同步...\n");
     int timeout = 50; // 最多等5秒
@@ -57,6 +87,17 @@ void SMC_Close(void)
 {
     printf("\n[SMC_API] 收到关闭请求，触发优雅下电时序...\n");
 
+    // 先停止 B-Spline 平滑线程 (排空队列后退出)
+    BSpline_StopThread();
+
+    // 仿真模式: 停止双缓冲轨迹采集器 (排空残余数据后关闭文件)
+    if (g_sim_mode) {
+        sim_engine_finish();
+    }
+
+    // 停止轨迹探针落盘线程 (排空残余数据后退出)
+    TraceLogger_StopThread();
+
     // 请求 RT 线程进入优雅下电状态机（抱闸闭合 + CiA402 降级）
     dorun = 2;
 
@@ -74,18 +115,20 @@ void SMC_Close(void)
         printf("[SMC_API] RT 线程优雅下电完成。\n");
     }
 
-    // 降级 EtherCAT 状态机：OP → SAFE_OP → INIT
-    ctx.slavelist[0].state = EC_STATE_SAFE_OP;
-    ecx_writestate(&ctx, 0);
-    if (ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE) != EC_STATE_SAFE_OP) {
-        printf("[ECAT警告] 切换SAFE_OP失败，但继续执行降级流程\n");
+    // 降级 EtherCAT 状态机：OP → SAFE_OP → INIT (仅真实硬件模式)
+    if (!g_sim_mode) {
+        ctx.slavelist[0].state = EC_STATE_SAFE_OP;
+        ecx_writestate(&ctx, 0);
+        if (ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE) != EC_STATE_SAFE_OP) {
+            printf("[ECAT警告] 切换SAFE_OP失败，但继续执行降级流程\n");
+        }
+        ctx.slavelist[0].state = EC_STATE_INIT;
+        ecx_writestate(&ctx, 0);
+        if (ecx_statecheck(&ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE) != EC_STATE_INIT) {
+            printf("[ECAT警告] 切换INIT失败，但继续关闭主站\n");
+        }
+        ecx_close(&ctx);
     }
-    ctx.slavelist[0].state = EC_STATE_INIT;
-    ecx_writestate(&ctx, 0);
-    if (ecx_statecheck(&ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE) != EC_STATE_INIT) {
-        printf("[ECAT警告] 切换INIT失败，但继续关闭主站\n");
-    }
-    ecx_close(&ctx);
     printf("[SMC_API] 系统已安全关闭！\n");
 }
 

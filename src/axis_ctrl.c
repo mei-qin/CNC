@@ -472,6 +472,7 @@ void axis_sdo_config_pp(int axis_idx)
 
 void axis_sdo_config_mode(int axis_idx, uint8_t mode)
 {
+    if (g_sim_mode) return; // 仿真模式: 跳过真实 SDO 写入
     if (axis_idx < 0 || axis_idx >= AXIS_NUM)
     {
         printf("[SDO错误] 轴索引越界！输入索引：%d，最大索引：%d\n", axis_idx, AXIS_NUM-1);
@@ -495,6 +496,7 @@ void axis_sdo_config_mode(int axis_idx, uint8_t mode)
 // SDO读取函数（读取指定索引/子索引的值）
 uint8_t axis_sdo_read_mode(int axis_idx)
 {
+    if (g_sim_mode) return CSP_MODE; // 仿真模式: 返回 CSP 模式
     uint8_t mode = 0;
     int sz = sizeof(mode);
     // 调用SOEM的SDO读函数（ecx_SDOread，与write逻辑对称）
@@ -507,6 +509,21 @@ uint8_t axis_sdo_read_mode(int axis_idx)
 /************************ PDO写（控制字+目标位置） ************************/
 void axis_pdo_write(int slave_id, uint16 cw, int32 pos)
 {
+    // ---- 仿真模式: 拦截写入, 存入 sim 字段 ----
+    if (g_sim_mode) {
+        for (int i = 0; i < AXIS_NUM; i++) {
+            for (int s = 0; s < g_axis[i].slave_count; s++) {
+                if (g_axis[i].slave_ids[s] == slave_id) {
+                    g_axis[i].sim_cmd_cw = cw;
+                    g_axis[i].sim_target_pos = pos;
+                    g_axis[i].sim_actual_pos = pos; // 完美电机: 反馈 = 指令
+                    return;
+                }
+            }
+        }
+        return;
+    }
+
     // 越界检查
     if (slave_id <= 0 || slave_id > ctx.slavecount) return;
 
@@ -532,6 +549,23 @@ void axis_pdo_write(int slave_id, uint16 cw, int32 pos)
 /************************ 单轴PDO读（状态字） ************************/
 uint16 axis_pdo_read_sw(int slave_id)
 {
+    // ---- 仿真模式: 根据 CiA402 步骤伪造完美状态字 ----
+    if (g_sim_mode) {
+        for (int i = 0; i < AXIS_NUM; i++) {
+            for (int s = 0; s < g_axis[i].slave_count; s++) {
+                if (g_axis[i].slave_ids[s] == slave_id) {
+                    switch (g_axis[i].cia_step) {
+                        case 0: return 0x0021; // SW_SHUTDOWN_RDY
+                        case 1: return 0x0023; // SW_SWITCHED_ON
+                        case 2: return 0x0027; // SW_OP_ENABLED
+                        default: return 0x0237; // SW_OP_ENABLED + TARGET_REACH + 保留位
+                    }
+                }
+            }
+        }
+        return 0x0237;
+    }
+
     // 1. 基础校验：索引越界/轴故障/从站ID无效
     if (slave_id <= 0 || slave_id > ctx.slavecount) return 0xFFFF;
 
@@ -582,6 +616,7 @@ void axis_print_sw_detail(int axis_idx)
 /************************ 配置CSP模式所有参数 ************************/
 void axis_config_csp_params(int axis_idx)
 {
+    if (g_sim_mode) return; // 仿真模式: 跳过真实 SDO 配置
     if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
     
     int slave_id = g_axis[axis_idx].slave_id;
@@ -637,6 +672,7 @@ void axis_config_csp_params(int axis_idx)
 /************************ 读取CSP运行状态 ************************/
 void axis_read_csp_status(int axis_idx)
 {
+    if (g_sim_mode) return; // 仿真模式: 无真实驱动器状态可读
     if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
     
     int slave_id = g_axis[axis_idx].slave_id;
@@ -687,6 +723,7 @@ void axis_read_csp_status(int axis_idx)
 
 void check_pdo_mapping(int axis_idx)
 {
+    if (g_sim_mode) { printf("[SIM] check_pdo_mapping: 仿真模式下跳过\n"); return; }
     int slave_id = g_axis[axis_idx].slave_id;
     
     printf("\n========== %s PDO映射检查 ==========\n", g_axis[axis_idx].axis_name);
@@ -762,6 +799,7 @@ void check_pdo_mapping(int axis_idx)
 
 void read_error_history(int axis_idx)
 {
+    if (g_sim_mode) { printf("[SIM] read_error_history: 仿真模式下跳过\n"); return; }
     int slave_id = g_axis[axis_idx].slave_id;
     
     printf("\n========== %s 故障历史 ==========\n", g_axis[axis_idx].axis_name);
@@ -829,6 +867,7 @@ void axis_pdo_write_cw_only(int axis_idx, uint16 cw)
 
 void diagnose_sync_failure(int axis_idx)
 {
+    if (g_sim_mode) { printf("[SIM] diagnose_sync_failure: 仿真模式下跳过\n"); return; }
     int slave_id = g_axis[axis_idx].slave_id;
     
     printf("\n========== %s 同步诊断 ==========\n", g_axis[axis_idx].axis_name);
@@ -877,6 +916,18 @@ void diagnose_sync_failure(int axis_idx)
 /************************ 从PDO读取实际位置 ************************/
 int32 axis_pdo_read_pos(int slave_id)
 {
+    // ---- 仿真模式: 返回完美电机反馈 (0 跟随误差) ----
+    if (g_sim_mode) {
+        for (int i = 0; i < AXIS_NUM; i++) {
+            for (int s = 0; s < g_axis[i].slave_count; s++) {
+                if (g_axis[i].slave_ids[s] == slave_id) {
+                    return g_axis[i].sim_actual_pos;
+                }
+            }
+        }
+        return 0;
+    }
+
     if (slave_id <=0 || slave_id > ctx.slavecount) return 0;
     
     uint8 *in = ctx.slavelist[slave_id].inputs;
@@ -896,6 +947,9 @@ int32 axis_pdo_read_pos(int slave_id)
 /************************ 从PDO读取跟随误差 (0x60F4) ************************/
 int32_t axis_pdo_read_follow_err(int slave_id)
 {
+    // ---- 仿真模式: 完美电机, 跟随误差恒为 0 ----
+    if (g_sim_mode) return 0;
+
     if (slave_id <=0 || slave_id > ctx.slavecount) return 0;
 
     uint8 *in = ctx.slavelist[slave_id].inputs;
@@ -914,6 +968,7 @@ int32_t axis_pdo_read_follow_err(int slave_id)
 /************************ 执行原点复归 (Homing) ************************/
 void axis_homing(int axis_idx)
 {
+    if (g_sim_mode) return; // 仿真模式: 跳过真实 SDO 归零
     if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
     int slave_id = g_axis[axis_idx].slave_id;
     

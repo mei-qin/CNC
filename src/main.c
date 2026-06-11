@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 #include <ctype.h>
 #include "global_def.h"
@@ -56,11 +57,19 @@ int main(int argc, char *argv[])
 {
     if (argc < 2) {
         printf("用法: sudo %s <EtherCAT网卡名> (例如: sudo ./cnc_core eth0)\n", argv[0]);
+        printf("      sudo %s sim                  (纯软件仿真模式, 无需硬件)\n", argv[0]);
         return 0;
+    }
+
+    // ---- 仿真模式检测 ----
+    if (strcmp(argv[1], "sim") == 0) {
+        g_sim_mode = 1;
+        printf("[SIM] *** 纯软件仿真模式已激活 ***\n");
     }
 
     printf("\n==============================================\n");
     printf("     SMC 五轴高端数控系统内核 (V2.0) \n");
+    if (g_sim_mode) printf("     [SIMULATION MODE - 无真实硬件]\n");
     printf("==============================================\n");
 
     // ==========================================

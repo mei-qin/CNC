@@ -2,12 +2,13 @@
 #include "global_def.h"
 #include "axis_ctrl.h"
 #include "kinematics.h"
+#include "bspline_engine.h"
 #include <math.h>
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
 #define RTCP_LINEAR_SEGMENT_MM 0.5 // RTCP直线微段打碎步长，单位mm
 
-GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0}; // rtcp_enabled=0
+GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0, 0}; // rtcp=0, bspline=0
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
 extern int api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
@@ -226,11 +227,23 @@ int parse_gcode_line(const char *gcode_line)
 
     // 处理M代码：压入队列作为同步屏障
     if (m_code >= 0) {
-        if(api_push_mcode(m_code, s_value, p_value, q_value, r_value) < 0){
-            printf("[Parser] M代码入队失败(报警)，中止当前文件！\n");
-            return -1;
+        // B-Spline 缓冲区排空：M 代码前必须强制刷新，保证指令顺序
+        if (g_state.bspline_enabled) {
+            BSpline_Flush();
         }
-        printf("[Parser] 解析M代码: M%02d S%.1f P%.1f Q%.1f R%.1f\n", m_code, s_value, p_value, q_value, r_value);
+
+        // M50: B-Spline 平滑模式开关 (P1=开启, P0=关闭)
+        if (m_code == 50) {
+            g_state.bspline_enabled = (p_value > 0.5) ? 1 : 0;
+            printf("[Parser] B-Spline平滑模式: %s\n", g_state.bspline_enabled ? "开启" : "关闭");
+            // M50 不入队，仅切换模式
+        } else {
+            if(api_push_mcode(m_code, s_value, p_value, q_value, r_value) < 0){
+                printf("[Parser] M代码入队失败(报警)，中止当前文件！\n");
+                return -1;
+            }
+            printf("[Parser] 解析M代码: M%02d S%.1f P%.1f Q%.1f R%.1f\n", m_code, s_value, p_value, q_value, r_value);
+        }
     }
 
     // 运动门控：仅当本行包含显式轴运动且非运动参数指令时才触发轨迹下发
@@ -287,6 +300,20 @@ int parse_gcode_line(const char *gcode_line)
         }
         dist_total = sqrt(dist_total);
 
+        // ---- 异步时序同步屏障 ----
+        // 判断当前指令是否会绕过 B-Spline 蓄水池直接下发
+        int will_bypass_bspline = 1;
+        if(g_state.bspline_enabled && g_state.motion_mode == 1 && !g_state.rtcp_enabled){
+            will_bypass_bspline = 0; // 纯 G01 将进入蓄水池
+        }
+
+        // 如果开启了 B-Spline，且当前指令准备“插队直通底层”，必须先排空蓄水池！
+        // 这保证了时间先后的绝对顺序，并让底层的 plan_cursor 更新到最新位置
+        if (g_state.bspline_enabled && will_bypass_bspline) {
+            BSpline_Flush();
+        }
+        // ---------------------------------------------
+
         // 进给速度计算：G00 始终快速，G93 按时间反推，G94 直取 F 值
         double run_speed_mm;   // mm/min
         double g93_T_sec = 0.0;
@@ -335,9 +362,18 @@ int parse_gcode_line(const char *gcode_line)
             }
         } else {
             double speed_mm_sec=run_speed_mm/60.0;
-            if(api_push_trajectory(machine_target_pos,speed_mm_sec,DEFAULT_ACC,DEFAULT_DEC) < 0){
-                printf("[Parser] 运动指令入队失败(报警)，中止当前文件！\n");
-                return -1;
+            if(!will_bypass_bspline){
+                // G01 + B-Spline 模式: 通过平滑引擎入队
+                if(BSpline_PushDirtyPoint(machine_target_pos, speed_mm_sec, g93_T_sec) < 0){
+                    printf("[Parser] B-Spline入队失败(报警)，中止当前文件！\n");
+                    return -1;
+                }
+            } else {
+                // 直通: G00 或 B-Spline 未启用
+                if(api_push_trajectory(machine_target_pos,speed_mm_sec,DEFAULT_ACC,DEFAULT_DEC) < 0){
+                    printf("[Parser] 运动指令入队失败(报警)，中止当前文件！\n");
+                    return -1;
+                }
             }
         }
 
@@ -410,6 +446,9 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 }
             }
             fclose(fp);
+            if(g_state.bspline_enabled){
+                BSpline_Flush();
+            }
             api_flush_planner();
             printf("[Parser] 文件处理完成: %s\n", g_parser_ctrl.filepath);
             g_parser_ctrl.is_running=0; // 处理完成后重置状态

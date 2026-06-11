@@ -2,6 +2,8 @@
 #include "global_def.h"
 #include "axis_ctrl.h"
 #include "planner.h"
+#include "trace_logger.h"
+#include "sim_engine.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -15,6 +17,7 @@ uint8 IOmap[4096];
 OSAL_THREAD_HANDLE thread_rt;
 OSAL_THREAD_HANDLE thread_chk;
 OSAL_THREAD_HANDLE thread_parser;
+OSAL_THREAD_HANDLE thread_bspline;
 int expectedWKC;
 int wkc;
 int mappingdone = 0;
@@ -23,6 +26,7 @@ int inOP = 0;
 _Atomic int g_sys_alarm_state = 0;
 int dowkccheck = 0, currentgroup = 0;
 int g_all_axis_enabled = 0;
+int g_sim_mode = 0;
 
 // 实时控制变量
 int cycle = 0;
@@ -116,17 +120,33 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
     osal_get_monotonic_time(&ts);
     ht = (ts.tv_nsec / 1000000) + 1;
     ts.tv_nsec = ht * 1000000;
-    ecx_send_processdata(&ctx);
+    if (!g_sim_mode) ecx_send_processdata(&ctx);
     rt_log("[RT] 初始化完成，等待dorun启动");
 
     while (1)
     {
-        add_time_ns(&ts, cycletime + toff);
-        osal_monotonic_sleep(&ts);
+        // ================================================================
+        // 仿真模式: 跳过硬件时钟等待, 以 CPU 最高算力空转
+        // 每次循环代表 1ms 虚拟时间, 但实际以纳秒级执行
+        // "几秒钟推演几十小时加工代码" 的超光速仿真核心!
+        // ================================================================
+        if (g_sim_mode) {
+            // 无 sleep, 无 add_time_ns — 纯 CPU 火力全开
+        } else {
+            add_time_ns(&ts, cycletime + toff);
+            osal_monotonic_sleep(&ts);
+        }
 
         if(dorun == 1){
             cycle++;
-            wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+
+            // ---- 仿真模式: 跳过真实 EtherCAT 收发 ----
+            if (g_sim_mode) {
+                wkc = expectedWKC > 0 ? expectedWKC : 1;
+                // 跳过 ec_sync (无物理 DC 时钟)
+            } else {
+                wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+            }
 
             static int is_first_run=1;
             if(is_first_run&&wkc>0){
@@ -139,7 +159,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             }
             is_first_run=0;
 
-            if (ctx.slavelist[0].hasdc && (wkc > 0))
+            if (!g_sim_mode && ctx.slavelist[0].hasdc && (wkc > 0))
                 ec_sync(ctx.DCtime, cycletime, &toff);
 
             // === 报警复位安全点：必须在 g_all_axis_op_ready 门控之外 ===
@@ -279,6 +299,39 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     }
                 }
 
+            }
+
+            // ---- 无锁轨迹探针: 每 5ms 且 is_moving 时采样 (仅真实硬件模式) ----
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: TraceLogger_Push 是无锁非阻塞的, 满时静默丢弃
+            // 仿真模式下由 sim_engine 以 1ms 全量采集, 此处跳过避免冗余
+            if (!g_sim_mode && g_interpolator.is_moving && (cycle % 5 == 0)) {
+                int idx_x = g_axis_map['X' - 'A'];
+                int idx_y = g_axis_map['Y' - 'A'];
+                int idx_z = g_axis_map['Z' - 'A'];
+                int idx_b = g_axis_map['B' - 'A'];
+                int idx_c = g_axis_map['C' - 'A'];
+                TraceLogger_Push(
+                    cycle,
+                    g_interpolator.virtual_time_ms,
+                    (idx_x >= 0) ? g_interpolator.current_pos[idx_x] : 0.0,
+                    (idx_y >= 0) ? g_interpolator.current_pos[idx_y] : 0.0,
+                    (idx_z >= 0) ? g_interpolator.current_pos[idx_z] : 0.0,
+                    (idx_b >= 0) ? g_interpolator.current_pos[idx_b] : 0.0,
+                    (idx_c >= 0) ? g_interpolator.current_pos[idx_c] : 0.0,
+                    g_interpolator.v_target
+                );
+            }
+
+            // ---- 仿真模式: 每周期全量轨迹采集 (1ms 精度, 无降采样) ----
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: sim_engine_push 无锁无阻塞, 双缓冲原子交换+sem_post
+            // 生产 1:1 完整物理轨迹供上位机 3D 渲染比对
+            if (g_sim_mode && g_interpolator.is_moving) {
+                sim_engine_push((uint64_t)cycle,
+                                g_interpolator.virtual_time_ms,
+                                g_interpolator.current_pos,
+                                g_interpolator.v_target);
             }
 
             if(g_all_axis_op_ready){
@@ -545,8 +598,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
             g_all_axis_op_ready=all_ready_flag;
 
-            ecx_mbxhandler(&ctx, 0, 4);
-            ecx_send_processdata(&ctx);
+            if (!g_sim_mode) ecx_mbxhandler(&ctx, 0, 4);
+            if (!g_sim_mode) ecx_send_processdata(&ctx);
 
         }else if(dorun == 2){
             // ================================================================
@@ -555,7 +608,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // @Danger: NO BLOCKING, NO MATH.H, NO PRINTF, NO MALLOC.
             // 抱闸闭合期间维持 EtherCAT 心跳，防止通信丢失。
             // ================================================================
-            wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+            if (g_sim_mode) {
+                // 仿真模式: 直接完成下电
+                dorun = 0;
+            } else {
+                wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
             static int shutdown_step = 0;
             static int shutdown_counter = 0;
@@ -597,17 +654,20 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     shutdown_counter = 0;
                 }
             }
+            } // end else (real hardware shutdown)
 
         }else{
             // dorun == 0: 心跳兜底（SMC_Close 执行 EtherCAT 降级期间的过渡态）
-            for(int i=0;i<AXIS_NUM;i++){
-               for(int s=0;s<g_axis[i].slave_count;s++){
-                int slave_id=g_axis[i].slave_ids[s];
-                int32_t act=axis_pdo_read_pos(slave_id);
-                axis_pdo_write(slave_id,CW_SHUTDOWN,act);
-               }
+            if (!g_sim_mode) {
+                for(int i=0;i<AXIS_NUM;i++){
+                   for(int s=0;s<g_axis[i].slave_count;s++){
+                    int slave_id=g_axis[i].slave_ids[s];
+                    int32_t act=axis_pdo_read_pos(slave_id);
+                    axis_pdo_write(slave_id,CW_SHUTDOWN,act);
+                   }
+                }
+                ecx_send_processdata(&ctx);
             }
-            ecx_send_processdata(&ctx);
         }
 
     }

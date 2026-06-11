@@ -146,6 +146,11 @@ typedef struct {
     double current_cmd_pos; // 当前命令位置（以工程单位表示，用于UI/控制）
     double pulse_per_unit; // 脉冲/单位（如 脉冲/mm 或 脉冲/度），用于位置/速度换算
 
+    // ⑤ 仿真存根字段 (仅 g_sim_mode == 1 时使用)
+    uint16_t sim_cmd_cw;       // 上周期 RT 线程发送的控制字
+    int32_t sim_target_pos;    // 上周期 RT 线程发送的目标位置 (脉冲)
+    int32_t sim_actual_pos;    // 仿真编码器反馈 (= sim_target_pos, 0 跟随误差)
+
     // ④ 轴动力学参数（由 SMC_ConfigAxisDynamics 配置）
     int axis_type;        // 0: 线性轴 (Linear), 1: 旋转轴 (Rotary)
     double max_speed;     // 单轴最大允许速度 (mm/s 或 deg/s)
