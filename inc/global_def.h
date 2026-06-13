@@ -4,6 +4,7 @@
 #include "soem/soem.h"
 #include "axis_cfg.h"
 #include "gcode_parser.h"
+#include "cutter_comp.h"
 #include "trace_logger.h"
 #include "sim_engine.h"
 #include <pthread.h>

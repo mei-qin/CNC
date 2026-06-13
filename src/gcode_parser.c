@@ -8,7 +8,7 @@
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
 #define RTCP_LINEAR_SEGMENT_MM 0.5 // RTCP直线微段打碎步长，单位mm
 
-GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0, 0}; // rtcp=0, bspline=0
+GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0, 0, 0}; // rtcp=0, bspline=0, comp=OFF
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
 extern int api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
@@ -191,6 +191,16 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==18.0) g_state.active_plane=18;
                 else if(value==19.0) g_state.active_plane=19;
                 else if(value==28.0) is_non_motion_g=1;    // G28 返回参考点
+                else if(value==40.0){
+                    // G40: 取消刀具半径补偿
+                    if(CutterComp_GetMode() != COMP_OFF){
+                        // 刷出 B-Spline 蓄水池，保证补偿引擎的输出在 M 代码/新指令前到达
+                        if(g_state.bspline_enabled) BSpline_Flush();
+                        CutterComp_Disable();
+                    }
+                }
+                else if(value==41.0) g_state.pending_comp_mode = COMP_LEFT;  // G41: 左补偿 (等待 D 值)
+                else if(value==42.0) g_state.pending_comp_mode = COMP_RIGHT; // G42: 右补偿 (等待 D 值)
                 else if(value==90.0) g_state.is_absolute=1;
                 else if(value==91.0) g_state.is_absolute=0;
                 else if(value==92.0) is_non_motion_g=1;    // G92 坐标偏移
@@ -206,6 +216,16 @@ int parse_gcode_line(const char *gcode_line)
             case 'J':offset_j=value;has_move=1;break;
             case 'K':offset_k=value;has_move=1;break;
             case 'M':m_code=(int)value;break;
+            case 'D':
+                // D 代码: 刀具半径补偿值 (mm)
+                // 当 G41/G42 已在本行声明时，配合 D 值激活补偿
+                if(g_state.pending_comp_mode != COMP_OFF){
+                    // 刷出 B-Spline 蓄水池，保证补偿引擎输出顺序
+                    if(g_state.bspline_enabled) BSpline_Flush();
+                    CutterComp_Enable(g_state.pending_comp_mode, value);
+                    g_state.pending_comp_mode = COMP_OFF;
+                }
+                break;
             case 'P':p_value=value;break;
             case 'Q':q_value=value;break;
             case 'R':r_value=value;break;
@@ -300,6 +320,14 @@ int parse_gcode_line(const char *gcode_line)
         }
         dist_total = sqrt(dist_total);
 
+        // G53，屏蔽一切姿态补偿和平滑
+        int local_rtcp_enabled = g_state.rtcp_enabled;
+        int local_bspline_enabled = g_state.bspline_enabled;
+        if(is_G53_this_block) {
+            local_rtcp_enabled = 0;
+            local_bspline_enabled = 0;
+        }
+
         // ---- 异步时序同步屏障 ----
         // 判断当前指令是否会绕过 B-Spline 蓄水池直接下发
         int will_bypass_bspline = 1;
@@ -354,6 +382,7 @@ int parse_gcode_line(const char *gcode_line)
 
         } else if(g_state.rtcp_enabled){
             // RTCP 直线：微段打碎 + 逐点逆解
+            // 刀补引擎暂不支持 RTCP 路径 (旋转轴参与偏置复杂度超出 2D 范围)
             if(generate_linear_rtcp_trajectory(machine_start_pos,
                                                machine_target_pos,
                                                run_speed_mm, g93_T_sec) < 0){
@@ -362,7 +391,19 @@ int parse_gcode_line(const char *gcode_line)
             }
         } else {
             double speed_mm_sec=run_speed_mm/60.0;
-            if(!will_bypass_bspline){
+
+            // ---- 刀具半径补偿路由 ----
+            // 补偿激活时，G01/G00 直线段通过 CutterComp_PushPoint 走偏置引擎，
+            // 引擎内部计算偏置后通过回调下发到 B-Spline 或 Planner。
+            // G02/G03 圆弧和 RTCP 直通，不经过刀补引擎。
+            if(CutterComp_GetMode() != COMP_OFF && g_state.motion_mode <= 1){
+                // 刀补模式: 通过补偿引擎入队 (引擎内部已设置输出回调)
+                if(CutterComp_PushPoint(machine_target_pos, speed_mm_sec,
+                                        DEFAULT_ACC, DEFAULT_DEC) < 0){
+                    printf("[Parser] 刀补引擎入队失败(报警)，中止当前文件！\n");
+                    return -1;
+                }
+            } else if(!will_bypass_bspline){
                 // G01 + B-Spline 模式: 通过平滑引擎入队
                 if(BSpline_PushDirtyPoint(machine_target_pos, speed_mm_sec, g93_T_sec) < 0){
                     printf("[Parser] B-Spline入队失败(报警)，中止当前文件！\n");

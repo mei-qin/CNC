@@ -6,7 +6,9 @@
 #include <string.h>
 #include <ctype.h>
 #include "soem/soem.h"
+#include "osal_compat.h"
 #include "axis_cfg.h"
+#include "cutter_comp.h"
 
 #define RAPID_SPEED_MM_MIN 3000.0 // G00 快速移动速度（mm/min），可根据需要调整
 #define DEFAULT_ACC  50.0   // 默认加速度（mm/s^2）
@@ -26,6 +28,7 @@ typedef struct {
     int feed_mode;         // 进给模式: FEED_MODE_G93 或 FEED_MODE_G94
     int rtcp_enabled;      // G43.4 RTCP刀尖跟随: 0=关闭, 1=开启
     int bspline_enabled;   // B-Spline平滑模式: 0=关闭(M50 P0), 1=开启(M50 P1)
+    int pending_comp_mode; // 待激活的刀补模式: COMP_OFF/G41/G42, 配合 D 代码使用
 } GCodeState_t;
 
 typedef struct{

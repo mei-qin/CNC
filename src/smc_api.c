@@ -42,14 +42,26 @@ int SMC_InitAndStart(const char *netif_name)
         printf("[SMC_API] B-Spline平滑线程启动失败！\n"); return -1;
     }
 
+    // 刀补引擎初始化: 设置输出回调为 api_push_trajectory
+    // 当刀补激活时，偏置后的点直接发往规划器 (不经过 B-Spline)
+    CutterComp_Init();
+    CutterComp_SetOutput(api_push_trajectory);
+
     TraceLogger_Init();
-    if(TraceLogger_StartThread() < 0){
-        printf("[SMC_API] 轨迹探针线程启动失败！\n"); return -1;
+    if (!g_sim_mode) {
+        if(TraceLogger_StartThread() < 0){
+            printf("[SMC_API] 轨迹探针线程启动失败！\n"); return -1;
+        }
     }
 
     // 仿真模式: 启动高频双缓冲轨迹采集器
     if (g_sim_mode) {
-        if (sim_engine_init("sim_trace.bin", 1) != 0) {
+        char ts_buf[300];
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        strftime(ts_buf, sizeof(ts_buf),
+                 "cnc_trace_log_%Y%m%d_%H%M%S.csv", tm_info);
+        if (sim_engine_init(ts_buf, 0) != 0) {
             printf("[SMC_API] 仿真轨迹采集器初始化失败！\n"); return -1;
         }
         if (sim_engine_start() != 0) {
