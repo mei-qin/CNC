@@ -3,7 +3,7 @@
 # 1. libsoem.so 路径：/home/server/SOEM/build
 # 2. SOEM源码根目录：/home/server/SOEM
 # 3. osal.h 路径：/home/server/SOEM/src/osal
-SOEM_PATH = /home/server/SOEM
+SOEM_PATH = /home/meiqin/SOEM
 INC_PATH  = ./inc
 SRC_PATH  = ./src
 BIN_PATH  = ./
@@ -12,8 +12,8 @@ CC = gcc
 # 核心修正：新增SOEM的src/osal和src/nicdrv路径，解决osal.h/nicdrv.h找不到
 CFLAGS = -Wall -O2 \
 -I$(INC_PATH) \
--I$(SOEM_PATH)/include/soem \
 -I$(SOEM_PATH)/include \
+-I$(SOEM_PATH)/build/include \
 -I$(SOEM_PATH)/osal \
 -I$(SOEM_PATH)/osal/linux \
 -I$(SOEM_PATH)/oshw/linux \
@@ -25,7 +25,7 @@ LDFLAGS = -L$(SOEM_PATH)/build \
 -lsoem \
 -lpthread -lrt -lm
 
-TARGET = $(BIN_PATH)/five_axis_servo
+TARGET = $(BIN_PATH)/cnc_core
 SRC = $(wildcard $(SRC_PATH)/*.c)
 OBJ = $(patsubst $(SRC_PATH)/%.c, $(SRC_PATH)/%.o, $(SRC))
 

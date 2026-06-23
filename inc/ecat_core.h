@@ -3,6 +3,7 @@
 #define ECAT_CORE_H
 
 #include "soem/soem.h"
+#include "osal_compat.h"
 #include "axis_cfg.h"
 
 

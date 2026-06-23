@@ -11,6 +11,9 @@
 GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0, 0, 0}; // rtcp=0, bspline=0, comp=OFF
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
 extern int api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
+extern int api_push_trajectory_g93(double target_pos[AXIS_NUM],double speed,double acc,double dec,double g93_dt_sec);
+extern int api_push_trajectory_passthrough(double target_pos[AXIS_NUM],double speed,double acc,double dec);
+extern int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
 
 const char* skip_spaces(const char* str)
@@ -48,11 +51,121 @@ static void apply_rtcp_to_pos(double pos[AXIS_NUM])
 }
 
 // @Context: Non-RealTime Background Thread (parser 调用)
-// @Safe: 纯坐标变换 + 调用 api_push_trajectory（队列写入，线程安全）。
-// RTCP 直线微段打碎：当直线段包含旋转轴运动时，按 0.5mm 等效步长
-// 将逻辑空间直线打碎成微小段，逐点做逆解后入队，消除刀尖弧形挖坑效应。
-// 每微段按 逻辑时间预算 / 物理距离 计算下发速度，保证刀尖进给率。
-// 无旋转变化时退化为单次逆解入队。
+// @Safe: 纯坐标变换,可使用 math.h。采样预估离线进行,与 RT 线程无关。
+//
+// 估算 RTCP 段的 Jacobian Ratio 峰值: max(物理步长 / 逻辑步长)。
+// 用途: ① 自适应打碎步长 (R_max 越大,段越细)
+//       ② 全局逻辑进给速度压制 (R_max > 1 时, run_speed_mm /= R_max)
+//
+// 采样策略 (动态密度,修复 Nyquist 盲区审计 🟠 HIGH):
+//   - 采样间距上限 5mm (工业经验值,覆盖典型 RTCP 旋转高曲率区)
+//   - N = max(21, ceil(logical_total_mm / 5.0))
+//   - 上限 200 点 (性能 trade-off, 超长段接受精度损失)
+//   - 短段 (< 105mm) 用 21 点,与原方案一致
+//   - 长段 (≥ 105mm) 按密度扩展,1000mm 段采 200 点 (5mm 间距)
+//
+// 退化路径防御 (修复量纲混乱审计 🟡 MEDIUM):
+//   - logical_total < 1e-6 mm 时,返回保守值 10.0 触发自适应收紧
+//     (旧版返回 1.0 会退化为纯平动假设,失去保护)
+//   - 旋转轴 equivalent_radius=0 时,警告但继续 (角度与 mm 混算,
+//     R 值失去物理意义,但保守的 10.0 兜底仍能保护)
+//
+// 返回 R_max ≥ 1.0 (保守路径返回 ≥ 10.0)
+#define RTCP_JACOBIAN_SAMPLES_MIN  21
+#define RTCP_JACOBIAN_SAMPLES_MAX  200
+#define RTCP_JACOBIAN_SPACING_MM   5.0
+#define RTCP_R_MAX_DEGENERATE      10.0  // 退化路径保守值
+static double estimate_max_jacobian_ratio(double start_pos[AXIS_NUM],
+                                          double end_pos[AXIS_NUM])
+{
+    // ---- 入口防御: 旋转轴半径配置检查 (审计攻击面 3) ----
+    // 若旋转轴 equivalent_radius=0,其 delta 以原始角度值参与距离计算,
+    // 与物理 mm 量纲不一致,R 值失去物理意义。警告并继续。
+    for(int j = 0; j < AXIS_NUM; j++){
+        if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius <= 0.0){
+            double delta = fabs(end_pos[j] - start_pos[j]);
+            if(delta > 1e-6){
+                printf("[RTCP] 警告: 旋转轴 %s equivalent_radius 未配置,"
+                       "Jacobian 预估可能失准 (本段 %s 变化 %.3f°)\n",
+                       g_axis[j].axis_name, g_axis[j].axis_name, delta);
+            }
+        }
+    }
+
+    // ---- 计算逻辑总距离 (含旋转轴弧长折算,与打碎逻辑一致) ----
+    double logical_total_sq = 0.0;
+    for(int j = 0; j < AXIS_NUM; j++){
+        double delta = end_pos[j] - start_pos[j];
+        if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+            delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
+        }
+        logical_total_sq += delta * delta;
+    }
+    double logical_total = sqrt(logical_total_sq);
+
+    // ---- 退化路径防御: logical_total 过小时返回保守值 ----
+    // 旧版阈值 1e-9 + 返回 1.0 有两个问题:
+    //   (a) [1e-9, 2.1e-8] 区间 logical_step ≤ 1e-9 跳过比率计算,R_max 保持 1.0
+    //   (b) 纯姿态变化段 (刀尖不动) 若 radius 未配置, logical_total 仍可能非零
+    // 提高阈值到 1e-6 + 返回 10.0,触发自适应收紧兜底
+    if(logical_total < 1e-6) return RTCP_R_MAX_DEGENERATE;
+
+    // ---- 动态采样密度 (审计攻击面 2) ----
+    int N = RTCP_JACOBIAN_SAMPLES_MIN;
+    double spacing_threshold = RTCP_JACOBIAN_SPACING_MM * (double)N;  // 105mm
+    if(logical_total > spacing_threshold){
+        N = (int)ceil(logical_total / RTCP_JACOBIAN_SPACING_MM);
+        if(N > RTCP_JACOBIAN_SAMPLES_MAX) N = RTCP_JACOBIAN_SAMPLES_MAX;
+    }
+
+    // ---- 逐点采样: 物理步长 / 逻辑步长 ----
+    double R_max = 1.0;
+    double prev_phys[AXIS_NUM];
+    memcpy(prev_phys, start_pos, sizeof(double) * AXIS_NUM);
+    apply_rtcp_to_pos(prev_phys);
+
+    for(int i = 1; i <= N; i++){
+        double ratio = (double)i / (double)N;
+        double pos[AXIS_NUM];
+        for(int j = 0; j < AXIS_NUM; j++){
+            pos[j] = start_pos[j] + (end_pos[j] - start_pos[j]) * ratio;
+        }
+        // 末点强制对齐终点,消除浮点累积
+        if(i == N){
+            memcpy(pos, end_pos, sizeof(double) * AXIS_NUM);
+        }
+        apply_rtcp_to_pos(pos);
+
+        double phys_step_sq = 0.0;
+        for(int j = 0; j < AXIS_NUM; j++){
+            double d = pos[j] - prev_phys[j];
+            if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                d = d * (PI / 180.0) * g_axis[j].equivalent_radius;
+            }
+            phys_step_sq += d * d;
+        }
+        double phys_step = sqrt(phys_step_sq);
+        double logical_step = logical_total / (double)N;
+        if(logical_step > 1e-9){
+            double R = phys_step / logical_step;
+            if(R > R_max) R_max = R;
+        }
+        memcpy(prev_phys, pos, sizeof(double) * AXIS_NUM);
+    }
+    return R_max;
+}
+
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: 纯坐标变换 + 调用 api_push_trajectory_rtcp（队列写入，线程安全）。
+// RTCP 直线微段打碎 (Adaptive Jacobian Step):
+//   1. 21 点 Jacobian 预估 R_max (物理步长 / 逻辑步长 的峰值)
+//   2. 自适应步长: adaptive_segment_mm = 0.5 / max(1.0, R_max), 下限 0.01mm
+//      - 纯直线 (R_max=1): 保持 0.5mm
+//      - 强非线性 (R_max=10): 收紧到 0.05mm
+//   3. 全局逻辑进给压制: 若 R_max > 1.0, run_speed_mm /= R_max
+//      保证物理轴速度不超过原始进给,防止微段内物理超速
+//   4. 逐点逆解 + 入队 (标记 is_rtcp_active=1)
+//   5. 无旋转变化时退化为单次逆解入队
 int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[AXIS_NUM],
                                     double run_speed_mm, double g93_T_sec)
 {
@@ -66,16 +179,29 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
     if(idx_b >= 0 && fabs(end_pos[idx_b] - start_pos[idx_b]) > 1e-6) has_rotation = 1;
     if(idx_c >= 0 && fabs(end_pos[idx_c] - start_pos[idx_c]) > 1e-6) has_rotation = 1;
 
-    // 无旋转变化：单次逆解入队
+    // 无旋转变化：单次逆解入队 (R_max 必为 1.0)
     if(!has_rotation){
         double phys_end[AXIS_NUM];
         memcpy(phys_end, end_pos, sizeof(double) * AXIS_NUM);
         apply_rtcp_to_pos(phys_end);
         double speed_mm_sec = run_speed_mm / 60.0;
-        return api_push_trajectory(phys_end, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
+        return api_push_trajectory_rtcp(phys_end, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
     }
 
-    // 有旋转变化：计算等效空间距离（含旋转轴弧长折算）
+    // ---- 1. Jacobian 预估 (21 点采样) ----
+    double R_max = estimate_max_jacobian_ratio(start_pos, end_pos);
+
+    // ---- 2. 全局逻辑进给压制 (R_max > 1.0 时) ----
+    // 物理含义: 若物理轴运动比逻辑刀尖快 R_max 倍,则把刀尖进给等比降低,
+    //          保证物理轴速度不超过原始 run_speed_mm 对应的物理速度。
+    // G93 模式时间预算刚性,豁免此压制 (用户已强制 T_sec,不能改),
+    //          改由下方自适应步长保证微段内物理速度合理。
+    if(g93_T_sec <= 1e-9 && R_max > 1.0){
+        run_speed_mm /= R_max;
+        if(run_speed_mm < 1e-6) run_speed_mm = 1e-6;
+    }
+
+    // ---- 3. 等效空间距离 (含旋转轴弧长折算) ----
     double dist_eq = 0.0;
     for(int i = 0; i < AXIS_NUM; i++){
         double delta = end_pos[i] - start_pos[i];
@@ -86,21 +212,44 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
     }
     dist_eq = sqrt(dist_eq);
 
-    int num_segments = (int)ceil(dist_eq / RTCP_LINEAR_SEGMENT_MM);
-    if(num_segments < 1) num_segments = 1;
-
-    // 每微段逻辑时间预算：保证刀尖按编程进给率匀速运动
+    // ---- 4. 段数与时间预算: 自适应步长 + G93/G94 双模式 ----
+    // G93: 1ms 时间切分 (T_sec * 1000),与 RT 线程 1ms 周期对齐,绝对守恒总时间。
+    //      封顶 20000 段 (20 秒),防止超长 G93 段塞爆 QUEUE_SIZE。
+    // G94: 自适应空间切分。
+    //      adaptive_segment_mm = 0.5 / max(1.0, R_max),下限 0.01mm。
+    //      线性段保持 0.5mm; 非线性段收紧至最低 0.01mm,
+    //      保证 S 曲线 7 段预计算在每个微段内的物理一致性。
+    int num_segments;
     double dt_per_seg;
     if(g93_T_sec > 1e-9){
+        num_segments = (int)ceil(g93_T_sec * 1000.0);
+        if(num_segments > 20000) num_segments = 20000;
+        if(num_segments < 1) num_segments = 1;
         dt_per_seg = g93_T_sec / (double)num_segments;
     } else {
+        double adaptive_segment_mm = RTCP_LINEAR_SEGMENT_MM / fmax(1.0, R_max);
+        if(adaptive_segment_mm < 0.01) adaptive_segment_mm = 0.01;
+        if(adaptive_segment_mm > RTCP_LINEAR_SEGMENT_MM) adaptive_segment_mm = RTCP_LINEAR_SEGMENT_MM;
+        num_segments = (int)ceil(dist_eq / adaptive_segment_mm);
+        if(num_segments < 1) num_segments = 1;
+        // ---- 段数硬上限 (审计攻击面 1, CRITICAL) ----
+        // 旧版无上限: R_max=500 + dist_eq=2000mm → 200,000 段 → Parser 阻塞 3 分钟。
+        // 红方原方案 return -1 会触发 parse_gcode_line 中止整个文件,等同 DoS 升级。
+        // 改进: clamp + SEVERE 警告 + 继续执行。物理一致性由 Layer 2 (Planner 短板限幅) 兜底。
+        // 用户通过警告主动修正 G-code,而非被动中止生产。
+        if(num_segments > 20000) {
+            printf("[RTCP] SEVERE: 单段打碎 %d 段超过上限 20000 (dist=%.1fmm, R_max=%.1f),"
+                   "强制 clamp, 物理一致性可能损失 - 请检查 G-code 奇异点!\n",
+                   num_segments, dist_eq, R_max);
+            num_segments = 20000;
+        }
         double seg_logical_dist = dist_eq / (double)num_segments;
         double feed_mm_sec = run_speed_mm / 60.0;
         if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
         dt_per_seg = seg_logical_dist / feed_mm_sec;
     }
 
-    // 逐点插值 + 逆解 + 物理速度计算 + 入队
+    // ---- 5. 逐点插值 + 逆解 + 物理速度计算 + 入队 ----
     for(int i = 1; i <= num_segments; i++){
         double ratio = (double)i / (double)num_segments;
         double interp_pos[AXIS_NUM];
@@ -133,12 +282,27 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         double phys_speed = (dt_per_seg > 1e-9) ? phys_dist / dt_per_seg : 1e-6;
         if(phys_speed < 1e-6) phys_speed = 1e-6;
 
-        if(api_push_trajectory(interp_pos, phys_speed, DEFAULT_ACC, DEFAULT_DEC) < 0){
+        // G93 模式走强一致性路径,豁免底层短板限幅,刚性守恒时间预算。
+        // G94 模式走标准路径 + RTCP 标记。
+        // 注意: G93 路径暂未提供 _rtcp 变体,因为 G93 已豁免短板限幅,
+        //       is_rtcp_active 元数据对 G93 段意义不大 (RT 线程不区分对待)。
+        //       后续若需 G93 RTCP 元数据,可扩展 api_push_trajectory_g93_rtcp。
+        int push_ret;
+        if(g93_T_sec > 1e-9){
+            push_ret = api_push_trajectory_g93(interp_pos, phys_speed,
+                                                DEFAULT_ACC, DEFAULT_DEC, dt_per_seg);
+        } else {
+            push_ret = api_push_trajectory_rtcp(interp_pos, phys_speed,
+                                                 DEFAULT_ACC, DEFAULT_DEC);
+        }
+        if(push_ret < 0){
             return -1;
         }
     }
 
-    printf("[Parser] RTCP直线打碎: %d 段 (等效距离 %.2f mm)\n", num_segments, dist_eq);
+    printf("[Parser] RTCP直线打碎: %d 段 (等效距离 %.2f mm, R_max=%.2f, 步长=%.3fmm)\n",
+           num_segments, dist_eq, R_max,
+           (g93_T_sec > 1e-9) ? 0.0 : dist_eq / fmax(1, num_segments));
     return 0;
 }
 
@@ -418,6 +582,13 @@ int parse_gcode_line(const char *gcode_line)
             }
         }
 
+        // @Context: Non-RealTime Background Thread (parser)
+        // @Stage: STAGE_PARSER —— G 代码原始意图坐标 (machine_target_pos)
+        // 无论本行走圆弧 / RTCP / 刀补 / B-Spline / 直通中的哪条路径,
+        // machine_target_pos 都是 Parser 解析出的唯一意图点,
+        // 在更新 g_state.current_pos 前一次性记录,作为管线起点的基准。
+        TraceLogger_PushPipeline(STAGE_PARSER, machine_target_pos, 0.0);
+
         for(int i=0;i<AXIS_NUM;i++){
             g_state.current_pos[i]=target_pos[i];
         }
@@ -582,6 +753,11 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
             }
             double phys_speed = (dt > 1e-9) ? phys_dist / dt : 1e-6;
             if(phys_speed < 1e-6) phys_speed = 1e-6;
+            // G93 强一致性: 豁免短板限幅
+            if(g93_T_sec > 1e-9){
+                return api_push_trajectory_g93(end_pos, phys_speed,
+                                                DEFAULT_ACC, DEFAULT_DEC, g93_T_sec);
+            }
             return api_push_trajectory(end_pos, phys_speed, DEFAULT_ACC, DEFAULT_DEC);
         } else {
             double speed_mm_sec;
@@ -608,9 +784,16 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
 
     double total_angle = theta_end - theta_start;
 
-    // ---- 5. 分段数与切向速度 ----
+    // ---- 5. 分段数: G93 时间切分, G94 空间切分 ----
     double arc_length = fabs(total_angle) * radius;
-    int num_segments = (int)ceil(arc_length / ARC_SEGMENT_LENGTH_MM);
+    int num_segments;
+    if(g93_T_sec > 1e-9){
+        // G93 时间切分: 1ms 一段,与 RT 周期对齐,封顶 20000
+        num_segments = (int)ceil(g93_T_sec * 1000.0);
+        if(num_segments > 20000) num_segments = 20000;
+    } else {
+        num_segments = (int)ceil(arc_length / ARC_SEGMENT_LENGTH_MM);
+    }
     if(num_segments < 1) num_segments = 1;
 
     // 螺旋真实空间长度 = sqrt(弧长² + 非平面轴位移²)
@@ -635,17 +818,16 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
         speed_mm_sec = feedrate_mm_min / 60.0;
     }
 
-    // RTCP 每微段逻辑时间预算
+    // 每微段逻辑时间预算 (G93 强一致性必填, G94 RTCP 也用)
     double dt_per_seg = 0.0;
-    if(g_state.rtcp_enabled){
-        if(g93_T_sec > 1e-9){
-            dt_per_seg = g93_T_sec / (double)num_segments;
-        } else {
-            double seg_logical_dist = helical_length / (double)num_segments;
-            double feed_mm_sec = feedrate_mm_min / 60.0;
-            if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
-            dt_per_seg = seg_logical_dist / feed_mm_sec;
-        }
+    if(g93_T_sec > 1e-9){
+        // G93: 整段时间预算均分到每微段,RTCP/非 RTCP 一致
+        dt_per_seg = g93_T_sec / (double)num_segments;
+    } else if(g_state.rtcp_enabled){
+        double seg_logical_dist = helical_length / (double)num_segments;
+        double feed_mm_sec = feedrate_mm_min / 60.0;
+        if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
+        dt_per_seg = seg_logical_dist / feed_mm_sec;
     }
 
     double angle_step = total_angle / num_segments;
@@ -694,7 +876,17 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
             seg_speed = speed_mm_sec;
         }
 
-        if(api_push_trajectory(next_pos, seg_speed, DEFAULT_ACC, DEFAULT_DEC) < 0){
+        // G93 模式下 seg_speed 已按 phys_dist/dt_per_seg 或 helical_length/T_sec 精确推算,
+        // 必须走强一致性路径豁免短板限幅,否则时间预算被静默破坏。
+        int push_ret;
+        if(g93_T_sec > 1e-9){
+            push_ret = api_push_trajectory_g93(next_pos, seg_speed,
+                                                DEFAULT_ACC, DEFAULT_DEC, dt_per_seg);
+        } else {
+            push_ret = api_push_trajectory(next_pos, seg_speed,
+                                            DEFAULT_ACC, DEFAULT_DEC);
+        }
+        if(push_ret < 0){
             return -1;
         }
     }

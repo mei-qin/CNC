@@ -15,3 +15,22 @@
 /soem_test
 /test.c
 /Delta ASDA-x3-E rev0.18.xml
+
+# ==== 构建产物 (Build Artifacts) ====
+*.o
+*.obj
+*.a
+*.so
+/cnc_core
+
+# ==== 运行时数据 (Runtime Data) ====
+# CSV 轨迹/追踪日志
+*.csv
+# PNG 校验/分析图像
+*.png
+
+# ==== Python 产物 (Python Artifacts) ====
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

@@ -11,6 +11,10 @@ double calculate_junction_speed(TrajectorySegment_t *prev,TrajectorySegment_t *c
 // force_flush=1: force-release all segments (from starvation watchdog)
 void planner_recalculate(int force_flush);
 
+// @Context: callee MUST hold queue_spinlock. Does NOT acquire/release it.
+//           Used by api_flush_planner after spin-wait lock acquisition.
+void planner_recalculate_locked(int force_flush);
+
 
 
 #endif // PLANNER_H

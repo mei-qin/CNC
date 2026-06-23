@@ -3,7 +3,7 @@
 
 // ====================================================================
 // 7 段式 S 曲线 (Jerk Control) — 绝对解析式预计算
-// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// @Context: Non-RealTime Background Thread (caller holds queue_spinlock)
 // 所有内部物理量单位：mm/ms, mm/ms^2, mm/ms^3 → 时间自然为 ms
 // ====================================================================
 
@@ -13,8 +13,10 @@
 #define SCURVE_BISECT_ITERS  20
 // 前瞻精确求解迭代次数
 #define LOOKAHEAD_BISECT_ITERS  24
-// 前瞻深度上限：防止单次规划段数过多阻塞入队
-#define LOOKAHEAD_MAX_DEPTH  200
+// 前瞻硬上限 (防御性): 真实有效窗口由动态刹车距离决定 (见 step 2),
+// 此值仅在段长全部极小且 v_target 极大的极端情况下兜底,避免无限扫描。
+// 取 QUEUE_SIZE 一半,留出 push 端空槽缓冲
+#define LOOKAHEAD_HARD_CAP  (QUEUE_SIZE / 2)
 // 拐角圆角平滑引擎参数
 #define FILLET_SUB_SEGMENTS  3
 #define FILLET_SAFETY_RATIO  0.4
@@ -76,11 +78,32 @@ static void compute_dec_profile(double v_m, double v_e, double d_max, double jer
 // 精确求解：给定 v_end 和可用距离 S，求最大 v_start
 //   使得 S 曲线减速 (v_start → v_end) 恰好 fits in S
 // @Context: Non-RealTime Background Thread
+//
+// 退化防御 (Audit CONDITIONAL PASS → PASS):
+//   当 v_end == v_ceil 时,lo = hi = v_end,二分区间坍塌为单点,
+//   24 次迭代 compute_dec_profile(v_end, v_end, ...) 始终 dv=0 → S_test=0,
+//   距离 S 完全不参与决策,函数盲目返回 v_end。
+//   触发场景: 反向扫描中前段 v_end 耦合自后段 v_start,
+//             若后段共线 + 距离充足 → 后段 v_start = v_target → 前段 v_end = v_target,
+//             当 v_target == v_ceil 时即退化。
+//   当前依赖 Step 6 距离熔断兜底;此防御改为初级预防,不再依赖次级纠正。
 // --------------------------------------------------------------------
 static double solve_max_vstart_scurve(double v_end, double S,
                                        double d_max, double jerk, double v_ceil)
 {
     double lo = v_end, hi = fmax(v_end, v_ceil);
+
+    // 退化防御: lo==hi 时二分无意义,直接物理检验 v_end 能否在 S 内完成减速。
+    // 注意: 此处 == 比较安全——lo 和 hi 都来自同一 v_end 字面赋值,
+    //       无浮点运算误差累积。
+    if (lo == hi) {
+        double tj, td, S_test;
+        compute_dec_profile(lo, v_end, d_max, jerk, &tj, &td, &S_test);
+        // S_test ≤ S: 恒速通过,无需减速距离,v_start = v_end 合法
+        // S_test > S: 物理不可能 (但此分支 dv=0 必然 S_test=0,理论上不会触发)
+        return (S_test <= S) ? lo : 0.0;
+    }
+
     for (int i = 0; i < LOOKAHEAD_BISECT_ITERS; i++) {
         double mid = 0.5 * (lo + hi);
         double tj, td, S_test;
@@ -94,11 +117,21 @@ static double solve_max_vstart_scurve(double v_end, double S,
 // 精确求解：给定 v_start 和可用距离 S，求最大 v_end
 //   使得 S 曲线加速 (v_start → v_end) 恰好 fits in S
 // @Context: Non-RealTime Background Thread
+//
+// 退化防御: 同 solve_max_vstart_scurve,处理 v_start == v_ceil 的二分坍塌。
 // --------------------------------------------------------------------
 static double solve_max_vend_scurve(double v_start, double S,
                                      double a_max, double jerk, double v_ceil)
 {
     double lo = v_start, hi = fmax(v_start, v_ceil);
+
+    // 退化防御: lo==hi 时直接物理检验
+    if (lo == hi) {
+        double tj, ta, S_test;
+        compute_acc_profile(v_start, lo, a_max, jerk, &tj, &ta, &S_test);
+        return (S_test <= S) ? lo : v_start;
+    }
+
     for (int i = 0; i < LOOKAHEAD_BISECT_ITERS; i++) {
         double mid = 0.5 * (lo + hi);
         double tj, ta, S_test;
@@ -130,7 +163,7 @@ static double compute_stop_distance(double v, double d_max, double jerk)
 
 // --------------------------------------------------------------------
 // 重算单段的 7 段式 S 曲线预计算（含内部距离熔断）
-// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// @Context: Non-RealTime Background Thread (caller holds queue_spinlock)
 // 注意：此函数不执行反向传播，仅保证本段 T1~T7 与 v_start/v_end 自洽
 // --------------------------------------------------------------------
 static void recompute_scurve_profile(TrajectorySegment_t *seg)
@@ -146,6 +179,18 @@ static void recompute_scurve_profile(TrajectorySegment_t *seg)
         seg->j5=0; seg->a6=0; seg->j7=0;
         seg->T_total = 1.0;
         seg->total_distance = 0.0;
+        return;
+    }
+
+    // G93 强一致性段: api_push_trajectory_impl 已预计算纯匀速参数
+    // (T4=T_total, v0..v6=v_target, s4..s6=total_distance)。
+    // 反向/正向扫描可能改写了 v_start/v_end,这里强制恢复,确保 RT 线程
+    // 读到的是恒速绝对解析参数,绝对遵守 G93 时间预算。
+    if (seg->is_g93_strict) {
+        double v_const = seg->v_target;
+        seg->v_start = v_const;
+        seg->v_end   = v_const;
+        seg->v_max   = v_const;
         return;
     }
 
@@ -266,8 +311,31 @@ static void recompute_scurve_profile(TrajectorySegment_t *seg)
 }
 
 // ====================================================================
-// G64 向心加速度过弯模型
-// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// G64 + Jerk-Limited 双限制过弯模型
+// @Context: Non-RealTime Background Thread (caller holds queue_spinlock)
+//
+// 物理模型 (Beudaert-Lavernhe-Lartigue 双 S 曲线入口/出口):
+//   拐角处等效为半径 R_eff 的圆弧, 速度矢量在入口/出口经历从直线 (κ=0)
+//   到圆弧 (κ=1/R_eff) 的过渡。
+//
+//   等效半径: R_eff = δ / (1 - cos(θ/2))   其中 δ 为拐角容差, θ 为夹角
+//
+//   ① 向心加速度限制 (经典 G64):
+//        v_acc = sqrt(A_max · R_eff)
+//      推导: a_n = v²/R_eff ≤ A_max → v ≤ sqrt(A_max · R_eff)
+//
+//   ② Jerk 限制 (新增, 解决高速微段冲击):
+//      入口处 a_n 从 0 渐变到 v²/R_eff, 假设 jerk = J_max (双 S 线性渐变),
+//      渐变时间 t = 2v²/(R_eff · J_max), 通过距离 ≈ v·t = 2v³/(R_eff · J_max)。
+//      要求该距离 ≤ δ, 解得:
+//        v_jerk = (J_max · R_eff · δ / 2)^(1/3)
+//      量纲检验: [mm/s³ · mm · mm]^(1/3) = [mm³/s³]^(1/3) = mm/s ✓
+//
+//   最终: v_junc = min(v_acc, v_jerk, prev->v_max, curr->v_max)
+//
+// 工程意义:
+//   - 低速/小拐角场景: v_acc < v_jerk, 由向心加速度主导 (与旧版一致)
+//   - 高速/大拐角场景: v_jerk < v_acc, 由 jerk 主导, 防止驱动器电流冲击
 // ====================================================================
 double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *curr)
 {
@@ -282,6 +350,7 @@ double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *
     if (cos_theta > 1.0)  cos_theta = 1.0;
     if (cos_theta < -1.0) cos_theta = -1.0;
 
+    // 共线/反相特判: 跳过数学计算
     if (cos_theta >= 0.999) return fmin(prev->v_max, curr->v_max);
     if (cos_theta <= -0.999) return 0.0;
 
@@ -289,8 +358,24 @@ double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *
     double denom = 1.0 - cos(alpha * 0.5);
     if (denom <= 1e-6) denom = 1e-6;
 
-    double v_allow = sqrt(g_planner_config.max_centripetal_acc
-                        * (g_planner_config.corner_tolerance / denom));
+    double delta = g_planner_config.corner_tolerance;
+    double A_max = g_planner_config.max_centripetal_acc;
+
+    // 等效圆弧半径
+    double R_eff = delta / denom;
+
+    // ① 向心加速度限制
+    double v_acc_limit = sqrt(A_max * R_eff);
+
+    // ② Jerk 限制: 取两段中更严格的 jerk (短板效应)
+    //   seg_effective_jerk 已在 api_push_trajectory_impl 经过短板限幅,
+    //   反映了"通过此段时各轴允许的最大 jerk"。
+    //   拐角过渡的 jerk 由两段共享, 取 min 保证不超任一段的物理极限。
+    double J_eff = fmin(seg_effective_jerk(prev), seg_effective_jerk(curr));
+    double v_jerk_limit = cbrt(0.5 * J_eff * R_eff * delta);
+
+    // 取最严格限制 (NaN/Inf 防御)
+    double v_allow = fmin(v_acc_limit, v_jerk_limit);
     if (isnan(v_allow) || isinf(v_allow) || v_allow < 0.0) v_allow = 0.0;
 
     return fmin(v_allow, fmin(prev->v_max, curr->v_max));
@@ -298,12 +383,15 @@ double calculate_junction_speed(TrajectorySegment_t *prev, TrajectorySegment_t *
 
 // ====================================================================
 // Corner Rounding 预处理引擎 (Fillet Arc Insertion)
-// @Context: Non-RealTime Background Thread (caller holds planner_mutex)
+// @Context: Non-RealTime Background Thread (caller holds queue_spinlock)
 // @Math: 给定连续两段直线 L1(方向D1)和 L2(方向D2)，夹角 theta = acos(D1·D2)
 //   半外角 alpha = (PI-theta)/2
 //   容差 delta = R*(1/sin_alpha - 1) → R = delta*sin_alpha/(1-sin_alpha)
 //   切点距 d = R*cot_alpha，限制 d <= 0.4*min(L1,L2)
 //   圆弧用 SLERP 离散为 FILLET_SUB_SEGMENTS 个微小直线段插入队列
+// @Thread-Safety: 调用方持 queue_spinlock → fillet 的内存平移与生产者 push
+//                 互斥,绝对安全。write_head 推进用 relaxed 即可,
+//                 可见性由调用方的 spinlock release 统一建立。
 // ====================================================================
 static int planner_fillet_preprocess(int plan_tail, int old_head)
 {
@@ -356,7 +444,12 @@ static int planner_fillet_preprocess(int plan_tail, int old_head)
         if (d < 1e-6 || R < 1e-6) { i = prev; continue; }
 
         // ---- 3. 队列空间检查 ----
-        int queue_used = (head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
+        // 持锁期间 RT 消费者可能继续推进 read_tail (RT 不取锁),
+        // 用 relaxed 读 read_tail 即可——可见性由 spinlock acquire 保证
+        // (本线程刚获取 spinlock,看到的是上一任持锁者修改后的最新状态)。
+        // RT 1ms 周期的推进最多让本检查保守 1ms,不会引发数据覆写。
+        int cur_tail = atomic_load_explicit(&g_cmd_queue.read_tail, memory_order_relaxed);
+        int queue_used = (head - cur_tail + QUEUE_SIZE) % QUEUE_SIZE;
         if (QUEUE_SIZE - 1 - queue_used < FILLET_SUB_SEGMENTS) break;
 
         // ---- 4. 几何计算：顶点 / 切点 / 圆心 ----
@@ -474,31 +567,47 @@ static int planner_fillet_preprocess(int plan_tail, int old_head)
         i = prev; // 继续向前扫描
     }
 
-    g_cmd_queue.head = head;
+    // relaxed 推进 write_head: fillet 已完成子段插入 + 缩短 prev/curr 操作,
+    // 可见性由 planner_recalculate 出口的 spinlock release 统一建立。
+    // (fillet 的所有写入都在持锁期间,不需要 release 写)
+    atomic_store_explicit(&g_cmd_queue.write_head, head, memory_order_relaxed);
     return head;
 }
 
 // ====================================================================
 // Deep Look-Ahead 前瞻核心引擎
-// @Context: Non-RealTime Background Thread (parser 或 看门狗)
-// @Thread-Safety: 由 planner_mutex 保护，禁止 RT 线程调用！
+// @Context: Non-RealTime Background Thread (parser / bspline / 看门狗)
+// @Thread-Safety: queue_spinlock Try-Lock 避让模式:
+//                 - 入口 try-lock,失败立即返回 (生产者绝不阻塞)
+//                 - 持锁期间: 生产者/planner/watchdog 全部互斥,
+//                   fillet 内存平移绝对安全
+//                 - 单次规划: 持锁期间 write_head 不变,无需 while(1) 兜底
+//                 - RT 线程不取此锁,优先级反转免疫
 //
 // 核心重构要点：
 //   1. 废弃 plan_count==1/2/3 硬编码分支，统一反向+正向扫描
-//   2. LOOKAHEAD_MAX_DEPTH 上限防阻塞，超出时分批处理
+//   2. 动态 Look-ahead Depth: 基于 worst-case 刹车距离扩展 eff_head,
+//      LOOKAHEAD_HARD_CAP 仅作硬上限防御 (替代旧版写死的 200 段短视)
 //   3. 动态安全释放窗口：基于真实 S 曲线制动距离判定
 //   4. M 代码屏障：停稳释放，不受制动距离限制
 //   5. force_flush：无视安全窗口，强制清空队列
+//   6. Try-Lock 避让 + 单次规划: 替代 pthread_mutex 阻塞语义,
+//      RT 线程 1ms 周期永不被阻塞。
+//   7. api_flush_planner 通过 planner_recalculate_locked 实现 Spin-Wait,
+//      消除文件末尾"最后一点饥饿"。
 // ====================================================================
-void planner_recalculate(int force_flush)
-{
-    pthread_mutex_lock(&planner_mutex);
 
-    // ---- 0. 队列快照 ----
-    int tail = g_cmd_queue.tail;
-    int head = g_cmd_queue.head;
+// @Context: callee MUST hold queue_spinlock (either via try-lock or spin-wait).
+//           Does NOT acquire or release the lock — that is the caller's responsibility.
+// @Thread-Safety: All buffer access is serialized by the caller's lock.
+void planner_recalculate_locked(int force_flush)
+{
+
+    // ---- 0. 队列快照 (持锁期间 relaxed 读即可,可见性由 spinlock 保证) ----
+    int tail = atomic_load_explicit(&g_cmd_queue.read_tail,  memory_order_relaxed);
+    int head = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_relaxed);
     int count = (head - tail + QUEUE_SIZE) % QUEUE_SIZE;
-    if (count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+    if (count == 0) goto release_and_exit;
 
     // ---- 1. 找到 plan_tail：第一个未释放段 ----
     int plan_tail = tail;
@@ -508,29 +617,101 @@ void planner_recalculate(int force_flush)
         plan_tail = (plan_tail + 1) % QUEUE_SIZE;
     }
     int plan_count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
-    if (plan_count == 0) { pthread_mutex_unlock(&planner_mutex); return; }
+    if (plan_count == 0) goto release_and_exit;
 
-    // ---- 1.5 拐角圆角平滑预处理 ----
+    // ---- 1.5 拐角圆角平滑预处理 (持锁期间内存平移绝对安全) ----
     head = planner_fillet_preprocess(plan_tail, head);
     count = (head - tail + QUEUE_SIZE) % QUEUE_SIZE;
     plan_count = (head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
 
-    // ---- 2. 分批上限：截断有效规划窗口 ----
+    // ---- 2. 动态扩展有效规划窗口 (基于物理刹车距离) ----
+    // 旧版: 写死 LOOKAHEAD_MAX_DEPTH=200,在 F10000 + 0.01mm 微段场景下
+    //       (刹车距离可达 20mm → 需要 ~2000 段),规划器严重短视,
+    //       末端 v_end=0 约束无法反向传播到 plan_tail, 导致超速冲过拐角。
+    // 新版: 用所有未释放段中的 (max_v_target, min_dec, min_jerk) 计算
+    //       worst-case 刹车距离,然后从 plan_tail 向前累加段距离直到 ≥ S_stop。
+    //
+    // 不变量:
+    //   ① eff_last 段以 v_target 进入时, eff_head 前累积距离足够其刹停
+    //   ② 硬上限 LOOKAHEAD_HARD_CAP 防御段长全部极小的病态输入
     int eff_head = head;
-    if (plan_count > LOOKAHEAD_MAX_DEPTH) {
-        eff_head = (plan_tail + LOOKAHEAD_MAX_DEPTH) % QUEUE_SIZE;
-        plan_count = LOOKAHEAD_MAX_DEPTH;
+    {
+        // (a) 第一遍扫描: 找未释放段中的 worst-case 减速参数
+        double max_v_target = 0.0;
+        double min_dec      = 1e9;
+        double min_jerk     = 1e9;
+        int cap_n           = 0;
+        int c               = plan_tail;
+        while (c != head && cap_n < LOOKAHEAD_HARD_CAP) {
+            TrajectorySegment_t *seg = &g_cmd_queue.buffer[c];
+            if (atomic_load_explicit(&seg->is_ready, memory_order_acquire) == 0) {
+                if (seg->cmd_type == CMD_TYPE_MOTION && seg->v_target > max_v_target) {
+                    max_v_target = seg->v_target;
+                }
+                if (seg->dec > 1e-9 && seg->dec < min_dec)   min_dec  = seg->dec;
+                if (seg->jerk > 1e-15 && seg->jerk < min_jerk) min_jerk = seg->jerk;
+            }
+            c = (c + 1) % QUEUE_SIZE;
+            cap_n++;
+        }
+
+        // (b) 计算 worst-case 刹车距离
+        //   S_stop = compute_stop_distance(max_v_target, min_dec, min_jerk)
+        //   若所有段都是 M 代码或零距离, max_v_target=0 → S_stop=0 → eff_head=head (全部规划)
+        double S_worst = 0.0;
+        if (max_v_target > 1e-12) {
+            double J_worst = (min_jerk < 1e9) ? min_jerk : DEFAULT_JERK_MS3;
+            double d_worst = (min_dec  < 1e9) ? min_dec  : (100.0 / 1e6); // 兜底 100 mm/s²
+            S_worst = compute_stop_distance(max_v_target, d_worst, J_worst);
+        }
+
+        // (c) 第二遍扫描: 从 plan_tail 累加距离,直到 ≥ S_worst 或耗尽段数/硬上限
+        if (S_worst > 1e-9) {
+            double accum = 0.0;
+            int n = 0;
+            int c2 = plan_tail;
+            while (c2 != head && accum < S_worst && n < LOOKAHEAD_HARD_CAP) {
+                accum += g_cmd_queue.buffer[c2].total_distance;
+                c2 = (c2 + 1) % QUEUE_SIZE;
+                n++;
+            }
+            eff_head = c2;
+            plan_count = (eff_head - plan_tail + QUEUE_SIZE) % QUEUE_SIZE;
+        }
+        // else: S_worst=0, 保持 eff_head=head (规划全部未释放段)
     }
     int eff_last = (eff_head - 1 + QUEUE_SIZE) % QUEUE_SIZE;
 
-    // ---- 3. 初始化未释放段速度为 0 ----
+    // ---- 3. 初始化未释放段速度为 0 + 短段物理速度钳制 ----
+    // 短段物理钳制 (Short-Segment Bottleneck):
+    //   极短微段 (L < 0.1mm) 没有足够距离完成"加速-减速"轮廓,
+    //   若 v_target 过大,S 曲线预计算 (recompute_scurve_profile) 内部
+    //   二分求解器会返回不合理的 v_target (或触发距离熔断)。
+    //   物理上限推导 (v_start=v_end=0, 无匀速段):
+    //     s_acc + s_dec = v²/a_max + v²/a_max = 2v²/a_max ... 不对
+    //     正确: 单段加速到 v 再减到 0, 距离 = v²/a_max (前半加速 + 后半减速)
+    //     → v_max_seg = sqrt(a_max · L)
+    //   S 曲线额外损耗约 30% (jerk ramp 占用时间), 用 0.7 系数保守估计。
+    //   G93 强一致性段豁免: 用户已强制纯匀速, 时间预算刚性。
     {
         int c = plan_tail;
         while (c != eff_head) {
-            if (atomic_load_explicit(&g_cmd_queue.buffer[c].is_ready,
-                                     memory_order_acquire) == 0) {
-                g_cmd_queue.buffer[c].v_start = 0.0;
-                g_cmd_queue.buffer[c].v_end   = 0.0;
+            TrajectorySegment_t *seg = &g_cmd_queue.buffer[c];
+            if (atomic_load_explicit(&seg->is_ready, memory_order_acquire) == 0) {
+                seg->v_start = 0.0;
+                seg->v_end   = 0.0;
+
+                // 短段物理钳制 (仅对常规运动段)
+                if (seg->cmd_type == CMD_TYPE_MOTION
+                    && !seg->is_g93_strict
+                    && seg->total_distance > 1e-9) {
+                    double a_max_seg = fmax(seg->acc, 1e-9);
+                    double v_phys_max = sqrt(a_max_seg * seg->total_distance) * 0.7;
+                    if (seg->v_target > v_phys_max) {
+                        seg->v_target = v_phys_max;
+                        seg->v_max    = v_phys_max;
+                    }
+                }
             }
             c = (c + 1) % QUEUE_SIZE;
         }
@@ -552,16 +733,42 @@ void planner_recalculate(int force_flush)
             TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev];
             TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
 
-            double v_junc = calculate_junction_speed(s_prev, s_curr);
-            double d_max  = fmax(s_curr->dec, 1e-9);
-            double J_c    = seg_effective_jerk(s_curr);
+            // ---- M 代码速度屏障 (显式强制) ----
+            // 若本段在队列中的下一段 (curr+1) 为 M 代码,必须强制 v_end=0,
+            // 严禁运动段以非零过渡速度滑入 M 代码屏障 (主轴换向/换刀前必须停稳)。
+            // 现有 calculate_junction_speed 在 prev/curr 任一为 MCODE 时也返回 0
+            // 已能间接保证,此处的显式预扫是对该不变量的防御性加固,
+            // 避免未来重构 (例如改写 junction 公式) 时悄然破坏该约束。
+            // eff_last 段已在 4a 强制 v_end=0,无需重复检查。
+            if (curr != eff_last) {
+                int next_idx = (curr + 1) % QUEUE_SIZE;
+                if (g_cmd_queue.buffer[next_idx].cmd_type == CMD_TYPE_MCODE) {
+                    s_curr->v_end = 0.0;
+                }
+            }
 
-            double max_v_start = solve_max_vstart_scurve(
-                s_curr->v_end, s_curr->total_distance,
-                d_max, J_c, s_curr->v_target);
+            // ---- G93 强一致性: v_start 锁定 v_target,不走 junction 限幅 ----
+            // 保证 api_push_trajectory_impl 预计算的纯匀速参数不被破坏。
+            if (s_curr->is_g93_strict) {
+                s_curr->v_start = s_curr->v_target;
+            } else {
+                double v_junc = calculate_junction_speed(s_prev, s_curr);
+                double d_max  = fmax(s_curr->dec, 1e-9);
+                double J_c    = seg_effective_jerk(s_curr);
 
-            s_curr->v_start = fmin(v_junc, fmin(max_v_start, s_curr->v_target));
-            s_prev->v_end = s_curr->v_start;
+                double max_v_start = solve_max_vstart_scurve(
+                    s_curr->v_end, s_curr->total_distance,
+                    d_max, J_c, s_curr->v_target);
+
+                s_curr->v_start = fmin(v_junc, fmin(max_v_start, s_curr->v_target));
+            }
+
+            // ---- G93 强一致性 prev: v_end 必须锁定 v_target,邻居据此规划减速 ----
+            if (s_prev->is_g93_strict) {
+                s_prev->v_end = s_prev->v_target;
+            } else {
+                s_prev->v_end = s_curr->v_start;
+            }
             curr = prev;
         }
     }
@@ -589,6 +796,14 @@ void planner_recalculate(int force_flush)
             TrajectorySegment_t *s_curr = &g_cmd_queue.buffer[curr];
             int next = (curr + 1) % QUEUE_SIZE;
 
+            // ---- G93 强一致性: v_end 锁定 v_target,不走加速限幅 ----
+            if (s_curr->is_g93_strict) {
+                s_curr->v_end = s_curr->v_target;
+                g_cmd_queue.buffer[next].v_start = s_curr->v_target;
+                curr = next;
+                continue;
+            }
+
             double a_max = fmax(s_curr->acc, 1e-9);
             double J_c   = seg_effective_jerk(s_curr);
 
@@ -598,7 +813,14 @@ void planner_recalculate(int force_flush)
 
             s_curr->v_end = fmin(s_curr->v_end, max_v_end);
             s_curr->v_end = fmin(s_curr->v_end, s_curr->v_target);
-            g_cmd_queue.buffer[next].v_start = s_curr->v_end;
+
+            // 下一段若为 G93 强一致性,其 v_start 必须锁定为 v_target,
+            // 而非由本段 v_end 决定 (避免被本段的加速限幅压低)。
+            if (g_cmd_queue.buffer[next].is_g93_strict) {
+                g_cmd_queue.buffer[next].v_start = g_cmd_queue.buffer[next].v_target;
+            } else {
+                g_cmd_queue.buffer[next].v_start = s_curr->v_end;
+            }
             curr = next;
         }
     }
@@ -637,7 +859,7 @@ void planner_recalculate(int force_flush)
                 double d_max = fmax(seg->dec, 1e-9);
                 double S_stop = compute_stop_distance(seg->v_target, d_max, J);
 
-                if (accum >= S_stop || seg_count >= LOOKAHEAD_MAX_DEPTH) {
+                if (accum >= S_stop || seg_count >= LOOKAHEAD_HARD_CAP) {
                     safe_release_head = scan;
                     break;
                 }
@@ -698,7 +920,11 @@ void planner_recalculate(int force_flush)
     }
 
     // ================================================================
-    // 7. 原子释放安全窗口内的段
+    // 7. 原子释放安全窗口内的段 (release 写 is_ready)
+    //    RT 消费者【不取 spinlock】,通过 is_ready 的 release/acquire 配对
+    //    建立与 planner 的 happens-before,看到所有 S 曲线参数。
+    //    注意: release 写 is_ready 不能省略——即使 spinlock release 也会
+    //    建立 happens-before,但 RT 不取锁,只能通过 is_ready 获得可见性。
     // ================================================================
     {
         int mark_curr = plan_tail;
@@ -710,5 +936,30 @@ void planner_recalculate(int force_flush)
         }
     }
 
-    pthread_mutex_unlock(&planner_mutex);
+    return;  // 锁由调用者管理
+
+release_and_exit:
+    return;  // 空队列,锁由调用者管理
+}
+
+// ====================================================================
+// planner_recalculate — Try-Lock 入口 (非阻塞, 供生产者在 push 后使用)
+//
+// @Context: 生产者在 api_push_trajectory_impl / api_push_mcode 内部,
+//           完成入队后调用此函数触发前瞻规划。
+// @Thread-Safety: Try-Lock 避让,竞争失败直接返回。
+//   - 生产者正在 push: 退让, 生产者 push 完成后会再次触发
+//   - 其他 planner 持锁: 当前调用 redundant, 直接返回
+//   - watchdog 持锁: 同上, watchdog 兜底规划已覆盖
+//   注意: api_flush_planner 不走此路径, 而是直接 spin-wait +
+//         planner_recalculate_locked, 保证文件末尾强制 flush。
+// ====================================================================
+void planner_recalculate(int force_flush)
+{
+    if (atomic_flag_test_and_set_explicit(&g_cmd_queue.queue_spinlock,
+                                          memory_order_acquire)) {
+        return;  // Try-Lock 失败: 不阻塞, 依赖调用者下次触发
+    }
+    planner_recalculate_locked(force_flush);
+    atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
 }

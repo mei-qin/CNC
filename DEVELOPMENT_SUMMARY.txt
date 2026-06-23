@@ -1,7 +1,7 @@
 ================================================================
   CNC 五轴数控系统 — 代码开发总结报告
   分支: CNC_V1
-  生成时间: 2026-06-04
+  生成时间: 2026-06-16
 ================================================================
 
 一、提交历史 (从初始到最新)
@@ -21,337 +21,286 @@ ebf3d98  feat: Phase 1 安全闭环 — 软限位接入、跟随误差监控、R
 d1d9be0  feat: 7段S曲线精确前瞻 + jerk短板限幅 + 安全加固
 8a56ecb  feat: 优雅下电时序 — 抱闸闭合心跳维持 + CiA402降级状态机
 2d34538  fix: 动态轴映射安全加固 — NULL防护/越界校验/buffer溢出修复
+0793a4c  feat: G43.4 RTCP逆运动学 + N段前瞻重构 + 注释过滤/G53非模态
+971fd7b  fix: 致命漏洞修复 — 逆运动学矩阵/内存屏障/RTCP微段打碎 + 字母化API重构
+92603c9  fix: 队列并发安全/RTCP速度畸变/flush预计算 + 动态状态栏重构
+3bff817  feat: 通用五轴运动学引擎 — 4x4齐次矩阵库 + 三构型动态逆解
+7a7bcf5  feat: 仿真预演引擎 — 双缓冲无锁轨迹采集器 + 时间加速 + 驱动器存根
+191e594  feat: G41/G42 刀具半径补偿引擎 — 2D计算几何内外拐角分类 + 过渡圆弧
+(未提交) 本周新增: G93 时间绝对守恒体系 + TraceLogger 下降沿锁存
+          + B-Spline 前向追踪重离散化 + 暴力锐角截断
 
-二、功能增量总览
+
+二、功能增量总览 (按提交时间倒序,仅列 2d34538 之后)
 ================================================================
+(2d34538 及之前的提交详情见 git log, 此处仅记录新增内容)
 
-【commit 5433d98】M 代码解析与实时线程同步屏障
+
+【未提交 — 本周新增】G93 时间绝对守恒体系 + 多项算法重构
 ----------------------------------------------------------------
-涉及文件: axis_cfg.h, axis_ctrl.h, axis_ctrl.c, ecat_core.c,
-          gcode_parser.c, planner.c
+涉及文件: axis_cfg.h, axis_ctrl.h, axis_ctrl.c, planner.c,
+          gcode_parser.c, bspline_engine.c, ecat_core.c
 
-1. M 代码解析 (gcode_parser.c)
-   - parse_gcode_line 新增 M/S 字母识别 (case 'M', case 'S')
-   - 解析到 M 代码时调用 api_push_mcode 推入命令队列
-   - 支持的格式示例: M03 S1000 (主轴正转, 转速1000)
+这是对 G93/G94 数据流的彻底重构,共 4 轮迭代修复:
 
-2. 命令队列扩展 (axis_cfg.h)
-   - 新增宏 CMD_TYPE_MOTION=0, CMD_TYPE_MCODE=1
-   - 新增宏 MCODE_WAIT_TIMEOUT_MS=5000 (绝对超时防死锁)
-   - TrajectorySegment_t 新增字段: cmd_type, m_code, s_value
-   - Interpolator_t 新增字段: is_waiting_mcode, mcode_wait_timer,
-     current_mcode
+【Round 1】G93 时间塌陷根治 + M 代码显式屏障
+  1. 新增 api_push_trajectory_g93(...): G93 模式豁免 max_speed/max_acc/
+     max_dec/max_jerk 短板限幅,保证 phys_speed = phys_dist/dt_per_seg
+     不被静默压低。
+  2. gcode_parser.c RTCP 直线/圆弧 G93 路径改走强一致性入队。
+  3. planner_recalculate 反向扫描开头插入显式 MCODE 屏障:
+     若 (curr+1) 段为 CMD_TYPE_MCODE,强制 s_curr.v_end=0,
+     防御性加固 (现有 calculate_junction_speed 已能间接保证)。
 
-3. M 代码压入 API (axis_ctrl.c)
-   - api_push_mcode(m_code, s_value): 所有运动参数置零，
-     仅填充 cmd_type=CMD_TYPE_MCODE，触发 planner_recalculate()
+【Round 2】G93 强一致性纯匀速预计算 + 免抹圆透传
+  1. TrajectorySegment_t 新增 is_g93_strict 字段。
+  2. api_push_trajectory_impl 重构签名,新增 is_g93_strict/g93_dt_sec/
+     is_fillet 三个参数;mutex 内对 G93 段预计算纯匀速绝对解析参数
+     (T4=T_total, v0..v6=v_target, s4..s6=total_distance, 全部 jerk=0)。
+  3. 新增 api_push_trajectory_passthrough 包装: is_fillet=1,供 B-Spline
+     透传段调用,planner_fillet_preprocess 自动跳过。
+  4. planner.c 三处尊重 is_g93_strict:
+     - recompute_scurve_profile 入口跳过 S 曲线重算,保护预计算值;
+     - 反向扫描 is_g93_strict 段 v_start 锁定 v_target;
+     - 正向扫描 is_g93_strict 段 v_end 锁定 v_target。
+  5. G93 路径在 gcode_parser.c / bspline_engine.c 三处入队点传 dt_per_seg。
 
-4. 前瞻安全隔离 (planner.c)
-   - calculate_junction_speed: 遇 CMD_TYPE_MCODE 段返回 0.0，
-     强制前序运动段彻底减速停稳后再执行 M 代码
+【Round 3】TraceLogger 停止瞬间漏记 (Falling Edge Latch)
+  1. ecat_core.c RT 线程探针段加 static last_is_moving 状态变量。
+  2. 触发条件: current_is_moving || (下降沿 !current && last)。
+  3. 下降沿那一帧强制 log_v_target=0.0,消除"速度未归零"假象。
+  4. 真实硬件探针: 运动中 cycle%5 降采样 + 下降沿立即记录。
+  5. 仿真采集: 1ms 全量 + 下降沿。单次下降沿,单次记录。
 
-5. 实时线程同步屏障 (ecat_core.c)
-   - 队列弹出条件增加 is_waiting_mcode==0
-   - M 代码段弹出后置 is_waiting_mcode=1, 不加载到插补器
-   - 非阻塞等待: 每 1ms 周期递增 mcode_wait_timer
-     M03(主轴正转)=2000ms, M05(主轴停止)=1000ms, 其他=1000ms
-   - 绝对超时 MCODE_WAIT_TIMEOUT_MS=5000ms 兜底
-   - dorun=0 异常分支重置 is_waiting_mcode 标志
+【Round 4】时空切分谬误根治 + B-Spline 等距重离散化
+  1. G93 时间切分 (gcode_parser.c): 抛弃 0.5mm 空间切分,
+     num_segments = ceil(T_sec*1000),与 RT 线程 1ms 周期对齐,
+     封顶 20000 防队列爆掉。G94 仍走 0.5mm 空间切分。
+  2. B-Spline 前向追踪重离散化 (bspline_engine.c): 抛弃 LUT 二分反查
+     (256 采样精度不足,步长 CV=0.58),改用 t_step=0.0005 前向累加弧长,
+     达到 step_size_mm 立即入队,等距性显著提升。
+  3. 暴力锐角截断 (bspline_engine.c is_sharp_corner): 抛弃 acos
+     (在 cos_angle → ±1 处数值不稳定),预计算 cos_thresh=cos(threshold),
+     直接比较 cos_angle < cos_thresh (数学等价,cos 在 [0,π] 单调递减)。
 
 
-【commit a0a6abe】G64 向心加速度过弯模型 + planner 数学安全加固
+【commit 191e594】G41/G42 刀具半径补偿引擎
 ----------------------------------------------------------------
-涉及文件: planner.c
+涉及文件: cutter_comp.h, cutter_comp.c, gcode_parser.c, smc_api.c
 
-1. calculate_junction_speed 完全重写 — G64 容差平滑模型
-   - 旧算法: v = v_min * cos_theta (线性降速, 90度强制归零)
-   - 新算法: 基于容差 TOLERANCE=0.05mm + 向心加速度极限 500mm/s^2
-     计算等效转弯半径 R = TOLERANCE / (1-cos(alpha/2))
-     安全过弯速度 v_allow = sqrt(MAX_CENTRIPETAL_ACC * R)
-     返回 min(v_allow, prev->v_max, curr->v_max)
-   - 90度直角: R~0.12mm, v_allow~7.7mm/s (不再归零, 机床不卡顿)
-   - cos_theta >= 0.999: 全速通过
-   - cos_theta <= -0.999: 折返停稳
-   - denom 防除零保护 (<=1e-6)
+1. 2D 计算几何引擎 (cutter_comp.c)
+   - 滑动窗口三点滚动 (prev/curr/next),首段法向切入 + 末段法向退刀
+   - 内外拐角分类: cross * mode_sign > 0 → 内角(收敛求交),
+                   cross * mode_sign < 0 → 外角(发散插弧)
+   - 内角: 偏置线交点替代原始拐角,含 t/s 参数燕尾过切拦截
+   - 外角: footA→圆弧→footB 过渡,圆心=原始拐点,归一化取短弧
+   - G41 外角圆弧 CW (sweep<0),G42 外角圆弧 CCW (sweep>0)
 
-2. planner_recalculate 全面安全加固
-   a. 消灭野数据: 反向扫描前遍历 is_ready==0 的段,
-      强制 v_start/v_end = 0.0
-   b. 消灭 pow(x,2): 全部替换为 x*x 高效乘法
-   c. sqrt 防负钳制: 所有 sqrt 入参加 if(inner<0) inner=0
-     (反向扫描、正向扫描、三角形退化, 共 3 处)
-   d. 除零保护: a = fmax(seg->acc, 1e-6), d = fmax(seg->dec, 1e-6)
-   e. t_cru 除零: if(v_m > 1e-6) 保护分支
-   f. M 代码/零距离跳过: 时间重构头部 continue, t_total=1
-   g. safe_tail 边界修复: (tail+2)->(tail+1), count==3 时
-      反向扫描正确执行 1 次迭代
+2. 解析器集成 (gcode_parser.c)
+   - G40/G41/G42 + D 代码解析,激活时 BSpline_Flush 保证输出顺序
+   - 直线段(G00/G01) 路由经刀补引擎,G02/G03/RTCP 直通
+
+3. CutterComp_Enable 预填当前机器坐标 P0 到窗口,消除 Start-up 斜拉
+4. 圆弧微段最后一拍强制对齐理论终点,消除浮点累积误差
 
 
-【commit ebf3d98】Phase 1 安全闭环
+【commit 7a7bcf5】仿真预演引擎
 ----------------------------------------------------------------
-涉及文件: axis_cfg.h, global_def.h, axis_ctrl.c, ecat_core.c
+涉及文件: sim_engine.h, sim_engine.c, ecat_core.c, smc_api.c
 
-1. is_trajectory_finished 修复
-   - 新增 is_waiting_mcode==0 判断, 防止 M 代码等待期间
-     误报"运动已完成"
+1. 双缓冲无锁轨迹采集器 (sim_engine.c)
+   - 高频双缓冲 (1M 条 × 64MB/缓冲, lock-free ping-pong)
+   - RT 线程无阻塞写入活跃缓冲,缓冲满时原子交换 + sem_post 唤醒落盘
+   - 后台线程批量 fwrite 二进制落盘,512 字节文件头关闭时回填 record_count
+   - 双缓冲不可用时静默丢弃 (dropped_records 原子计数),绝不忙等
+   - cache-line 隔离 (_Alignas(64)) 杜绝 RT 与落盘线程 false sharing
 
-2. 软限位泛化 + 接入运动管道
-   - check_soft_limits 从硬编码 XYZ 改为 AXIS_NUM 泛化循环
-   - api_push_trajectory 入队前调用, 越限则拒绝入队
-   - 打印越限轴名和范围信息
+2. 仿真模式时间加速 (ecat_core.c)
+   - 跳过 osal_monotonic_sleep,以 CPU 最高算力空转
+   - 每循环代表 1ms 虚拟时间,实际以纳秒级执行
+   - sim_engine_push 每周期全量采集插补器坐标 (1ms 精度)
+   - TraceLogger_Push 添加 !g_sim_mode 守卫,仿真模式由 sim_engine 覆盖
 
-3. RT 线程跟随误差监控
-   - axis_cfg.h 新增: FOLLOW_ERR_MAX_PULSE=5000 (硬限)
-     FOLLOW_ERR_WARN_PULSE=3000 (警告)
-     FOLLOW_ERR_WARN_TIME_MS=200 (警告持续时长)
-   - AxisCtrl_t 新增: _follow_err_timer 计时器
-   - RT 线程 case 3 分支每周期读取驱动器 0x60F4 跟随误差
-   - 使能首周期强制对齐: cia_step_delay==0 时
-     cmd_pos = actual_pos, 消除坐标系偏移
-   - 硬限超差: 立即截断插补器 (is_moving=0) + 触发报警
-   - 警告超差: 累积计时器, 持续超限后触发报警
-   - dorun=0 异常分支重置所有轴 _follow_err_timer
-
-4. RT 线程环形日志缓冲
-   - axis_cfg.h 新增 RtLog_t 结构体 (64条 x 128字节)
-   - global_def.h 声明 g_rt_log 全局实例
-   - rt_log(): vsnprintf 写入 + __sync_synchronize 写屏障
-     + 更新 head (缓冲满则丢弃)
-   - rt_log_drain(): 读屏障 + printf + 写屏障, 完整对称
-   - ecat_thread_chk 每 10ms 调用 rt_log_drain 异步输出
+3. SMC_InitAndStart/Close 集成仿真初始化与排空关闭
+   - ECAT 降级调用添加 !g_sim_mode 守卫防止仿真模式崩溃
 
 
-【commit 01c38e6】跟随误差改用驱动器 0x60F4 PDO 映射 + 双驱对齐修复
+【commit 3bff817】通用五轴运动学引擎
 ----------------------------------------------------------------
-涉及文件: axis_cfg.h, axis_ctrl.h, axis_ctrl.c, ecat_core.c
+涉及文件: kinematics.h, kinematics.c, smc_api.h, smc_api.c, main.c
 
-1. TxPDO 重映射 (ecat_core.c -> ecat_bringup)
-   - 在 config_map_group 之前对所有从站执行 PDO 重映射
-   - 禁用 TxPDO 分配 (0x1C13:00=0)
-   - 清空映射对象 0x1A00, 写入三条映射:
-     * 0x60410010 — 状态字 (16bit)
-     * 0x60640020 — 实际位置 (32bit)
-     * 0x60F40020 — 跟随误差 (32bit)
-   - 绑定 0x1A00 → 0x1C13, 启用分配
-   - SOEM config_map_group 自动重新分配 IOmap 偏移
+1. Mat4x4 基础矩阵库 (kinematics.c)
+   - Identity/Multiply/Translate/RotateAxis/Inverse/ApplyPoint
+   - 支持别名安全与正交转置求逆
 
-2. 驱动器侧跟随误差读取 (axis_ctrl.c)
-   - 新增 axis_pdo_read_follow_err(slave_id)
-   - 从 PDO 偏移字节 6-9 读取 0x60F4 (驱动器自身计算)
-   - 消除主站坐标系偏移导致的误报/漏报风险
+2. 三构型动态逆解 (kinematics.c)
+   - KinType_t 枚举: HEAD_HEAD / TABLE_TABLE / MIXED
+   - KinConfig_t 通用配置: 旋转轴索引/维度/刀具偏置/枢轴偏置
+   - 统一逆解公式 joint = tip + delta_table - delta_head
+   - 通过 switch 动态装配三种构型的矩阵链,微分形式保证零位一致
+
+3. SMC_ConfigKinematics 通用配置 API + SMC_ConfigKinematicsOffset BC 摆头接口
+4. main.c 状态栏重构为动态轴映射 + SMC_GetSystemStatusStr 状态指示
 
 
-【commit 9688b38】N轴短板限幅 + acquire-release语义修复 + 规划器互斥锁加固
+【commit 92603c9】队列并发安全/RTCP速度畸变/flush预计算
 ----------------------------------------------------------------
-涉及文件: axis_cfg.h, global_def.h, planner.h, smc_api.h,
-          axis_ctrl.c, ecat_core.c, planner.c, smc_api.c, CLAUDE.md
+涉及文件: axis_ctrl.c, gcode_parser.c, planner.c, smc_api.c, main.c
 
-1. [致命Bug修复] 短板限幅被下限钳制反向击穿 (axis_ctrl.c)
-   - 先执行 ratio 乘法（物理约束），后做 1e-6 兜底（数学安全）
+1. 队列并发安全 (axis_ctrl.c)
+   - api_push_trajectory/mcode 加 planner_mutex 保护队列临界区
+   - 防止 planner_fillet_preprocess 后台改 head 竞态覆写
 
-2. [致命Bug修复] RT线程 acquire-release 语义违规 (ecat_core.c)
-   - 将结构体拷贝移入 atomic_load_acquire 成功分支内部
+2. RTCP 速度畸变修正 (gcode_parser.c)
+   - 直线/圆弧微段按 逻辑时间预算/物理距离 计算下发速度
+   - 修正逆解后物理距离放大导致的刀尖进给率畸变
 
-3. N轴向量化的短板效应限幅 (axis_ctrl.c -> api_push_trajectory)
-   - 逐轴计算空间投影比 axis_ratio_mm = |delta_mm[i]|/dist
-   - 线性轴/旋转轴分别处理, 取最小 ratio 缩放全局
+3. flush 预计算 (axis_ctrl.c)
+   - api_flush_planner 改为 planner_recalculate(1),消除残余段
+     T_total=0 导致 RT 线程位置瞬跳
 
-4. 规划器互斥锁 + plan_tail 结界 (planner.c)
-   - pthread_mutex_t planner_mutex 保护前瞻计算原子性
-   - plan_tail 结界: 跳过所有 is_ready==1 的已释放段
+4. 拐角圆角平滑 (planner.c)
+   - 新增 planner_fillet_preprocess: G64 容差自动插入过渡圆弧
+   - is_fillet 标记圆弧子段,防止重复平滑
 
-5. 轴动力学配置 API (smc_api.c)
-   - SMC_ConfigAxisDynamics / SMC_ConfigPlannerParams
-   - 运行中修改保护
-
-6. 饥饿看门狗 (ecat_core.c -> ecat_thread_chk)
-   - 解析器关闭后 50ms 无新指令触发 force_flush
+5. 动态状态栏 (smc_api.c, main.c)
+   - SMC_IsAxisConfigured/SMC_GetSystemStatusStr 状态查询 API
+   - ANSI 无闪烁刷新,安全 snprintf 拼接
 
 
-【commit 9331e3a】铲除废弃代码 + M代码计时器溢出封顶
+【commit 971fd7b】致命漏洞修复 — 逆运动学矩阵/内存屏障/RTCP微段打碎
 ----------------------------------------------------------------
-   - 删除 g_ui_cmd 僵尸全局变量
-   - mcode_wait_timer 溢出保护 (INT32_MAX 封顶)
+涉及文件: kinematics.c, axis_ctrl.c, gcode_parser.c, ecat_core.c,
+          smc_api.c, main.c
+
+1. 正向旋转矩阵修正 (kinematics.c)
+   - 改为逆转 R_Y(-B)*R_X(-A)*R_Z(-C),sin 项取反
+
+2. 内存屏障 (axis_ctrl.c)
+   - api_push_trajectory/api_push_mcode 加入
+     atomic_thread_fence(memory_order_release) 写屏障
+
+3. RTCP 微段打碎 (gcode_parser.c)
+   - 新增 generate_linear_rtcp_trajectory
+   - 含旋转运动的 G01 按 0.5mm 等效步长逐点逆解
+   - 消除刀尖弧形挖坑效应
+
+4. CiA402 使能流程 4 处 pulse_per_unit 除零保护
+5. api_get_cursor 越界检查
+6. 字母化 API 重构 (smc_api.c, main.c)
+   - 废除 SMC_AXIS_X/B 硬编码宏,全部改为 char axis_letter 查表驱动
+   - SMC_ConfigAxisTopology 自动分配底层房间号
 
 
-【commit 49b7173】虚拟时间平滑急停 + CiA402故障自动恢复
+【commit 0793a4c】G43.4 RTCP逆运动学 + N段前瞻重构
 ----------------------------------------------------------------
-涉及文件: axis_cfg.h, axis_ctrl.c, ecat_core.c
+涉及文件: gcode_parser.c, planner.c, kinematics.c (早期版本)
 
-1. 虚拟时间 Feedhold 机制
-   - 废弃旧的 position_freeze 方案, 改用 virtual_time_ms + time_scale
-   - FeedHoldState_t 四态机: NORMAL → BRAKING → PAUSED → RESUMING
-   - time_scale 每周期递减/递增 0.005, 200ms 平滑刹车/恢复
-   - 插补公式基于绝对解析式, 无 static 变量继承位置
+1. G43.4 RTCP 刀尖跟随
+   - apply_rtcp_to_pos: 调用 Kinematics_Inverse 做刀尖到关节的逆解
+   - 动态适配 AC/BC/ABC 构型,旋转轴缺失时角度取 0
 
-2. 报警复位安全闭环 (ecat_core.c)
-   - alarm_reset_request 原子标志, RT 线程在安全点(HOLD_PAUSED)消费
-   - 复位动作: 清队列 + 同步位置到驱动器实际位置 + 重置插补器
-   - 全轴 op_ready 门控, 防止未使能轴被写入
+2. N 段前瞻重构 (planner.c)
+   - 废弃 plan_count==1/2/3 硬编码分支
+   - 统一反向+正向扫描,LOOKAHEAD_MAX_DEPTH=200 上限防阻塞
 
-3. 故障轴处理加固 (ecat_core.c -> case 3/4)
-   - case 3: 驱动器故障(SW_ERROR) 立即进入 case 4, 触发报警
-   - 绝对禁止在 case 3 置 is_moving=0, 让虚拟时间轴平滑刹车
-   - case 4: 故障期间命令位置死咬实际位置, 防恢复瞬间飞车
+3. 注释过滤 (gcode_parser.c)
+   - 支持 (...) 括号注释、M03(LSON) 紧贴写法
+   - 分号/百分号后续忽略
 
-
-【commit d1d9be0】7段S曲线精确前瞻 + jerk短板限幅 + 安全加固
-----------------------------------------------------------------
-涉及文件: axis_cfg.h, gcode_parser.h, axis_ctrl.c, planner.c, ecat_core.c
-
-1. 7段式 S 曲线绝对解析式预计算 (planner.c)
-   - compute_acc_profile / compute_dec_profile: 加速/减速段距离解析积分
-     退化段(无匀加速): S = 2·vs·tj + J·tj³
-     非退化段: S = vs·(2t+a) + a_max·t² + 1.5·a_max·t·a + 0.5·a_max·a²
-   - T3/T7 位移公式包含完整的 ½·a_n·τ² 初始加速度项:
-     s(τ) = s_n + v_n·τ + ½·a_n·τ² + ⅙·j_n·τ³
-   - 7 段入口状态全部预计算 (T1-T7, v0-v6, s0-s6, j1-j7)
-   - RT 线程仅做无状态绝对解析插补, 查表比较 + 多项式求值
-   - NaN/Inf 熔断 + total_distance=0 安全着陆
-   - 二分查找 v_m (20次迭代) 处理短距离退化
-   - 防爆熔断: 最低速度仍超距时强制归零 + 反向传播前驱段 v_end
-
-2. 精确 S 曲线前瞻 (废弃 K=0.8 近似系数)
-   - 新增 solve_max_vstart_scurve / solve_max_vend_scurve
-     直接调用 compute_dec/acc_profile + 24 次二分搜索
-   - 反向/正向扫描全部使用精确求解, 消除低速段距离不足隐患
-   - 正向扫描从 plan_tail 启动, 修复 plan_tail.v_end=0 的过度保守
-
-3. Jerk 短板限幅 (axis_ctrl.c)
-   - TrajectorySegment_t 新增 double jerk 字段
-   - api_push_trajectory 新增 jerk 短板效应限幅 (与 acc/dec 对称)
-   - 单位转换 mm/s³ → mm/ms³ (÷1e9)
-   - gcode_parser.h 新增 DEFAULT_JERK 5000.0 mm/s³
-
-4. Interpolator_t 安全加固 (axis_cfg.h, ecat_core.c)
-   - is_moving: int → _Atomic int (ARM 弱序安全)
-   - 删除死字段: total_time_ms (int32_t), current_time_ms (int32_t)
-   - FOLLOW_ERR_MAX_PULSE 硬限超差立即截断插补器 (is_moving=0)
-
-
-【commit 2d34538】动态轴映射 + G93进给模式 + 规划器动态安全释放窗口
-----------------------------------------------------------------
-涉及文件: axis_cfg.h, axis_ctrl.h, gcode_parser.h, global_def.h,
-          axis_ctrl.c, ecat_core.c, gcode_parser.c, main.c,
-          planner.c, smc_api.c
-
-1. 动态轴映射表 (axis_ctrl.c, global_def.h, gcode_parser.c)
-   - 新增 g_axis_map[26]: 'A'-'Z' → 轴索引, -1=未映射
-   - SMC_ConfigAxisTopology 自动注册首字母映射
-   - gcode_parser 运动轴解析改为查表，废弃硬编码 X/Y/Z/A/B case
-   - 圆弧插补平面轴索引改为动态查表 (idx_x/idx_y/idx_z)
-   - 安全加固: NULL/空字符串校验, toupper 强转 unsigned char,
-     strncpy sizeof()-1 + 手动补 '\0'
-
-2. G-code 解析器重构 — 模态状态 + G93/G94 + P/Q/R (gcode_parser.c)
-   - 废弃 is_G00/is_G01/is_G02/is_G03 逐行标志,
-     改用 g_state.motion_mode 模态持续 (0=G00, 1=G01, 2=G02, 3=G03)
-   - 新增 feed_mode: FEED_MODE_G93(倒数时间), FEED_MODE_G94(每分钟)
-   - G93: F = 1/T_min, 由距离反推实际速度 v = dist / T_sec
-   - M代码扩展参数: P/Q/R, api_push_mcode 签名扩展为 5 参数
-   - 非运动组 G 代码拦截: G04/G10/G28/G92 置 is_non_motion_g=1,
-     阻止误触发运动下发
-   - 螺旋弧真实长度: sqrt(弧长² + 非平面轴位移²), 含旋转轴等效换算
-   - 零半径退化: 起终点重合则真无操作, 否则退化为直线 (G93 兼容)
-   - buffer 溢出防护: strncpy(buffer, ..., sizeof(buffer)-1) + '\0'
-
-3. 规划器动态安全释放窗口 (planner.c)
-   - 废弃 plan_count < 3 释放启发式, 改用精确 S 曲线制动距离判定
-   - compute_stop_distance(v, d_max, jerk): 调用 compute_dec_profile 精确求解
-   - 从队列尾部向前累加距离, 满足 accum >= S_stop 时标记安全边界
-   - M代码屏障: 扫描遇 CMD_TYPE_MCODE 立即截断
-   - LOOKAHEAD_MAX_SEGMENTS=100: 段数上限防无限扫描
-   - 7段预计算仅对安全窗口内段执行 (safe_release_head 边界)
-   - recompute_scurve_profile(): 单段重算, 前瞻熔断后反向传播
-     修改前驱段 v_end 时同步重算其 7段入口状态
-
-4. 微段快进 (ecat_core.c)
-   - T_total < 0.5ms 的微段: 废弃 rt_log 报错, 改为直接快进
-     current_pos = target_pos (无插补消耗)
-
-5. 解析器卡死二级看门狗 (ecat_core.c)
-   - 路径 A: 解析器已停 → 不限段数, 全部 force_flush (废除 count<3)
-   - 路径 B: 解析器标记运行但队列首尾无进展 → 2s 超时 force_flush
-   - STUCK_THRESHOLD=200 (200 × 10ms = 2s)
-
-6. 默认动力学参数调整 (main.c, gcode_parser.h)
-   - 线性轴速度: 500→50 mm/s, 加速度: 2000→200 mm/s²
-   - 旋转轴速度: 180→18 deg/s, 加速度: 720→72 deg/s²
-   - DEFAULT_ACC/DEC: 100→50 mm/s²
-   - A/B 轴脉冲当量: 1000→2777.7778 pulse/deg
-
-
-【commit 8a56ecb】优雅下电时序 — 抱闸闭合心跳维持 + CiA402降级状态机
-----------------------------------------------------------------
-涉及文件: smc_api.c, ecat_core.c
-
-1. SMC_Close 优雅下电触发 (smc_api.c)
-   - dorun=0 → dorun=2: 触发 RT 线程下电状态机
-   - 删除所有非 RT 线程的 axis_pdo_write / ecx_send_processdata 调用
-   - 新增阻塞等待 dorun==0 (最多 3 秒, 超时强制降级)
-   - 保留 SAFE_OP → INIT → ecx_close EtherCAT 降级流程
-
-2. RT 线程 dorun 状态拆分 (ecat_core.c)
-   - if(dorun>0) → if(dorun==1): 正常运行 (插补/状态机/发包)
-   - 新增 else if(dorun==2): 优雅下电状态机
-     * Step 0 (500ms): 发 CW_SWITCH_ON + 锁定物理位置, 抱闸闭合等待
-     * Step 1 (≤1000ms): 发 CW_SHUTDOWN, 轮询 SW_SHUTDOWN_RDY
-     * 全程 1ms 心跳不断 (ecx_receive/send_processdata), 零阻塞
-     * 完成后置 dorun=0, 交还控制权给 SMC_Close
-   - else (dorun==0): 兜底发 CW_SHUTDOWN, 覆盖降级过渡期
-
-3. 修复 Z 轴下电通信丢失
-   - 旧方案: dorun=0 瞬间停止 1ms 心跳, 抱闸 50ms 延期内通信断联
-   - 新方案: dorun==2 状态机维持心跳 500ms+1000ms, 机械抱闸充分闭合
+4. G53 非模态机械坐标
+   - is_G53_this_block 标记,强制 G90 忽略 G91,不影响模态 WCS
 
 
 三、当前系统架构总览
 ================================================================
 
-文件结构:
-  inc/axis_cfg.h      — 数据结构、宏定义、硬件常量
-  inc/axis_ctrl.h     — 轴控制 API 声明
-  inc/ecat_core.h     — EtherCAT 核心函数声明
-  inc/gcode_parser.h  — G 代码解析器声明
-  inc/global_def.h    — 全局变量 extern 声明
-  inc/planner.h       — 前瞻规划器声明
-  inc/smc_api.h       — 上层用户 API 声明
+文件结构 (13 头文件 + 11 实现):
+  inc/axis_cfg.h       — 数据结构、宏定义、硬件常量
+  inc/axis_ctrl.h      — 轴控制 + 入队 API 声明
+  inc/bspline_engine.h — B-Spline 平滑引擎声明
+  inc/cutter_comp.h    — 刀具半径补偿引擎声明
+  inc/ecat_core.h      — EtherCAT 核心函数声明
+  inc/gcode_parser.h   — G 代码解析器声明
+  inc/global_def.h     — 全局变量 extern 声明
+  inc/kinematics.h     — 通用五轴运动学库声明
+  inc/osal_compat.h    — OS 抽象层兼容声明
+  inc/planner.h        — 前瞻规划器声明
+  inc/sim_engine.h     — 仿真预演引擎声明
+  inc/smc_api.h        — 上层用户 API 声明
+  inc/trace_logger.h   — 轨迹探针日志声明
 
-  src/main.c          — 主程序入口 + 交互式控制台
-  src/axis_ctrl.c     — 轴控制 API 实现 + 运动命令队列
-  src/ecat_core.c     — EtherCAT 实时线程 + 故障检查 + 优雅下电状态机
-  src/gcode_parser.c  — G 代码解析 + 圆弧插补
-  src/planner.c       — G64 前瞻 + 7段S曲线精确预计算
-  src/smc_api.c       — 用户层 API 封装
+  src/main.c           — 主程序入口 + 动态状态栏
+  src/axis_ctrl.c      — 轴控制 + 入队 API 实现 (4 个 push 变体)
+  src/bspline_engine.c — B-Spline 平滑引擎实现 (前向追踪重离散化)
+  src/cutter_comp.c    — 刀具半径补偿实现
+  src/ecat_core.c      — EtherCAT 实时线程 + 故障检查 + 优雅下电
+                          + 探针下降沿锁存
+  src/gcode_parser.c   — G 代码解析 + 圆弧/RTCP 微段打碎
+                          + G93 时间切分 (1ms 对齐 RT 周期)
+  src/kinematics.c     — 4x4 矩阵库 + 三构型动态逆解
+  src/planner.c        — G64 前瞻 + 7段S曲线预计算
+                          + G93 强一致性纯匀速保护
+                          + 拐角圆角平滑 (is_fillet 跳过)
+  src/sim_engine.c     — 仿真双缓冲无锁轨迹采集器
+  src/smc_api.c        — 用户层 API 封装
+  src/trace_logger.c   — 无锁轨迹探针落盘线程
 
 线程模型:
   ecat_thread_rt      — 1ms 实时线程, SCHED_FIFO 优先级99
     (CSP 位置命令下发, 7段S曲线绝对解析插补, 跟随误差监控 0x60F4,
-     龙门同步检测, CiA402 状态机, 优雅下电状态机 dorun==2)
+     龙门同步检测, CiA402 状态机, 优雅下电状态机 dorun==2,
+     探针下降沿锁存 last_is_moving)
   ecat_thread_chk     — 10ms 非实时线程
     (从站状态检测, RT 日志异步输出, 队列饥饿看门狗,
      解析器卡死二级检测 2s 超时)
   parser_thread_func  — 非实时解析线程
     (G 代码文件逐行解析, 模态状态管理, G93/G94 进给模式,
-     动态轴映射查表, 推入命令队列)
+     G93 1ms 时间切分 (封顶 20000), 动态轴映射查表,
+     RTCP 逆解微段打碎, 推入命令队列)
+  bspline_thread_func — B-Spline 平滑后台线程 (绑定 CPU 核心)
+    (脏点队列消费, 锐角切批 (cos_thresh 比较),
+     前向追踪重离散化 (t_step=0.0005), 推入命令队列)
+  trace_logger/落盘线程 — 仿真轨迹双缓冲落盘
 
 数据流:
-  G代码文件 -> parse_gcode_line (模态状态+动态轴映射+G93/G94)
-    -> api_push_trajectory/api_push_mcode (P/Q/R扩展)
+  G代码文件
+    -> parse_gcode_line (模态+轴映射+G93/G94+注释过滤+G53非模态)
+    -> RTCP 微段打碎 generate_linear_rtcp/arc_trajectory
+       (G93: 1ms 时间切分 ceil(T_sec*1000), 封顶 20000)
+    -> CutterComp_PushPoint (G41/G42 2D 偏置, 直线段路由)
+    -> BSpline_PushDirtyPoint (G01+BSpline 模式)
+       -> bspline_thread_func: 锐角切批 + 前向追踪重离散化
+    -> api_push_trajectory / _g93 / _passthrough / _mcode
+       (4 个 push 变体, mutex 保护, release 写屏障)
     -> CommandQueue_t -> planner_recalculate (mutex + plan_tail结界)
-    -> 动态安全释放窗口 (精确制动距离 + M代码屏障 + 段数上限100)
-    -> 7段S曲线精确前瞻 (solve_max_vstart/vend_scurve 二分搜索)
+       -> planner_fillet_preprocess (G64 圆角, is_fillet 跳过)
+       -> 反向扫描 (MCODE 显式屏障 + G93 strict 锁定)
+       -> 正向扫描 (G93 strict 锁定)
+       -> 动态安全释放窗口 (精确制动距离 + M代码屏障 + 段数上限200)
+       -> recompute_scurve_profile (is_g93_strict 跳过, 保留纯匀速)
     -> atomic_store_release(is_ready=1)
     -> ecat_thread_rt atomic_load_acquire -> 弹出段
     -> Interpolator_t 7段绝对解析插补 (T1-T7 多项式求值)
+       (G93 strict 段: T4=T_total, v0..v6=v_target, 纯匀速)
     -> 微段快进 (T_total<0.5ms 直接snap)
+    -> 探针 Falling Edge Latch (last_is_moving 检测停止瞬间)
     -> 各轴 current_cmd_pos -> PDO 写入 -> 驱动器
 
-插补架构 (7段式 S 曲线):
+插补架构 (7段式 S 曲线 + G93 强一致性纯匀速):
   Planner (非RT): 预计算 T1-T7/v0-v6/s0-s6/j1-j7/a2/a6
+    G93 strict: 预计算纯匀速 (T4=T_total, jerk 全 0)
   RT 线程: virtual_time_ms 与 T1-T7 比较, 无状态绝对解析
     s(τ) = s_n + v_n·τ + ½·a_n·τ² + ⅙·j_n·τ³
   Feedhold: time_scale 控制虚拟时间流速, 平滑刹车/恢复
+
+G93 时间绝对守恒体系:
+  1. 切分: 时间切分 num_segments=ceil(T_sec*1000), 封顶 20000
+  2. 入队: api_push_trajectory_g93 豁免短板限幅
+  3. 预计算: mutex 内设 T4=T_total, v0..v6=v_target
+  4. 保护: recompute_scurve_profile 跳过 is_g93_strict
+  5. 锁定: 反向/正向扫描 v_start/v_end = v_target
+  6. RT 解析: 1ms 周期匀速推演,绝对遵守 T_sec
 
 下电时序:
   SMC_Close (非RT): dorun=2 → 阻塞等待 dorun==0 → EtherCAT 降级
@@ -365,6 +314,8 @@ d1d9be0  feat: 7段S曲线精确前瞻 + jerk短板限幅 + 安全加固
   - _Atomic is_moving: RT 线程写, 非RT 线程读, ARM 弱序安全
   - _Atomic alarm_reset_request: 非RT 请求, RT 安全点消费
   - plan_tail 结界: 已释放段对 planner 只读, 禁止覆写
+  - bspline_mutex + bspline_cond: 脏点队列生产消费同步
+  - static last_is_moving (RT 线程局部): 探针下降沿锁存
 
 TxPDO 映射 (每从站 10 字节):
   偏移 0-1: 0x6041 状态字 (uint16)
@@ -377,62 +328,52 @@ TxPDO 映射 (每从站 10 字节):
   DEFAULT_JERK = 5000 mm/s³
 
 
-四、已完成的 Phase 2 → Phase 3 项目
+四、已完成的 Phase 项目
 ================================================================
 
-[已完成] 每轴独立动力学配置
-  - AxisCtrl_t: axis_type, max_speed, max_acc, max_dec, max_jerk,
-    equivalent_radius
-  - SMC_ConfigAxisDynamics API, 运行中修改保护
-  - 短板效应限幅: 逐轴投影比 × 全局 ratio 缩放 (含 jerk)
+[Phase 1 安全闭环]
+  - 软限位泛化接入、跟随误差监控 (0x60F4 PDO)、RT 日志缓冲
 
-[已完成] G64 参数运行时可配
-  - PlannerConfig_t: corner_tolerance, max_centripetal_acc
-  - SMC_ConfigPlannerParams API
-
-[已完成] 距离/速度计算区分线性轴和旋转轴
-  - api_push_trajectory 统一量纲 → 等效 mm 位移
-
-[已完成] 规划器线程安全
-  - planner_mutex 互斥锁 + plan_tail 结界 + is_ready 原子化
-
-[已完成] 队列饥饿看门狗
-  - 解析器关闭后 50ms 无新指令触发 force_flush
-
-[已完成] 7段式 S 曲线加减速
+[Phase 2 七段式 S 曲线 + 精确前瞻]
   - 绝对解析式预计算: compute_acc/dec_profile + 7段入口状态
-  - 精确前瞻: 废弃 K=0.8, 二分搜索求解 S 曲线真实距离
+  - 精确前瞻: solve_max_vstart/vend_scurve 二分搜索
   - RT 线程无状态插补: virtual_time_ms + 多项式绝对解析
 
-[已完成] 虚拟时间 Feedhold 机制
-  - time_scale 控制虚拟时间流速, 四态状态机平滑刹车/恢复
+[Phase 3 高级运动控制]
+  - G43.4 RTCP 刀尖跟随 (五轴空间逆解)
+  - 通用五轴运动学引擎 (4x4 矩阵 + 三构型动态逆解)
+  - G41/G42 刀具半径补偿 (2D 计算几何内外拐角)
+  - B-Spline 平滑引擎 (3 阶 clamped, 前向追踪重离散化)
+  - 拐角圆角平滑 (planner_fillet_preprocess, is_fillet 标记)
+  - G93 时间绝对守恒 (1ms 时间切分 + 强一致性纯匀速)
+  - 仿真预演引擎 (双缓冲无锁轨迹采集器 + 时间加速)
+  - 虚拟时间 Feedhold (time_scale 平滑刹车/恢复)
+  - CiA402 故障自动恢复 + 优雅下电时序
+  - 动态轴映射 + 字母化 API (查表驱动,告别硬编码)
+  - TraceLogger 探针下降沿锁存 (停止瞬间不漏记)
 
-[已完成] CiA402 故障自动恢复
-  - alarm_reset_request 原子标志 + RT 安全点消费 + 位置同步
-
-[已完成] 优雅下电时序
-  - dorun==2 状态机: 抱闸闭合 500ms + CiA402 降级 ≤1000ms
-  - 全程 1ms EtherCAT 心跳不断, 修复 Z 轴下电通信丢失
-
-[已完成] 动态轴映射 + G93/G94 进给模式 + 规划器动态安全释放窗口
-  - g_axis_map[26]: 'A'-'Z' → 轴索引, 解析器/圆弧插补统一查表
-  - G-code 模态状态: motion_mode 持续, feed_mode 支持 G93(倒数时间)/G94(每分钟)
-  - G93 进给速度: F=1/T_min, 距离反推实际速度, 螺旋弧真实长度计算
-  - M代码扩展参数 P/Q/R, 非运动组 G 代码拦截 (G04/G10/G28/G92)
-  - 规划器: 废弃 plan_count<3, 改用精确制动距离 + M代码屏障 + 段数上限100
-  - 微段快进: T_total<0.5ms 直接 snap 到目标位置
-  - 解析器卡死二级看门狗: 2s 无进展触发 force_flush
+[规划器算法演化]
+  - K=0.8 近似 → 精确 S 曲线二分搜索
+  - plan_count<3 启发式 → 精确制动距离 + M代码屏障
+  - LUT 反查重离散化 → 前向追踪累加法 (CV 显著降低)
+  - acos 判锐角 → cos_thresh 直接比较 (避免数值不稳定)
 
 
 五、已知限制与后续计划
 ================================================================
 
-Phase 4 (高级功能):
-  - 刀具半径补偿 (G41/G42)
+待清理 (本轮重构遗留):
+  - bspline_engine.c 中 compute_spline_arc_length / arc_length_to_t
+    及 arc_lut 静态数组在前向追踪重构后成为死代码,
+    仍保留用于计算 total_arc,后续可重构为纯弧长计算函数。
+
+Phase 5 (高级功能):
   - 实时进给率倍率 (Feed Override)
   - 电子齿轮/凸轮模式
   - G28 机械原点复归
   - 故障记录持久化
+  - B-Spline 内部边界 (子批首末段) 也保留锐角的进一步加固
+  - cutter_comp 路径下的 G93 强一致性集成 (当前刀补输出走常规入队)
 
 ================================================================
   报告结束

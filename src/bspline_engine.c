@@ -106,10 +106,41 @@ void BSpline_StopThread(void)
 
 // @Context: Non-RealTime Background Thread (parser)
 // @Thread-Safety: bspline_mutex 保护队列写入
+//
+// 前置尖角拦截 (Pre-emptive Sharp Corner Blocking):
+//   入队前用队尾最后两点 (P_n-2, P_n-1) 与当前 pos 构成三元组,调 is_sharp_corner。
+//   若判定为尖角,说明 pos 属于另一条折线 —— 立即同步 BSpline_Flush() 把当前队列
+//   (截至 P_n-1 的平滑段) 全部排空下发,然后 pos 进入空队列成为新批次起点。
+//   这样尖角后的点不再被混入当前拟合批次,且降低批处理延迟。
+//   注意: BSpline_Flush 自带 bspline_mutex 内部加锁,故此处必须先 unlock 再调 Flush,
+//   否则会自死锁。
 int BSpline_PushDirtyPoint(double pos[AXIS_NUM], double speed, double g93_time)
 {
     if (atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire) == 1) {
         return -1;
+    }
+
+    // ---- 前置尖角拦截: 检查 (P_n-2, P_n-1, pos) ----
+    pthread_mutex_lock(&bspline_mutex);
+    int dirty_count_pre = (g_dirty_queue.head - g_dirty_queue.tail
+                           + BSPLINE_DIRTY_QUEUE_SIZE) % BSPLINE_DIRTY_QUEUE_SIZE;
+    int corner_detected = 0;
+    if (dirty_count_pre >= 2) {
+        int idx_n1 = (g_dirty_queue.head - 1 + BSPLINE_DIRTY_QUEUE_SIZE)
+                     % BSPLINE_DIRTY_QUEUE_SIZE;
+        int idx_n2 = (g_dirty_queue.head - 2 + BSPLINE_DIRTY_QUEUE_SIZE)
+                     % BSPLINE_DIRTY_QUEUE_SIZE;
+        DirtyPoint_t *P_n1 = &g_dirty_queue.buffer[idx_n1];
+        DirtyPoint_t *P_n2 = &g_dirty_queue.buffer[idx_n2];
+        corner_detected = is_sharp_corner(P_n2->pos, P_n1->pos, pos,
+                                          g_bspline_config.sharp_angle_rad);
+    }
+    pthread_mutex_unlock(&bspline_mutex);
+
+    if (corner_detected) {
+        // 同步排空当前平滑段队列 (P_n-1 是其终点)。
+        // Flush 返回后队列必为空 (5 秒超时保护),后续 push 的 pos 即为新批次起点。
+        BSpline_Flush();
     }
 
     pthread_mutex_lock(&bspline_mutex);
@@ -309,13 +340,15 @@ static void bspline_process_batch_from(int start, int count)
 {
     if (count < 1) return;
 
-    // ---- 少于 4 个点: 直接透传 ----
+    // ---- 少于 4 个点: 直接透传,标记 is_fillet=1 防止底层二次抹圆 ----
+    // 这些点是锐角切批后的残余,需保留其锐角几何,planner_fillet_preprocess 必须跳过。
     if (count < BSPLINE_ORDER) {
         for (int i = 0; i < count; i++) {
             int idx = start + i;
             double speed = batch_speeds[idx];
             if (speed < 1e-6) speed = 1e-6;
-            api_push_trajectory(batch_ctrl[idx], speed, DEFAULT_ACC, DEFAULT_DEC);
+            api_push_trajectory_passthrough(batch_ctrl[idx], speed,
+                                             DEFAULT_ACC, DEFAULT_DEC);
         }
         return;
     }
@@ -338,11 +371,13 @@ static void bspline_process_batch_from(int start, int count)
         return;
     }
 
-    // ---- 重离散化 ----
-    int num_seg = (int)ceil(total_arc / g_bspline_config.step_size_mm);
-    if (num_seg < 1) num_seg = 1;
-
-    // 计算整批的总 G93 时间预算
+    // ---- 绝对比例等距采样 (Absolute Equidistant Resampling) ----
+    // 废除 t += dt 试探法 (overshoot discard 引起微米级步长方差)。
+    // 改为对弧长做严格 N 等分,每个采样点的累计弧长 = i/N × total_arc。
+    // 相邻输出点之间的弧长必然精确等于 total_arc/num_seg,
+    // 仅受 arc_length_to_t 的 LUT 插值精度约束 (O(1/SAMPLES²) 量级)。
+    //
+    // 计算整批的总 G93 时间预算 + 平均速度
     double total_g93_time = 0.0;
     double avg_speed = 0.0;
     for (int i = 0; i < count; i++) {
@@ -351,60 +386,97 @@ static void bspline_process_batch_from(int start, int count)
     }
     avg_speed /= (double)count;
 
-    double prev_pos[AXIS_NUM];
-    memcpy(prev_pos, batch_ctrl[start], sizeof(double) * AXIS_NUM);
+    // G93 模式下,整批匀速 = total_arc / total_g93_time (恒定)
+    double g93_avg_speed = (total_g93_time > 1e-9)
+                            ? total_arc / total_g93_time : 0.0;
 
+    // ---- 等分数计算 + 严格段弧长 ----
+    double step = g_bspline_config.step_size_mm;
+    if (step < 1e-6) step = 1e-6;  // 防除零
+    // 固定步长采样 (Fixed-Step Resampling): seg_arc = step 对大多数段,
+    // 末段吸收余数 (total_arc - full_steps*step)。
+    // 替代原 ceil() 方案: ceil 对小弧长子批 (尖角切分残余) 会产生 num_seg=1 + 极小 seg_arc,
+    // 跨批次 CV 高达 0.58。改 floor 后,绝大多数段严格等于 step,跨批次 CV 显著降低。
+    int full_steps = (int)floor(total_arc / step);
+    if (full_steps < 0) full_steps = 0;
+    int num_seg = full_steps + 1;  // 末段总是存在 (吸收余数或等于 step)
+    double last_seg_arc = total_arc - (double)full_steps * step;
+
+    int seg_out = 0;
     for (int i = 1; i <= num_seg; i++) {
-        double target_arc = (double)i / (double)num_seg * total_arc;
-        double t = arc_length_to_t(target_arc, arc_lut, arc_lut_count);
-
-        double curr_pos[AXIS_NUM];
-        // 末段强制对齐终点
-        if (i == num_seg) {
-            memcpy(curr_pos, batch_ctrl[start + count - 1], sizeof(double) * AXIS_NUM);
+        double target_arc;
+        double current_seg_arc;
+        if (i < num_seg) {
+            // 整数倍步长段: target_arc = i * step,seg_arc = step
+            target_arc = (double)i * step;
+            current_seg_arc = step;
         } else {
-            de_boor_evaluate(n, BSPLINE_DEGREE, batch_knots,
-                            &batch_ctrl[start], t, curr_pos);
+            // 末段: 吸收余数,对齐 total_arc (消除浮点累积误差)
+            target_arc = total_arc;
+            current_seg_arc = last_seg_arc;
         }
+        int is_end_point = (i == num_seg);
 
-        // NaN 防护
+        // LUT 反查: target_arc -> t
+        double t = arc_length_to_t(target_arc, arc_lut, arc_lut_count);
+        double curr_pos[AXIS_NUM];
+        de_boor_evaluate(n, BSPLINE_DEGREE, batch_knots,
+                        &batch_ctrl[start], t, curr_pos);
+
+        // NaN/Inf 防护: 退化点跳过 (极罕见,LUT 边界处可能)
         int nan_detected = 0;
         for (int j = 0; j < AXIS_NUM; j++) {
             if (isnan(curr_pos[j]) || isinf(curr_pos[j])) {
-                nan_detected = 1;
-                break;
+                nan_detected = 1; break;
             }
         }
-        if (nan_detected) {
-            memcpy(curr_pos, prev_pos, sizeof(double) * AXIS_NUM);
-            continue;
+        if (nan_detected) continue;
+
+        // 终点对齐: 最后一段强制 curr_pos = 最后控制点,消除 LUT 插值残留
+        if (is_end_point) {
+            memcpy(curr_pos, batch_ctrl[start + count - 1],
+                   sizeof(double) * AXIS_NUM);
         }
 
-        // 计算本段物理距离
-        double seg_dist = compute_equivalent_dist(prev_pos, curr_pos);
-        if (seg_dist < 1e-9) continue;
+        // @Context: Non-RealTime Background Thread (bspline_thread_func)
+        // @Stage: STAGE_BSPLINE —— 3 阶 B 样条等距重采样输出点
+        // curr_pos 已通过 NaN 防护 + 终点对齐,是最终的等距重采样形态。
+        // v_target 取本批次恒定速度 (G93=整批匀速, G94=avg_speed),
+        // 与下方 seg_speed 同源, /1000.0 转换为 mm/ms 与 RT 探针对齐。
+        {
+            double bspline_v = (total_g93_time > 1e-9) ? g93_avg_speed : avg_speed;
+            if (bspline_v < 1e-6) bspline_v = 1e-6;
+            TraceLogger_PushPipeline(STAGE_BSPLINE, curr_pos, bspline_v / 1000.0);
+        }
 
-        // 速度分配
+        // 入队 (整段步长 = step,末段 = last_seg_arc,速度恒定)
         double seg_speed;
+        int push_ret;
         if (total_g93_time > 1e-9) {
-            // G93 模式: 保持总时间预算
-            seg_speed = seg_dist / total_g93_time * (double)num_seg;
+            // G93: 段速度 = 整批匀速,段时长按本段弧长比例分配
+            // (current_seg_arc: 整段=step,末段=last_seg_arc)
+            seg_speed = g93_avg_speed;
+            if (seg_speed < 1e-6) seg_speed = 1e-6;
+            double dt_this = current_seg_arc / total_arc * total_g93_time;
+            push_ret = api_push_trajectory_g93(curr_pos, seg_speed,
+                                                DEFAULT_ACC, DEFAULT_DEC, dt_this);
         } else {
-            // G94 模式: 使用批次平均速度
+            // G94 模式: B-样条已输出严格等距平滑段,必须透传(is_fillet=1),
+            // 否则 Planner 的 G64 拐角抹圆会对 B-样条段做二次篡改,破坏等距性。
             seg_speed = avg_speed;
+            if (seg_speed < 1e-6) seg_speed = 1e-6;
+            push_ret = api_push_trajectory_passthrough(curr_pos, seg_speed,
+                                                        DEFAULT_ACC, DEFAULT_DEC);
         }
-        if (seg_speed < 1e-6) seg_speed = 1e-6;
-
-        if (api_push_trajectory(curr_pos, seg_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) {
+        if (push_ret < 0) {
             printf("[BSpline] 入队失败 (报警)，中止本批次\n");
             return;
         }
-
-        memcpy(prev_pos, curr_pos, sizeof(double) * AXIS_NUM);
+        seg_out++;
     }
 
-    printf("[BSpline] 批次完成: %d 点 -> %d 段 (弧长 %.2f mm)\n",
-           count, num_seg, total_arc);
+    printf("[BSpline] 批次完成: %d 点 -> %d 段 (弧长 %.2f mm, 步长 %.4f mm, 末段 %.4f mm)\n",
+           count, seg_out, total_arc, step, last_seg_arc);
 }
 
 // ================== 3 阶 B 样条数学引擎 ==================
@@ -566,6 +638,11 @@ static double arc_length_to_t(double target_arc, const ArcLutEntry_t *lut, int l
 // 判断三个连续点构成的拐角是否为尖角 (偏转角 > threshold_rad)。
 // prev, corner, next: 三个连续点的机械绝对坐标。
 // 返回 1=尖角, 0=平滑过渡。
+//
+// 数学等价优化: 抛弃 acos (在 cos_angle → ±1 处数值不稳定)。
+// 由于 cos 在 [0, π] 单调递减:
+//   angle > threshold_rad  <=>  cos(angle) < cos(threshold_rad)
+// 因此直接比较 cos_angle < cos_thresh 即可,一次乘法比 acos 更快更稳。
 static int is_sharp_corner(double prev[AXIS_NUM], double corner[AXIS_NUM],
                              double next[AXIS_NUM], double threshold_rad)
 {
@@ -586,7 +663,13 @@ static int is_sharp_corner(double prev[AXIS_NUM], double corner[AXIS_NUM],
 
     double len1 = sqrt(len1_sq);
     double len2 = sqrt(len2_sq);
-    if (len1 < 1e-9 || len2 < 1e-9) return 0;
+    // 动态信噪比 (SNR) 屏蔽: 以平滑步长的 15% 作为噪声底噪阈值。
+    // 仅当【两个向量同时】短于底噪时才视为 CAM 量化噪声 (低通吸收)。
+    // 若只有一个短 (如 flush 残余批次的边缘短向量),仍尝试检测尖角 ——
+    // 因为真实尖角通常至少有一侧是正常长度的向量。
+    // 早期 OR 逻辑会漏判 45° 拐角 (一侧短向量触发整角屏蔽),改 AND 修复。
+    double noise_floor = g_bspline_config.step_size_mm * 0.15;
+    if (len1 < noise_floor && len2 < noise_floor) return 0;
 
     double cos_angle = 0.0;
     for (int i = 0; i < AXIS_NUM; i++) {
@@ -595,9 +678,9 @@ static int is_sharp_corner(double prev[AXIS_NUM], double corner[AXIS_NUM],
     if (cos_angle > 1.0)  cos_angle = 1.0;
     if (cos_angle < -1.0) cos_angle = -1.0;
 
-    // 方向向量夹角即为偏转角
-    double angle = acos(cos_angle);
-    return (angle > threshold_rad) ? 1 : 0;
+    // 暴力截断: cos_thresh 预计算,直接比较,绕过 acos
+    double cos_thresh = cos(threshold_rad);
+    return (cos_angle < cos_thresh) ? 1 : 0;
 }
 
 // ================== 工具函数 ==================

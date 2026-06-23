@@ -5,6 +5,7 @@
 #include <ctype.h>
 #include "global_def.h"
 #include "axis_ctrl.h"
+#include "kinematics.h"
 #include "smc_api.h"
 
 // ============================================================================
@@ -80,11 +81,11 @@ int main(int argc, char *argv[])
     // ==========================================
     // 2. 硬件拓扑配置（字母化 API，底层自动分配房间号）
     // ==========================================
-    SMC_ConfigAxisTopology("X轴", 0, 5, 0);
-    SMC_ConfigAxisTopology("Y轴", 1, 3, 4); // Y轴双驱 (主站3, 从站4)
-    SMC_ConfigAxisTopology("Z轴", 0, 6, 0);
-    SMC_ConfigAxisTopology("C轴", 0, 1, 0);
-    SMC_ConfigAxisTopology("B轴", 0, 2, 0);
+    SMC_ConfigAxisTopology("X", 0, 5, 0);
+    SMC_ConfigAxisTopology("Y", 1, 3, 4); // Y轴双驱 (主站3, 从站4)
+    SMC_ConfigAxisTopology("Z", 0, 6, 0);
+    SMC_ConfigAxisTopology("C", 0, 1, 0);
+    SMC_ConfigAxisTopology("B", 0, 2, 0);
 
     // ==========================================
     // 3. 脉冲当量配置 (1 单位对应多少个脉冲)
@@ -128,7 +129,7 @@ int main(int argc, char *argv[])
     // ==========================================
     SMC_ConfigPlannerParams(0.05, 500.0);
     SMC_ConfigGantrySyncAlarm('Y', 1, 1000, 8000, 100); // Y 轴龙门同步防撕裂
-    SMC_ConfigSoftLimit('Z', 1, -500.0, 15.0);          // Z 轴防撞软限位
+    SMC_ConfigSoftLimit('Z', 1, -500.0, 200.0);          // Z 轴防撞软限位 (放宽以适应RTCP逆解)
 
     // ==========================================
     // 6. 启动 EtherCAT 内核

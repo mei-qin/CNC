@@ -334,7 +334,12 @@ double SMC_GetLogicalPos(char axis_letter) {
 int SMC_IsParserRunning() { return g_parser_ctrl.is_running; }
 int SMC_IsMotionDone() { return is_trajectory_finished(); }
 int SMC_GetQueueCount() {
-    return (g_cmd_queue.head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
+    // 非实时调用方 (UI / 上层管理线程): acquire 读两侧游标,
+    // 与生产者 release 写 write_head、RT 消费者 release 写 read_tail 配对,
+    // 返回一致性的队列长度快照。
+    int h = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_acquire);
+    int t = atomic_load_explicit(&g_cmd_queue.read_tail,  memory_order_acquire);
+    return (h - t + QUEUE_SIZE) % QUEUE_SIZE;
 }
 
 // @Thread-Safety: 只读 g_axis_map[]，初始化后不变

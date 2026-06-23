@@ -50,6 +50,25 @@ void api_sync_planner_cursor();
 double api_get_cursor(int axis_idx);
 int is_trajectory_finished();
 int  api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
+// @Context: Non-RealTime Background Thread (parser / bspline)
+// @Thread-Safety: Lock-Free SPSC 队列,write_head 由生产者串行独占写入
+// G93 强一致性入队: 豁免 max_speed/max_jerk 短板限幅,并强制纯匀速 (T4=T_total),
+// 保证 1ms 线程解析时绝对遵守 g93_dt_sec 时间预算。
+// g93_dt_sec: 本微段时间预算(秒),必须 > 0;speed 应为 phys_dist / g93_dt_sec。
+int  api_push_trajectory_g93(double target_pos[AXIS_NUM],
+                              double speed,double acc,double dec,
+                              double g93_dt_sec);
+// 免抹圆透传入队: 写入 is_fillet=1 标记,planner_fillet_preprocess 跳过本段。
+// 用于 B-Spline 引擎在锐角切批后直接透传的段,防止底层二次抹圆。
+int  api_push_trajectory_passthrough(double target_pos[AXIS_NUM],
+                                      double speed,double acc,double dec);
+// @Context: Non-RealTime Background Thread (RTCP 路径专用)
+// @Thread-Safety: queue_spinlock 互斥,与其他 push 函数共享。
+// RTCP 路径包装: 入队时设置 is_rtcp_active=1 元数据。
+//   target_pos 必须已是物理关节坐标 (Parser 已调用 apply_rtcp_to_pos)。
+//   RT 线程读取时不做逆解,直接插补物理关节空间,保持 1ms 硬实时纯粹性。
+int  api_push_trajectory_rtcp(double target_pos[AXIS_NUM],
+                               double speed,double acc,double dec);
 int  api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
 void api_push_continuous_segment(double val_x,double val_y,double val_z,double speed_sec);
 void api_flush_planner();

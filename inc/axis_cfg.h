@@ -224,6 +224,11 @@ typedef struct{
     double acc;
     double dec;
 
+    double v_current;  // 当前周期的真实物理瞬时速度 (mm/ms),由 S 曲线 7 段解析求得
+    int current_phase; // S 曲线当前 phase (1..7),跨周期缓存,以减少 if-else 链分支预测失败
+    double phase_T_curr; // 当前 phase 下边界 T_{phase-1} (phase=1 时为 0),用于 dt = t - _T_curr
+    double phase_T_next; // 当前 phase 上边界 T_phase (phase=7 时为 T7),用于前向 phase 推进判定
+
     int is_waiting_mcode;       // M代码等待屏障标志
     int32_t mcode_wait_timer;   // M代码非阻塞延时计数器（ms）
     int current_mcode;          // 当前等待中的M代码编号
@@ -244,7 +249,11 @@ typedef struct{
     int32_t speed;
 
     int cmd_type;       // CMD_TYPE_MOTION 或 CMD_TYPE_MCODE
-    int is_fillet;      // 1=拐角圆弧子段 (corner rounding 预处理跳过)
+    int is_fillet;      // 几何锁定标识(0/1)：1=圆弧子段、G93微段、B-样条透传段。标记为1时，禁止 Planner 对其进行 G64 拐角二次抹圆篡改。
+    int is_g93_strict;  // 1=G93 强一致性段: 纯匀速,planner 不得 S 曲线限幅
+    int is_rtcp_active; // 1=RTCP 路径产生段(经 Kinematics_Inverse 物理逆解);
+                        // 仅元数据: 供 Trace 日志分类与未来度量扩展,
+                        // 不参与插补决策 (target_pos 已是物理关节坐标)
     int m_code;         // M代码编号（如 3=M03, 5=M05）
     double s_value;     // S值（如主轴转速）
     double p_value;     // P参数（激光功率、宏程序参数等）
@@ -273,18 +282,53 @@ typedef struct{
 }TrajectorySegment_t;
 
 
-/* CommandQueue_t 说明:
- * - buffer: 轨迹段环形缓冲
- * - head: 下一个可读位置索引
- * - tail: 下一个可写位置索引
+/* ================================================================
+ * CommandQueue_t — Hybrid Concurrency 环形队列 (Cache-Line Isolated)
+ *
+ * 并发模型 (混合并发):
+ *   ✦ RT 线程 (ecat_thread_rt): 绝对 Lock-Free 消费者
+ *     - 仅 acquire 读 is_ready, release 写 read_tail
+ *     - 永不接触 queue_spinlock,保证 1ms 硬实时不受任何锁影响
+ *     - 优先级反转免疫: 高优先级 RT 不会被低优先级后台线程卡住
+ *
+ *   ✦ 后台线程 (Parser / BSpline / Planner / Watchdog): queue_spinlock 互斥
+ *     - 所有修改 buffer 内容 + 推进 write_head 的操作必须持锁
+ *     - 包括 fillet 的内存平移 (dst=src+K 批量 memcpy 风格拷贝)
+ *     - 生产者 push: spin-wait 获取锁,临界区极短 (µs 级)
+ *     - Planner: try-lock 避让,失败立即返回 (不阻塞生产者)
+ *     - Watchdog: spin-wait 获取锁,保证 force_flush 必然成功
+ *
+ * 设计契约 (不可打破的不变量):
+ *   1. queue_spinlock 持有期间: write_head 不会变化 (其他后台写者全部阻塞)
+ *   2. RT 线程消费侧: is_ready=1 (release) → is_ready==1 (acquire)
+ *      建立 happens-before,RT 线程通过此屏障看到所有 buffer 修改
+ *   3. read_tail 单写者: 仅 RT 线程写入,其他线程只读
+ *
+ * Happens-before 链 (生产者数据 → RT 可见):
+ *   producer write buffer[N] (relaxed)
+ *     → producer release queue_spinlock
+ *     → planner acquire queue_spinlock
+ *     → planner write is_ready=1 (release)
+ *     → RT acquire is_ready
+ *     → RT read buffer[N]
+ *   由 C11 传递性,所有 relaxed 写都被正确发布。
+ *
+ * Cache-Line 隔离 (_Alignas(64)):
+ *   消除 write_head / read_tail / queue_spinlock 之间的 False-Sharing。
+ * ================================================================
  */
-
-typedef struct{
+typedef struct {
     TrajectorySegment_t buffer[QUEUE_SIZE];
-    volatile int head;
-    volatile int tail;
-    
-}CommandQueue_t;
+
+    /* 生产者 (Parser / BSpline) 独占写入 —— 自身 cache line */
+    _Alignas(64) _Atomic int write_head;
+
+    /* 消费者 (RT 线程) 独占写入 —— 自身 cache line */
+    _Alignas(64) _Atomic int read_tail;
+
+    /* 后台线程互斥锁 (producer/planner/watchdog 共用) —— 自身 cache line */
+    _Alignas(64) atomic_flag queue_spinlock;
+} CommandQueue_t;
 
 typedef enum{
 

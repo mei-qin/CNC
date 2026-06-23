@@ -1,6 +1,7 @@
 #include "cutter_comp.h"
 #include "gcode_parser.h"
 #include "global_def.h"
+#include "trace_logger.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -86,6 +87,24 @@ static int line_intersect(double x1, double y1, double dx1, double dy1,
     return 0;
 }
 
+// ================== 刀补输出 helper (探针埋点 + 回调转发) ==================
+//
+// @Context: Non-RealTime Background Thread (parser)
+// @Stage: STAGE_CUTTER_COMP —— 刀补引擎输出的偏置后坐标
+//
+// 所有"生成了新的偏置坐标并准备调用 g_comp.output_fn"的代码路径统一走本函数:
+//   1. 先记录 STAGE_CUTTER_COMP 探针 (pos 即偏置后机械绝对坐标)
+//   2. 再转发到 output_fn (下发到 B-Spline 或 Planner)
+// 这样 process_corner / flush_last_segment 中的 10+ 个 output_fn 调用点
+// 自动获得统一的管线探针埋点,不会漏掉任何偏置输出。
+// speed 单位: 调用方传 mm/s,trace 字段 v_target 期望 mm/ms,做 /1000.0 换算。
+static int cutter_emit(const double pos[AXIS_NUM], double speed,
+                       double acc, double dec)
+{
+    TraceLogger_PushPipeline(STAGE_CUTTER_COMP, pos, speed / 1000.0);
+    return g_comp.output_fn(pos, speed, acc, dec);
+}
+
 // ================== 核心：拐角分类与轨迹重构 ==================
 
 // @Context: Non-RealTime Background Thread (parser 调用)
@@ -153,12 +172,12 @@ static int process_corner(double prev[AXIS_NUM], double curr[AXIS_NUM],
     // 先输出编程轨迹点 prev (从上一个未补偿位置平滑过渡),
     // 再输出偏置起点, 形成垂直切入偏置线。
     if(g_comp.first_seg_pending) {
-        g_comp.output_fn(prev, speed, acc, dec);
+        cutter_emit(prev, speed, acc, dec);
         double start[AXIS_NUM];
         memcpy(start, prev, sizeof(double) * AXIS_NUM);
         start[ax1] += R * nAx;
         start[ax2] += R * nAy;
-        g_comp.output_fn(start, speed, acc, dec);
+        cutter_emit(start, speed, acc, dec);
         g_comp.first_seg_pending = 0;
     }
 
@@ -168,7 +187,7 @@ static int process_corner(double prev[AXIS_NUM], double curr[AXIS_NUM],
         memcpy(pt, curr, sizeof(double) * AXIS_NUM);
         pt[ax1] += R * nAx;
         pt[ax2] += R * nAy;
-        g_comp.output_fn(pt, speed, acc, dec);
+        cutter_emit(pt, speed, acc, dec);
         return 0;
     }
 
@@ -208,7 +227,7 @@ static int process_corner(double prev[AXIS_NUM], double curr[AXIS_NUM],
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
             pt[ax1] = ix;
             pt[ax2] = iy;
-            g_comp.output_fn(pt, speed, acc, dec);
+            cutter_emit(pt, speed, acc, dec);
         }
 
     } else {
@@ -232,7 +251,7 @@ static int process_corner(double prev[AXIS_NUM], double curr[AXIS_NUM],
         memcpy(ptA, curr, sizeof(double) * AXIS_NUM);
         ptA[ax1] = footAx;
         ptA[ax2] = footAy;
-        g_comp.output_fn(ptA, speed, acc, dec);
+        cutter_emit(ptA, speed, acc, dec);
 
         // ② 生成过渡圆弧微段
         double start_angle = atan2(footAy - curr[ax2], footAx - curr[ax1]);
@@ -263,7 +282,7 @@ static int process_corner(double prev[AXIS_NUM], double curr[AXIS_NUM],
                 pt[ax1] = curr[ax1] + R * cos(theta);
                 pt[ax2] = curr[ax2] + R * sin(theta);
             }
-            g_comp.output_fn(pt, speed, acc, dec);
+            cutter_emit(pt, speed, acc, dec);
         }
     }
 
@@ -307,13 +326,13 @@ static void flush_last_segment(void)
     // 如果首段尚未输出 (只推了 2 个点就 Disable)，输出过渡 + 偏置起点
     if(g_comp.first_seg_pending) {
         // 先输出编程轨迹点 (确保从上一个未补偿位置平滑过渡)
-        g_comp.output_fn(prev, speed, acc, dec);
+        cutter_emit(prev, speed, acc, dec);
         // 垂直切入偏置线
         double start[AXIS_NUM];
         memcpy(start, prev, sizeof(double) * AXIS_NUM);
         start[ax1] += R * nx;
         start[ax2] += R * ny;
-        g_comp.output_fn(start, speed, acc, dec);
+        cutter_emit(start, speed, acc, dec);
         g_comp.first_seg_pending = 0;
     }
 
@@ -322,7 +341,7 @@ static void flush_last_segment(void)
     memcpy(end, curr, sizeof(double) * AXIS_NUM);
     end[ax1] += R * nx;
     end[ax2] += R * ny;
-    g_comp.output_fn(end, speed, acc, dec);
+    cutter_emit(end, speed, acc, dec);
 
     // 回退点: 从偏置终点垂直返回到编程轨迹
     // 距离恰好为 R，确保后续无补偿指令从正确的编程位置开始。
@@ -332,7 +351,7 @@ static void flush_last_segment(void)
     double ret_dx = ret[ax1] - end[ax1];
     double ret_dy = ret[ax2] - end[ax2];
     if(hypot(ret_dx, ret_dy) > COMP_ZERO_LEN_TOL) {
-        g_comp.output_fn(ret, speed, acc, dec);
+        cutter_emit(ret, speed, acc, dec);
     }
 }
 

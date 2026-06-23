@@ -16,7 +16,6 @@ CommandQueue_t g_cmd_queue={0};
 static double plan_cursor[AXIS_NUM]={0};
 CoordManager_t g_coord_mgr={COORD_G54,{0},{0},{0}};
 PlannerConfig_t g_planner_config={0.05, 500.0};
-pthread_mutex_t planner_mutex;
 /************************ 五轴系统初始化（核心配置，修改此函数即可调整轴参数） ************************/
 static int check_soft_limits(double target_pos[AXIS_NUM]){
     for(int i=0;i<AXIS_NUM;i++){
@@ -110,10 +109,75 @@ void api_move_relative(int axis_idx,double distance,double speed){
 }
 
 
+// 前向声明: 静态实现函数,所有公开包装器均调用此函数。
+static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
+                                     double speed_sec_mm, double acc_sec_mm,
+                                     double dec_sec_mm, int is_g93_strict,
+                                     double g93_dt_sec, int is_fillet,
+                                     int is_rtcp_active);
+
 // @Context: Non-RealTime Background Thread (parser / 上层管理线程)
-// @Thread-Safety: planner_mutex 保护队列 head 读写临界区
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// 常规入队包装: 走完整的短板效应限幅路径。
 int api_push_trajectory(double target_pos[AXIS_NUM],
                          double speed_sec_mm, double acc_sec_mm, double dec_sec_mm)
+{
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 0);
+}
+
+// @Context: Non-RealTime Background Thread (parser / bspline)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// G93 强一致性入队包装: 豁免短板限幅,预计算纯匀速,刚性守恒时间。
+// 同时锁死几何拓扑 (is_fillet=1),禁止 Planner 对 G93 微段做 G64 拐角抹圆篡改。
+int api_push_trajectory_g93(double target_pos[AXIS_NUM],
+                             double speed_sec_mm, double acc_sec_mm,
+                             double dec_sec_mm, double g93_dt_sec)
+{
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0);
+}
+
+// @Context: Non-RealTime Background Thread (bspline)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// 免抹圆透传包装: is_fillet=1,planner_fillet_preprocess 跳过本段。
+int api_push_trajectory_passthrough(double target_pos[AXIS_NUM],
+                                     double speed_sec_mm, double acc_sec_mm,
+                                     double dec_sec_mm)
+{
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 1, 0);
+}
+
+// @Context: Non-RealTime Background Thread (RTCP 路径专用)
+// @Thread-Safety: queue_spinlock 互斥,与其他 push 函数共享。
+// RTCP 包装器: 入队时设置 is_rtcp_active=1 元数据。
+// 调用契约: target_pos 必须已是物理关节坐标 (apply_rtcp_to_pos 处理过)。
+//   RT 线程消费时不做逆解,继续物理关节空间 S 曲线插补,保持 1ms 硬实时纯粹性。
+int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],
+                              double speed_sec_mm, double acc_sec_mm,
+                              double dec_sec_mm)
+{
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 1);
+}
+
+// @Context: Non-RealTime Background Thread (parser / 上层管理线程)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// is_g93_strict=0: 常规路径,执行完整的短板效应限幅。
+// is_g93_strict=1: G93 强一致性路径,豁免 max_speed/max_acc/max_dec/max_jerk
+//                  短板限幅,并在 mutex 内预计算纯匀速 (T4=T_total),
+//                  保证 1ms 线程解析时绝对遵守 g93_dt_sec 时间预算。
+//                  调用者必须已按 phys_dist / g93_dt_sec 精确推算 speed_sec_mm。
+// g93_dt_sec: G93 微段时间预算(秒),仅 is_g93_strict=1 时生效,否则忽略。
+// is_fillet:    1=标记为免抹圆段,planner_fillet_preprocess 跳过本段。
+// is_rtcp_active: 1=RTCP 路径产生的段 (target_pos 已是物理关节坐标),
+//                 仅元数据,不参与插补决策。
+static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
+                                     double speed_sec_mm, double acc_sec_mm,
+                                     double dec_sec_mm,
+                                     int is_g93_strict, double g93_dt_sec,
+                                     int is_fillet, int is_rtcp_active)
 {
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
         printf("[SAFETY] 系统报警中，拒绝入队运动指令！\n");
@@ -171,51 +235,55 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     }
 
     // ---- 第四步：短板效应限幅（纯配置量运算，无需 mutex）----
+    // G93 强一致性模式: 完全豁免,保证刚性时间。
+    // 常规模式: 按各轴 max_* 配置等比例压低,避免单轴超载。
     double final_speed_ratio = 1.0;
     double final_acc_ratio   = 1.0;
     double final_dec_ratio   = 1.0;
     double final_jerk_ratio  = 1.0;
 
-    for(int i = 0; i < AXIS_NUM; i++){
-        if(fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
+    if(!is_g93_strict){
+        for(int i = 0; i < AXIS_NUM; i++){
+            if(fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
 
-        double axis_ratio_mm = fabs(delta_mm[i]) / dist;
+            double axis_ratio_mm = fabs(delta_mm[i]) / dist;
 
-        double req_v_mm = speed_sec_mm * axis_ratio_mm;
-        double req_a_mm = acc_sec_mm   * axis_ratio_mm;
-        double req_d_mm = dec_sec_mm   * axis_ratio_mm;
-        double req_j_mm = DEFAULT_JERK * axis_ratio_mm;
+            double req_v_mm = speed_sec_mm * axis_ratio_mm;
+            double req_a_mm = acc_sec_mm   * axis_ratio_mm;
+            double req_d_mm = dec_sec_mm   * axis_ratio_mm;
+            double req_j_mm = DEFAULT_JERK * axis_ratio_mm;
 
-        double req_v, req_a, req_d, req_j;
-        if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
-            double safe_r = fmax(g_axis[i].equivalent_radius, 1e-4);
-            double conv = DEG_TO_RAD * safe_r;
-            req_v = req_v_mm / conv;
-            req_a = req_a_mm / conv;
-            req_d = req_d_mm / conv;
-            req_j = req_j_mm / conv;
-        } else {
-            req_v = req_v_mm;
-            req_a = req_a_mm;
-            req_d = req_d_mm;
-            req_j = req_j_mm;
-        }
+            double req_v, req_a, req_d, req_j;
+            if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
+                double safe_r = fmax(g_axis[i].equivalent_radius, 1e-4);
+                double conv = DEG_TO_RAD * safe_r;
+                req_v = req_v_mm / conv;
+                req_a = req_a_mm / conv;
+                req_d = req_d_mm / conv;
+                req_j = req_j_mm / conv;
+            } else {
+                req_v = req_v_mm;
+                req_a = req_a_mm;
+                req_d = req_d_mm;
+                req_j = req_j_mm;
+            }
 
-        if(g_axis[i].max_speed > 0.0 && req_v > g_axis[i].max_speed){
-            double r = g_axis[i].max_speed / req_v;
-            if(r < final_speed_ratio) final_speed_ratio = r;
-        }
-        if(g_axis[i].max_acc > 0.0 && req_a > g_axis[i].max_acc){
-            double r = g_axis[i].max_acc / req_a;
-            if(r < final_acc_ratio) final_acc_ratio = r;
-        }
-        if(g_axis[i].max_dec > 0.0 && req_d > g_axis[i].max_dec){
-            double r = g_axis[i].max_dec / req_d;
-            if(r < final_dec_ratio) final_dec_ratio = r;
-        }
-        if(g_axis[i].max_jerk > 0.0 && req_j > g_axis[i].max_jerk){
-            double r = g_axis[i].max_jerk / req_j;
-            if(r < final_jerk_ratio) final_jerk_ratio = r;
+            if(g_axis[i].max_speed > 0.0 && req_v > g_axis[i].max_speed){
+                double r = g_axis[i].max_speed / req_v;
+                if(r < final_speed_ratio) final_speed_ratio = r;
+            }
+            if(g_axis[i].max_acc > 0.0 && req_a > g_axis[i].max_acc){
+                double r = g_axis[i].max_acc / req_a;
+                if(r < final_acc_ratio) final_acc_ratio = r;
+            }
+            if(g_axis[i].max_dec > 0.0 && req_d > g_axis[i].max_dec){
+                double r = g_axis[i].max_dec / req_d;
+                if(r < final_dec_ratio) final_dec_ratio = r;
+            }
+            if(g_axis[i].max_jerk > 0.0 && req_j > g_axis[i].max_jerk){
+                double r = g_axis[i].max_jerk / req_j;
+                if(r < final_jerk_ratio) final_jerk_ratio = r;
+            }
         }
     }
 
@@ -229,23 +297,43 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     if(dec_sec_mm < 1e-6)   dec_sec_mm   = 1e-6;
     if(jerk_sec_mm < 1e-6)  jerk_sec_mm  = 1e-6;
 
-    // === 队列临界区：planner_mutex 保护 head 读写 ===
-    // 防止 planner_fillet_preprocess 在后台修改 head 导致竞态覆写
-    pthread_mutex_lock(&planner_mutex);
+    // === queue_spinlock 保护的入队临界区 ===
+    // 后台线程互斥: parser/bspline/planner/watchdog 通过 queue_spinlock 串行化。
+    // RT 线程【不取此锁】,仍保持 lock-free 消费 (优先级反转免疫)。
+    //
+    // 持锁/释放节奏:
+    //   - 队列有空槽: 一次持锁完成 buffer 写入 + write_head 推进 (µs 级)
+    //   - 队列满: 必须释放锁后再 sleep,否则会阻塞其他后台线程 (含 watchdog 兜底)
+    int head, next_head;
+    while (1) {
+        // 自旋获取 spinlock (acquire): 与上一任持锁者 release 配对,看到所有 buffer 修改
+        while (atomic_flag_test_and_set_explicit(&g_cmd_queue.queue_spinlock,
+                                                 memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+            __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        }
+        // 持锁后: read_tail 可见性由 spinlock acquire 保证,用 relaxed 读即可
+        int tail = atomic_load_explicit(&g_cmd_queue.read_tail, memory_order_relaxed);
+        head = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_relaxed);
+        next_head = (head + 1) % QUEUE_SIZE;
+        if (next_head != tail) break;  // 有空槽,持锁继续
 
-    int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
-    while (next_head == g_cmd_queue.tail) {
-        pthread_mutex_unlock(&planner_mutex);
+        // 队列满: 释放锁,sleep 1ms 让 RT 消费推进 read_tail
+        atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
         if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
         osal_usleep(1000);
-        pthread_mutex_lock(&planner_mutex);
-        next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     }
 
-    TrajectorySegment_t *seg = &g_cmd_queue.buffer[g_cmd_queue.head];
-    seg->is_ready = 0;
+    // 写入 buffer[head]: relaxed 即可,可见性由 spinlock release + is_ready release 双重保证。
+    TrajectorySegment_t *seg = &g_cmd_queue.buffer[head];
+    atomic_store_explicit(&seg->is_ready, 0, memory_order_relaxed);
     seg->cmd_type = CMD_TYPE_MOTION;
-    seg->is_fillet = 0;
+    seg->is_fillet = is_fillet ? 1 : 0;
+    seg->is_g93_strict = (is_g93_strict && g93_dt_sec > 1e-9) ? 1 : 0;
+    seg->is_rtcp_active = is_rtcp_active ? 1 : 0;
     seg->m_code = 0;
     seg->s_value = 0.0;
     seg->total_distance = dist;
@@ -255,10 +343,10 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
         seg->dir_vec[i] = dir_vec[i];
     }
 
-    seg->v_target = speed_sec_mm / 1000.0;
-    seg->acc = acc_sec_mm / 1000000.0;
+    seg->v_target = speed_sec_mm / 1000.0;  // mm/s → mm/ms
+    seg->acc = acc_sec_mm / 1000000.0;       // mm/s^2 → mm/ms^2
     seg->dec = dec_sec_mm / 1000000.0;
-    seg->jerk = jerk_sec_mm / 1.0e9;
+    seg->jerk = jerk_sec_mm / 1.0e9;          // mm/s^3 → mm/ms^3
     seg->v_start = 0.0;
     seg->v_end = 0.0;
     seg->v_max = seg->v_target;
@@ -271,25 +359,56 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     seg->s0=0; seg->s1=0; seg->s2=0; seg->s3=0;
     seg->s4=0; seg->s5=0; seg->s6=0;
     seg->j1=0; seg->a2=0; seg->j3=0;
+
+    // ---- G93 强一致性预计算: 纯匀速 (T4=T_total, 加减速阶段全部为 0) ----
+    // 让 1ms 线程的绝对解析方程直接以恒定 v_target 走完整个 T_total,
+    // 不再受 planner 的 S 曲线限幅影响,绝对遵守 g93_dt_sec 时间预算。
+    // recompute_scurve_profile 检测到 is_g93_strict 后会跳过重算。
+    if(seg->is_g93_strict){
+        double T_total_ms = g93_dt_sec * 1000.0;
+        double v_const = (T_total_ms > 1e-9) ? dist / T_total_ms : seg->v_target;
+        if(v_const < 1e-9) v_const = 1e-9;
+
+        seg->T_total = T_total_ms;
+        seg->T1 = 0.0; seg->T2 = 0.0; seg->T3 = 0.0;
+        seg->T4 = T_total_ms;
+        seg->T5 = T_total_ms; seg->T6 = T_total_ms; seg->T7 = T_total_ms;
+
+        seg->v_target = v_const;
+        seg->v_start  = v_const;
+        seg->v_end    = v_const;
+        seg->v_max    = v_const;
+        seg->v0 = v_const; seg->v1 = v_const; seg->v2 = v_const; seg->v3 = v_const;
+        seg->v4 = v_const; seg->v5 = v_const; seg->v6 = v_const;
+
+        seg->s0 = 0.0; seg->s1 = 0.0; seg->s2 = 0.0; seg->s3 = 0.0;
+        seg->s4 = dist; seg->s5 = dist; seg->s6 = dist;
+
+        seg->j1 = 0.0; seg->a2 = 0.0; seg->j3 = 0.0;
+        seg->j5 = 0.0; seg->a6 = 0.0; seg->j7 = 0.0;
+    }
     seg->j5=0; seg->a6=0; seg->j7=0;
 
     for(int i=0;i<AXIS_NUM;i++){
         plan_cursor[i]=target_pos[i];
     }
 
-    atomic_thread_fence(memory_order_release);
-    g_cmd_queue.head = next_head;
+    // relaxed 推进 write_head: 由 spinlock release 统一建立可见性。
+    atomic_store_explicit(&g_cmd_queue.write_head, next_head, memory_order_relaxed);
 
-    pthread_mutex_unlock(&planner_mutex);
+    // 释放 spinlock (release): 建立 buffer 修改的 happens-before,
+    // 下一任 acquire 持锁者 (planner/producer) 必定看到本段完整数据。
+    atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
 
-    // planner_recalculate 内部自行加锁，必须在 unlock 之后调用
+    // 触发规划: planner 内部 try-lock 同一把 spinlock,
+    // 失败立即返回 (生产者 push 不阻塞),由 watchdog 兜底。
     planner_recalculate(0);
     return 0;
 }
 
 
 // @Context: Non-RealTime Background Thread (parser / 上层管理线程)
-// @Thread-Safety: planner_mutex 保护队列 head 读写临界区
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
 int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value)
 {
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
@@ -298,18 +417,28 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     }
     if(!g_all_axis_op_ready) return -1;
 
-    pthread_mutex_lock(&planner_mutex);
+    // === queue_spinlock 保护的入队临界区 (与 api_push_trajectory_impl 同模式) ===
+    int head, next_head;
+    while (1) {
+        while (atomic_flag_test_and_set_explicit(&g_cmd_queue.queue_spinlock,
+                                                 memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+            __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+            __asm__ volatile("yield" ::: "memory");
+#endif
+        }
+        int tail = atomic_load_explicit(&g_cmd_queue.read_tail, memory_order_relaxed);
+        head = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_relaxed);
+        next_head = (head + 1) % QUEUE_SIZE;
+        if (next_head != tail) break;
 
-    int next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
-    while (next_head == g_cmd_queue.tail) {
-        pthread_mutex_unlock(&planner_mutex);
+        atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
         if (!dorun || atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) return -1;
         osal_usleep(1000);
-        pthread_mutex_lock(&planner_mutex);
-        next_head = (g_cmd_queue.head + 1) % QUEUE_SIZE;
     }
 
-    TrajectorySegment_t *seg = &g_cmd_queue.buffer[g_cmd_queue.head];
+    TrajectorySegment_t *seg = &g_cmd_queue.buffer[head];
     memset(seg, 0, sizeof(TrajectorySegment_t));
 
     seg->cmd_type      = CMD_TYPE_MCODE;
@@ -318,7 +447,8 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->p_value       = p_value;
     seg->q_value       = q_value;
     seg->r_value       = r_value;
-    seg->is_ready      = 0;
+    atomic_store_explicit(&seg->is_ready, 0, memory_order_relaxed);
+    seg->is_rtcp_active = 0;  // M 代码不属于 RTCP 运动路径
     seg->total_distance = 0.0;
     seg->v_target      = 0.0;
     seg->v_start       = 0.0;
@@ -334,10 +464,9 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->j1=0; seg->a2=0; seg->j3=0;
     seg->j5=0; seg->a6=0; seg->j7=0;
 
-    atomic_thread_fence(memory_order_release);
-    g_cmd_queue.head = next_head;
-
-    pthread_mutex_unlock(&planner_mutex);
+    // relaxed 推进 write_head: 由 spinlock release 建立可见性。
+    atomic_store_explicit(&g_cmd_queue.write_head, next_head, memory_order_relaxed);
+    atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
 
     planner_recalculate(0);
     return 0;
@@ -345,7 +474,11 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
 
 
 int is_trajectory_finished(){
-    if(g_cmd_queue.head==g_cmd_queue.tail
+    // Acquire 读两侧游标: 与生产者 release 写、消费者 release 写配对,
+    // 确保看到最新的队列状态 (避免 stale read 导致提前返回 1)。
+    int head = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_acquire);
+    int tail = atomic_load_explicit(&g_cmd_queue.read_tail, memory_order_acquire);
+    if(head==tail
        && g_interpolator.is_moving==0
        && g_interpolator.is_waiting_mcode==0){
         return 1;
@@ -354,9 +487,36 @@ int is_trajectory_finished(){
 }
 
 // @Context: Non-RealTime Background Thread (parser 文件解析结束调用)
-// @Thread-Safety: 由 planner_recalculate 内部持有 planner_mutex
+// @Thread-Safety: Spin-Wait 获取 queue_spinlock 后直接调用内部核心逻辑。
+//   区别于 planner_recalculate 的非阻塞 try-lock: 这里是 parser 生命周期
+//   的最后一道防线，必须保证 flush 成功，否则最后一段永远得不到 is_ready=1。
+// @Danger: 此处阻塞最坏约 µs 级 (持锁者的临界区为纯计算)，且 parser 线程
+//          已无后续实时性要求，允许短暂阻塞。
 void api_flush_planner(){
-    planner_recalculate(1);  // force_flush=1: 全量速度规划 + S曲线预计算 + 原子释放
+    int retries = 0;
+    // Spin-Wait: 自旋直到成功获取 queue_spinlock。
+    // 竞争者 (watchdog/BSpline) 持锁时间均在 µs 级，正常 1~3 次 PAUSE 即可拿到。
+    while (atomic_flag_test_and_set_explicit(&g_cmd_queue.queue_spinlock,
+                                             memory_order_acquire)) {
+        retries++;
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+        // 防御: 10^6 次 PAUSE ≈ 50ms @ x86 (Skylake ~140 cycles/PAUSE @ 3GHz)。
+        // 抢不到说明持锁者死锁/内核卡死/调度异常,放弃 flush 避免永久阻塞 parser。
+        // 必须留 printf 痕迹: 这是"不该发生"的异常路径,静默 return 会掩盖真实故障。
+        if (retries > 1000000) {
+            printf("[FLUSH] WARN: queue_spinlock spin-wait 超时 (~50ms),"
+                   "flush 放弃 - 持锁者可能死锁或调度异常\n");
+            return;
+        }
+    }
+    // 持锁成功，直接内联 planner_recalculate 的核心逻辑，
+    // force_flush=1 保证全部残余段 is_ready 置 1。
+    planner_recalculate_locked(1);
+    atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
 }
 
 void api_motion_pause(){
@@ -393,16 +553,19 @@ int api_alarm_reset(void){
 
 void axis_sys_init(void)
 {
-    // 0. 互斥锁初始化（必须在任何线程创建之前）
-    pthread_mutex_init(&planner_mutex, NULL);
-
-    // 1. 轴数据结构初始化
+    // 0. 轴数据结构初始化
     memset(g_axis,0,sizeof(g_axis));
     for(int i=0;i<26;i++) g_axis_map[i]=-1; // 轴映射表全部置为未映射
 
-    // 2. 插补器和命令队列初始化
+    // 1. 插补器初始化 (零填充足够,无 atomic 字段需要单独初始化)
     memset(&g_interpolator,0,sizeof(Interpolator_t));
-    memset(&g_cmd_queue,0,sizeof(CommandQueue_t));
+
+    // 2. Hybrid CommandQueue 初始化:
+    //    - buffer 由生产者在使用槽位时自行初始化,无需清零
+    //    - write_head / read_tail / queue_spinlock 必须显式原子初始化
+    atomic_store_explicit(&g_cmd_queue.write_head, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_cmd_queue.read_tail,  0, memory_order_relaxed);
+    atomic_flag_clear_explicit(&g_cmd_queue.queue_spinlock, memory_order_release);
 
 
     // 3. 规划器光标初始化

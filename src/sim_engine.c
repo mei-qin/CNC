@@ -75,8 +75,8 @@ int sim_engine_init(const char *output_path, int use_binary)
         // 记录 record_count 字段在文件中的偏移 (关闭时回填)
         g_sim_logger.header_offset = (long)offsetof(sim_file_header_t, record_count);
     } else {
-        // CSV 表头
-        fprintf(g_sim_logger.fp, "cycle,virtual_time_ms");
+        // CSV 表头 (新增 stage_id 列, 位于 cycle 与 time 之间)
+        fprintf(g_sim_logger.fp, "cycle,stage_id,virtual_time_ms");
         for (int i = 0; i < AXIS_NUM; i++)
             fprintf(g_sim_logger.fp, ",%s", g_axis[i].axis_name);
         fprintf(g_sim_logger.fp, ",v_target\n");
@@ -147,10 +147,11 @@ void *sim_flush_thread_func(void *arg)
                 L->file_record_count += written;
             } else {
                 // CSV 落盘: 逐行格式化 (较慢但可读, 用于调试)
+                // 输出列序: cycle, stage_id, virtual_time_ms, x/y/z/b/c, v_target
                 for (uint32_t j = 0; j < cnt; j++) {
                     sim_trace_record_t *r = &L->bufs[i][j];
-                    fprintf(L->fp, "%" PRIu64 ",%.3f",
-                            r->cycle, r->virtual_time_ms);
+                    fprintf(L->fp, "%" PRIu64 ",%d,%.3f",
+                            r->cycle, r->stage_id, r->virtual_time_ms);
                     for (int a = 0; a < AXIS_NUM; a++)
                         fprintf(L->fp, ",%.6f", r->pos[a]);
                     fprintf(L->fp, ",%.6f\n", r->v_target);

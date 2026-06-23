@@ -2,6 +2,8 @@
 #define BSPLINE_ENGINE_H
 
 #include "axis_cfg.h"
+#include "soem/soem.h"
+#include "osal_compat.h"
 #include <pthread.h>
 
 // ================== B-Spline 压缩平滑引擎 ==================

@@ -1,7 +1,9 @@
 #ifndef SIM_ENGINE_H
 #define SIM_ENGINE_H
 
+#include <stdio.h>
 #include "axis_cfg.h"
+#include "trace_logger.h"   // 引入 STAGE_RT_INTERPOLATOR 宏
 #include <stdatomic.h>
 #include <stdint.h>
 #include <semaphore.h>
@@ -19,13 +21,15 @@
 //   RT 线程填满 Buffer[active_idx] → 原子交换 → sem_post 唤醒落盘线程
 //   落盘线程检测 flush_pending[idx] → fwrite 整块写入 → 重置缓冲
 
-// 每条轨迹采样记录 (AXIS_NUM=5 时恰好 64 bytes, 一条 cache line)
+// 每条轨迹采样记录 (AXIS_NUM=5 时 64 bytes 起步, 已含 stage_id 列)
+// stage_id 恒为 STAGE_RT_INTERPOLATOR —— sim_engine 仅采集 1ms RT 插补物理波形
 typedef struct {
+    int      stage_id;         // 管线阶段标签 (固定 STAGE_RT_INTERPOLATOR)
     uint64_t cycle;            // RT 周期计数
     double   virtual_time_ms;  // 插补器虚拟时间 (ms)
     double   pos[AXIS_NUM];    // 各轴物理坐标 (mm / deg)
     double   v_target;         // 目标速度 (mm/ms)
-} sim_trace_record_t;          // 8 + 8 + 8*5 + 8 = 64 bytes (AXIS_NUM=5)
+} sim_trace_record_t;
 
 // 二进制文件头 (固定 512 bytes, record_count 在关闭时回填)
 #define SIM_FILE_HEADER_SIZE  512
@@ -135,6 +139,7 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
 
     // 写入记录 (纯内存操作, 零系统调用)
     sim_trace_record_t *r = &L->bufs[idx][count];
+    r->stage_id        = STAGE_RT_INTERPOLATOR;  // 标记 1ms RT 插补器物理执行阶段
     r->cycle           = cycle;
     r->virtual_time_ms = virtual_time_ms;
     for (int i = 0; i < AXIS_NUM; i++) r->pos[i] = pos[i];

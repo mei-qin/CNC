@@ -92,6 +92,123 @@ void ec_sync(int64 reftime,int64 cycletime,int64 *offsettime){
     *offsettime=(int64)((timeerror*pgain)+(integral*igain));
 }
 
+// ====================================================================
+// rt_resolve_scurve_step — 7段式 S 曲线绝对解析 (RT 内联函数)
+// @Context: 1ms Hard-RT Thread (ecat_thread_rt 内部)
+// @Danger: NO BLOCKING, NO MATH.H (sqrt/acos), NO PRINTF, NO MALLOC.
+//
+// 输入: g_interpolator.virtual_time_ms 已被调用方更新到目标时刻
+// 输出: 更新 g_interpolator.current_pos[AXIS_NUM], v_current, is_moving,
+//            current_phase, phase_T_curr, phase_T_next
+//
+// 双重优化 (与旧版逐位兼容):
+//   (a) Phase-Cached Switch: 跨周期 phase 缓存替代 7 层 if-else 链
+//   (b) 2-Double Bound Cache: 仅缓存当前 phase 下/上边界 (16B),
+//       全量 T1..T7 (56B) 仅在 phase 转换时懒构建
+//
+// 关键修复 (阶段 1-A): case 7 末态 v_now = v_end (而非硬编码 0.0),
+//   保证跨段瞬间速度连续 (v_end_A = v_start_B by planner 反向扫描)。
+// ====================================================================
+static inline void rt_resolve_scurve_step(void)
+{
+    double t = g_interpolator.virtual_time_ms;
+    double s = 0.0;
+    double v_now = 0.0;
+
+    int phase = g_interpolator.current_phase;
+    if (phase < 1) phase = 1;
+    if (phase > 7) phase = 7;
+
+    double _T_curr = g_interpolator.phase_T_curr;
+    double _T_next = g_interpolator.phase_T_next;
+
+    // Phase 状态机前向推进: t 单调递增 → phase 仅递增
+    if (t > _T_next && phase < 7) {
+        const double T_arr[8] = {0.0, g_interpolator.T1, g_interpolator.T2,
+                                 g_interpolator.T3, g_interpolator.T4,
+                                 g_interpolator.T5, g_interpolator.T6,
+                                 g_interpolator.T7};
+        do {
+            _T_curr = _T_next;
+            phase++;
+            _T_next = T_arr[phase];
+        } while (phase < 7 && t > _T_next);
+    }
+
+    g_interpolator.current_phase = phase;
+    g_interpolator.phase_T_curr = _T_curr;
+    g_interpolator.phase_T_next = _T_next;
+
+    double dt = t - _T_curr;
+
+    switch (phase) {
+        case 1:
+            s = g_interpolator.s0 + g_interpolator.v0*dt
+              + g_interpolator.j1*dt*dt*dt/6.0;
+            v_now = g_interpolator.v0 + 0.5*g_interpolator.j1*dt*dt;
+            break;
+        case 2:
+            s = g_interpolator.s1 + g_interpolator.v1*dt
+              + 0.5*g_interpolator.a2*dt*dt;
+            v_now = g_interpolator.v1 + g_interpolator.a2*dt;
+            break;
+        case 3:
+            s = g_interpolator.s2 + g_interpolator.v2*dt
+              + 0.5*g_interpolator.a2*dt*dt
+              + g_interpolator.j3*dt*dt*dt/6.0;
+            v_now = g_interpolator.v2 + g_interpolator.a2*dt
+                  + 0.5*g_interpolator.j3*dt*dt;
+            break;
+        case 4:
+            // T4 匀速段: v_current 由段加载时预置的 seg.v3,跳过 v_now 写入
+            s = g_interpolator.s3 + g_interpolator.v3*dt;
+            break;
+        case 5:
+            s = g_interpolator.s4 + g_interpolator.v4*dt
+              + g_interpolator.j5*dt*dt*dt/6.0;
+            v_now = g_interpolator.v4 + 0.5*g_interpolator.j5*dt*dt;
+            break;
+        case 6:
+            s = g_interpolator.s5 + g_interpolator.v5*dt
+              + 0.5*g_interpolator.a6*dt*dt;
+            v_now = g_interpolator.v5 + g_interpolator.a6*dt;
+            break;
+        case 7:
+        default:
+            if (t >= _T_next) {
+                // 段末态: s = total_distance, v_now = v_end (阶段 1-A 修复)
+                s = g_interpolator.total_distance;
+                v_now = g_interpolator.v_end;
+                g_interpolator.is_moving = 0;
+            } else {
+                s = g_interpolator.s6 + g_interpolator.v6*dt
+                  + 0.5*g_interpolator.a6*dt*dt
+                  + g_interpolator.j7*dt*dt*dt/6.0;
+                v_now = g_interpolator.v6 + g_interpolator.a6*dt
+                      + 0.5*g_interpolator.j7*dt*dt;
+            }
+            break;
+    }
+
+    double ratio = 0.0;
+    if (g_interpolator.total_distance > 1e-6) {
+        ratio = s / g_interpolator.total_distance;
+    }
+    if (ratio > 1.0) ratio = 1.0;
+    if (ratio < 0.0) ratio = 0.0;
+
+    for (int j = 0; j < AXIS_NUM; j++) {
+        g_interpolator.current_pos[j] = g_interpolator.start_pos[j]
+            + (g_interpolator.target_pos[j] - g_interpolator.start_pos[j]) * ratio;
+    }
+
+    // T4 phase 跳过 v_current 写入 (已预置); 其他 phase 写回 v_now
+    if (phase != 4) {
+        if (v_now < 0.0) v_now = 0.0;
+        g_interpolator.v_current = v_now;
+    }
+}
+
 /************************ 实时控制线程（核心！1ms周期，五轴同周期控制） ************************/
 OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 {
@@ -173,7 +290,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.time_scale = 1.0;
                     g_interpolator.hold_state = HOLD_NORMAL;
                     g_interpolator.alarm_reset_request = 0;
-                    g_cmd_queue.tail = g_cmd_queue.head;
+                    // Lock-Free 队列报警复位: 把 read_tail 推到 write_head,
+                    // 丢弃所有未消费段。RT 线程是 read_tail 的唯一写者,这里
+                    // release 写保证后续 ecx_send_processdata 看到的 read_tail
+                    // 已永久推进,生产者下次 acquire 读 read_tail 也会立即观察到。
+                    {
+                        int cur_head = atomic_load_explicit(&g_cmd_queue.write_head,
+                                                            memory_order_acquire);
+                        atomic_store_explicit(&g_cmd_queue.read_tail, cur_head,
+                                              memory_order_release);
+                    }
                     // 同步插补器位置到驱动器实际位置，防止故障恢复后位置偏差
                     for(int j=0;j<AXIS_NUM;j++){
                         if(g_axis[j].slave_count < 1 || g_axis[j].slave_ids[0] <= 0) continue;
@@ -189,26 +315,47 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 }
             }
 
-            // === 插补器运动控制：必须在 g_all_axis_op_ready 门控之外 ===
-            // 单轴故障时，非故障轴仍需跟踪平滑刹车轨迹。
-            // 若插补器被门控冻结，time_scale 无法递减，HOLD_BRAKING 永远不会完成。
-            if(g_interpolator.is_moving){
+            // ==== 无缝连续插补消费环 (Seamless Continuous Interpolation) ====
+            // @Context: 1ms Hard-RT Thread (EtherCAT)
+            // @Danger: NO BLOCKING, NO MATH.H, NO PRINTF, NO MALLOC.
+            //
+            // 架构原则 (阶段 2 重构):
+            //   旧版每个 1ms 周期只走一段的一部分,跨段在两个周期边界发生,
+            //   量化伪影掩盖了 S 曲线的微小不连续。
+            //   新版用 while 循环消费 ms_budget = time_scale 时间预算,
+            //   允许同一周期内跨过多段 (消除量化伪影),
+            //   实现真正的无缝连续插补环。
+            //
+            // 关键不变量:
+            //   ① ms_budget 总量 = time_scale (feedhold 控制流速)
+            //   ② 跨段瞬间: current_pos 连续 (start_pos_B = current_pos_A),
+            //                v_current 连续 (v_end_A = v_start_B by planner 反向扫描)
+            //   ③ 微段 Snap 必须扣除 ms_budget (防死循环)
+            //   ④ 迭代上限 RT_ITER_CAP = 64 (防御病态输入)
 
+            // ---- feedhold 状态机 (前移到 while 之前) ----
+            // 必须在 ms_budget 取值前递减 time_scale,否则 HOLD_BRAKING 失效。
+            // is_moving=0 时也允许执行 (resume 状态可能从静止恢复),
+            // 但 hold_state 转换只在 is_moving=1 时触发 (静止时无需 刹车/恢复)。
+            {
                 int alarm_active = atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire);
-                if(alarm_active){
-                    if(g_interpolator.hold_state != HOLD_PAUSED && g_interpolator.hold_state != HOLD_BRAKING){
-                        g_interpolator.hold_state = HOLD_BRAKING;
-                    }
-                } else {
-                    if (g_interpolator.pause_request && g_interpolator.hold_state == HOLD_NORMAL) {
-                        g_interpolator.hold_state = HOLD_BRAKING;
-                    } else if (!g_interpolator.pause_request && g_interpolator.hold_state == HOLD_PAUSED) {
-                        g_interpolator.hold_state = HOLD_RESUMING;
+                if (g_interpolator.is_moving) {
+                    if (alarm_active) {
+                        if (g_interpolator.hold_state != HOLD_PAUSED
+                            && g_interpolator.hold_state != HOLD_BRAKING) {
+                            g_interpolator.hold_state = HOLD_BRAKING;
+                        }
+                    } else {
+                        if (g_interpolator.pause_request && g_interpolator.hold_state == HOLD_NORMAL) {
+                            g_interpolator.hold_state = HOLD_BRAKING;
+                        } else if (!g_interpolator.pause_request
+                                   && g_interpolator.hold_state == HOLD_PAUSED) {
+                            g_interpolator.hold_state = HOLD_RESUMING;
+                        }
                     }
                 }
 
                 const double TIME_DEC_STEP = 0.005;
-
                 if (g_interpolator.hold_state == HOLD_BRAKING) {
                     g_interpolator.time_scale -= TIME_DEC_STEP;
                     if (g_interpolator.time_scale <= 0.0) {
@@ -222,90 +369,174 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_interpolator.hold_state = HOLD_NORMAL;
                     }
                 }
-
-                g_interpolator.virtual_time_ms+=g_interpolator.time_scale;
-
-                // ==== 7段式 S 曲线绝对解析插补 ====
-                // @Context: 1ms Hard-RT Thread (EtherCAT)
-                // @Danger: NO BLOCKING, NO MATH.H (sqrt/acos), NO PRINTF, NO MALLOC.
-                // 无状态：仅凭 virtual_time_ms 与预计算参数直接解析 s。
-                {
-                    double t = g_interpolator.virtual_time_ms;
-                    double s = 0.0;
-                    // 局部缓存，减少对结构体的重复访问
-                    double _T1=g_interpolator.T1, _T2=g_interpolator.T2;
-                    double _T3=g_interpolator.T3, _T4=g_interpolator.T4;
-                    double _T5=g_interpolator.T5, _T6=g_interpolator.T6;
-                    double _T7=g_interpolator.T7;
-
-                    if (t >= _T7) {
-                        s = g_interpolator.total_distance;
-                        g_interpolator.is_moving = 0;
-                    }
-                    else if (t <= _T1) {
-                        // T1: 加加速段  s = s0 + v0*dt + j1*dt^3/6
-                        double dt = t;
-                        s = g_interpolator.s0 + g_interpolator.v0*dt
-                          + g_interpolator.j1*dt*dt*dt/6.0;
-                    }
-                    else if (t <= _T2) {
-                        // T2: 匀加速段  s = s1 + v1*dt + 0.5*a2*dt^2
-                        double dt = t - _T1;
-                        s = g_interpolator.s1 + g_interpolator.v1*dt
-                          + 0.5*g_interpolator.a2*dt*dt;
-                    }
-                    else if (t <= _T3) {
-                        // T3: 减加速段  s = s2 + v2*dt + 0.5*a2*dt^2 + j3*dt^3/6
-                        double dt = t - _T2;
-                        s = g_interpolator.s2 + g_interpolator.v2*dt
-                          + 0.5*g_interpolator.a2*dt*dt
-                          + g_interpolator.j3*dt*dt*dt/6.0;
-                    }
-                    else if (t <= _T4) {
-                        // T4: 匀速段  s = s3 + v3*dt
-                        double dt = t - _T3;
-                        s = g_interpolator.s3 + g_interpolator.v3*dt;
-                    }
-                    else if (t <= _T5) {
-                        // T5: 加减速段  s = s4 + v4*dt + j5*dt^3/6
-                        double dt = t - _T4;
-                        s = g_interpolator.s4 + g_interpolator.v4*dt
-                          + g_interpolator.j5*dt*dt*dt/6.0;
-                    }
-                    else if (t <= _T6) {
-                        // T6: 匀减速段  s = s5 + v5*dt + 0.5*a6*dt^2
-                        double dt = t - _T5;
-                        s = g_interpolator.s5 + g_interpolator.v5*dt
-                          + 0.5*g_interpolator.a6*dt*dt;
-                    }
-                    else {
-                        // T7: 减减速段  s = s6 + v6*dt + 0.5*a6*dt^2 + j7*dt^3/6
-                        double dt = t - _T6;
-                        s = g_interpolator.s6 + g_interpolator.v6*dt
-                          + 0.5*g_interpolator.a6*dt*dt
-                          + g_interpolator.j7*dt*dt*dt/6.0;
-                    }
-
-                    double ratio = 0.0;
-                    if (g_interpolator.total_distance > 1e-6) {
-                        ratio = s / g_interpolator.total_distance;
-                    }
-                    if (ratio > 1.0) ratio = 1.0;
-                    if (ratio < 0.0) ratio = 0.0;
-
-                    for (int j = 0; j < AXIS_NUM; j++) {
-                        g_interpolator.current_pos[j] = g_interpolator.start_pos[j]
-                            + (g_interpolator.target_pos[j] - g_interpolator.start_pos[j]) * ratio;
-                    }
-                }
-
             }
 
-            // ---- 无锁轨迹探针: 每 5ms 且 is_moving 时采样 (仅真实硬件模式) ----
-            // @Context: 1ms Hard-RT Thread
-            // @Danger: TraceLogger_Push 是无锁非阻塞的, 满时静默丢弃
-            // 仿真模式下由 sim_engine 以 1ms 全量采集, 此处跳过避免冗余
-            if (!g_sim_mode && g_interpolator.is_moving && (cycle % 5 == 0)) {
+            // ---- 无缝插补消费环 ----
+            // just_loaded_seg 跨周期锁存: while 内置 1, trace 块消费清 0
+            // 必须在 while 之前声明 (C 语法: 先声明后使用)
+            static int just_loaded_seg = 0;
+            #define RT_ITER_CAP 64  // 防御: 64 段/周期 已足够覆盖最密集微段场景
+            double ms_budget = g_interpolator.time_scale;
+            int rt_iter = 0;
+
+            while (ms_budget > 1e-6 && rt_iter < RT_ITER_CAP) {
+                rt_iter++;
+
+                // (1) M 代码屏障: 冻结插补,等待 mcode_wait_timer 计时
+                if (g_interpolator.is_waiting_mcode) break;
+
+                // (2) 报警冻结: 不消费预算,等下一周期处理
+                if (atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire) != 0) break;
+
+                // (3) 加载新段 (当 is_moving=0 时尝试加载)
+                if (!g_interpolator.is_moving) {
+                    int rt_head = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_acquire);
+                    int rt_tail = atomic_load_explicit(&g_cmd_queue.read_tail, memory_order_acquire);
+
+                    if (rt_head == rt_tail) {
+                        // 队列真实枯竭 (Starvation):
+                        //   解析器仍运行 → 等待 planner 释放段,break 不归零 v_current
+                        //   解析器已停   → 彻底没指令,v_current 强制归零 (防止残留速度误导 trace)
+                        if (!g_parser_ctrl.is_running) {
+                            g_interpolator.v_current = 0.0;
+                        }
+                        break;
+                    }
+
+                    if (atomic_load_explicit(&g_cmd_queue.buffer[rt_tail].is_ready,
+                                              memory_order_acquire) != 1) {
+                        // 队列有数据但 Planner 还没算完 (Starvation)
+                        break;
+                    }
+
+                    // 拷出整段 + 推进 read_tail (release)
+                    TrajectorySegment_t seg = g_cmd_queue.buffer[rt_tail];
+                    atomic_store_explicit(&g_cmd_queue.read_tail,
+                                          (rt_tail + 1) % QUEUE_SIZE,
+                                          memory_order_release);
+
+                    // M 代码段: 进入等待屏障
+                    if (seg.cmd_type == CMD_TYPE_MCODE) {
+                        g_interpolator.is_waiting_mcode = 1;
+                        g_interpolator.mcode_wait_timer = 0;
+                        g_interpolator.current_mcode = seg.m_code;
+                        break;
+                    }
+
+                    // 运动段: 装载 S 曲线参数
+                    for (int j = 0; j < AXIS_NUM; j++) {
+                        g_interpolator.start_pos[j] = g_interpolator.current_pos[j];
+                        g_interpolator.target_pos[j] = seg.target_pos[j];
+                        g_interpolator.dir_vec[j] = seg.dir_vec[j];
+                    }
+                    g_interpolator.total_distance = seg.total_distance;
+                    g_interpolator.T1=seg.T1; g_interpolator.T2=seg.T2;
+                    g_interpolator.T3=seg.T3; g_interpolator.T4=seg.T4;
+                    g_interpolator.T5=seg.T5; g_interpolator.T6=seg.T6;
+                    g_interpolator.T7=seg.T7;
+                    g_interpolator.v0=seg.v0; g_interpolator.v1=seg.v1;
+                    g_interpolator.v2=seg.v2; g_interpolator.v3=seg.v3;
+                    g_interpolator.v4=seg.v4; g_interpolator.v5=seg.v5;
+                    g_interpolator.v6=seg.v6;
+                    g_interpolator.s0=seg.s0; g_interpolator.s1=seg.s1;
+                    g_interpolator.s2=seg.s2; g_interpolator.s3=seg.s3;
+                    g_interpolator.s4=seg.s4; g_interpolator.s5=seg.s5;
+                    g_interpolator.s6=seg.s6;
+                    g_interpolator.j1=seg.j1; g_interpolator.a2=seg.a2;
+                    g_interpolator.j3=seg.j3;
+                    g_interpolator.j5=seg.j5; g_interpolator.a6=seg.a6;
+                    g_interpolator.j7=seg.j7;
+                    g_interpolator.v_target=seg.v_target;
+                    g_interpolator.acc=seg.acc;
+                    g_interpolator.dec=seg.dec;
+                    g_interpolator.v_start=seg.v_start;
+                    g_interpolator.v_end=seg.v_end;
+                    g_interpolator.virtual_time_ms = 0.0;
+                    g_interpolator.current_phase = 1;
+                    g_interpolator.phase_T_curr = 0.0;
+                    g_interpolator.phase_T_next = seg.T1;
+
+                    if (seg.T_total > 0.5) {
+                        // 正常段: 进入插补消费
+                        g_interpolator.is_moving = 1;
+                        g_interpolator.v_current = seg.v3;  // T4 预置 (case 1 会立即覆盖)
+                    } else {
+                        // 微段 Snap (阶段 1-B 修复死循环):
+                        //   T_total ≤ 0.5ms 时无法稳定插补,直接快进到 target_pos。
+                        //   必须扣除 ms_budget = seg.T_total (按段时长),
+                        //   否则连续 Snap 微段会触发 while 死循环。
+                        //   下限 0.001ms 防御 T_total=0 病态值。
+                        for (int j = 0; j < AXIS_NUM; j++) {
+                            g_interpolator.current_pos[j] = g_interpolator.target_pos[j];
+                        }
+                        double snap_time = (seg.T_total > 0.001) ? seg.T_total : 0.001;
+                        ms_budget -= snap_time;
+                        just_loaded_seg = 1;  // 触发 trace 记录 Snap 落点
+                        // 不置 is_moving,继续 while 加载下一段
+                        continue;
+                    }
+
+                    just_loaded_seg = 1;  // 触发 trace 记录新段落点
+                }
+
+                // (4) 执行 S 曲线插补消费 (此时 is_moving=1)
+                //   两条路径:
+                //     A. ms_budget < remaining_time → 停留在本段内部,预算耗尽
+                //     B. ms_budget >= remaining_time → 本段结束,扣除预算,继续 while
+                {
+                    double remaining_time = g_interpolator.T7 - g_interpolator.virtual_time_ms;
+                    if (remaining_time < 1e-6) remaining_time = 1e-6;  // 防御 T7≈0
+
+                    if (ms_budget < remaining_time) {
+                        // 路径 A: 预算不够走完本段,停留
+                        g_interpolator.virtual_time_ms += ms_budget;
+                        rt_resolve_scurve_step();  // 解析当前 phase,更新 current_pos/v_current
+                        ms_budget = 0.0;  // 预算耗尽,while 退出
+                    } else {
+                        // 路径 B: 跨段! 本段在本周期内结束
+                        g_interpolator.virtual_time_ms = g_interpolator.T7;
+                        rt_resolve_scurve_step();  // 末态: s=total_distance, v_current=v_end
+                        ms_budget -= remaining_time;
+                        g_interpolator.is_moving = 0;  // 标记本段结束,下次 while 加载新段
+                        // while 继续 (若 ms_budget 还有,加载下一段)
+                    }
+                }
+            }  // end while
+
+            // ---- 无锁轨迹探针 + 仿真采集 (阶段 3 精简) ----
+            // @Context: 1ms Hard-RT Thread (EtherCAT)
+            // @Danger: TraceLogger_Push / sim_engine_push 均无锁非阻塞, 满时静默丢弃。
+            //
+            // 新架构 (while 消费环) 下的触发语义:
+            //   旧版 is_falling_edge 在新架构中失去意义 —— 跨段在 while 内部消化,
+            //   退出 while 后的 is_moving 状态可能是 "刚跨完段正在等下一段"
+            //   (is_moving=0 但运动未真正结束)。检测 1→0 下降沿会产生大量误触发。
+            //
+            //   新版触发条件 (二选一):
+            //   (a) is_moving == 1            —— 正常连续插补中
+            //   (b) just_loaded_seg == 1      —— while 内刚加载过段 (含 Snap 路径)
+            //
+            //   just_loaded_seg 在 while 内置 1, 此处消费后清 0。
+            //   Snap 微段 (T_total ≤ 0.5) 的 v_current 无物理意义,log_velocity 置零。
+            int current_is_moving = atomic_load_explicit(&g_interpolator.is_moving,
+                                                          memory_order_acquire);
+            int should_log_this_cycle = current_is_moving || just_loaded_seg;
+
+            // 探针速度基准: 物理瞬时速度 v_current
+            int is_snap_segment = just_loaded_seg && (g_interpolator.T7 <= 0.5);
+            double log_velocity = g_interpolator.v_current;
+            if (is_snap_segment || (!current_is_moving && !just_loaded_seg)) {
+                // Snap 微段或完全静止时, log_velocity 强制 0.0
+                log_velocity = 0.0;
+            }
+
+            // 消费跨周期锁存标志
+            int was_loaded = just_loaded_seg;
+            just_loaded_seg = 0;
+
+            // ---- 真实硬件探针: 运动中每 5ms 降采样 + 加载立即记录 ----
+            if (!g_sim_mode && should_log_this_cycle
+                && (cycle % 5 == 0 || was_loaded)) {
                 int idx_x = g_axis_map['X' - 'A'];
                 int idx_y = g_axis_map['Y' - 'A'];
                 int idx_z = g_axis_map['Z' - 'A'];
@@ -319,19 +550,19 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     (idx_z >= 0) ? g_interpolator.current_pos[idx_z] : 0.0,
                     (idx_b >= 0) ? g_interpolator.current_pos[idx_b] : 0.0,
                     (idx_c >= 0) ? g_interpolator.current_pos[idx_c] : 0.0,
-                    g_interpolator.v_target
+                    log_velocity
                 );
             }
 
-            // ---- 仿真模式: 每周期全量轨迹采集 (1ms 精度, 无降采样) ----
+            // ---- 仿真模式: 每周期全量轨迹采集 (1ms 精度, 无降采样, 绝不漏 Snap) ----
             // @Context: 1ms Hard-RT Thread
             // @Danger: sim_engine_push 无锁无阻塞, 双缓冲原子交换+sem_post
             // 生产 1:1 完整物理轨迹供上位机 3D 渲染比对
-            if (g_sim_mode && g_interpolator.is_moving) {
+            if (g_sim_mode && should_log_this_cycle) {
                 sim_engine_push((uint64_t)cycle,
                                 g_interpolator.virtual_time_ms,
                                 g_interpolator.current_pos,
-                                g_interpolator.v_target);
+                                log_velocity);
             }
 
             if(g_all_axis_op_ready){
@@ -363,81 +594,27 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 }
             }
 
+            // ---- 非阻塞 M 代码等待计时 (阶段 2 保留) ----
+            // 段加载逻辑已移到 while 消费环,此处仅保留 mcode_wait_timer 递增。
+            if(g_all_axis_op_ready && g_interpolator.is_waiting_mcode){
+                if(g_interpolator.mcode_wait_timer < INT32_MAX) {
+                    g_interpolator.mcode_wait_timer++;
+                }
+                int wait_target_ms;
+                switch(g_interpolator.current_mcode){
+                    case 3:  wait_target_ms=2000; break;
+                    case 5:  wait_target_ms=1000; break;
+                    default: wait_target_ms=1000; break;
+                }
+                if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
+                   g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
+                    g_interpolator.is_waiting_mcode=0;
+                    g_interpolator.mcode_wait_timer=0;
+                }
+            }
+
+            // ---- 坐标系管理器更新 (阶段 2 保留) ----
             if(g_all_axis_op_ready){
-                if(g_interpolator.is_moving==0&&g_interpolator.is_waiting_mcode==0&&g_cmd_queue.head!=g_cmd_queue.tail&&atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==0){
-
-                    if(atomic_load_explicit(&g_cmd_queue.buffer[g_cmd_queue.tail].is_ready, memory_order_acquire)==1){
-                        TrajectorySegment_t seg=g_cmd_queue.buffer[g_cmd_queue.tail];
-                        g_cmd_queue.tail=(g_cmd_queue.tail+1)%QUEUE_SIZE;
-
-                        if(seg.cmd_type==CMD_TYPE_MCODE){
-                            g_interpolator.is_waiting_mcode=1;
-                            g_interpolator.mcode_wait_timer=0;
-                            g_interpolator.current_mcode=seg.m_code;
-                            continue;
-                        }
-
-                        for(int j=0;j<AXIS_NUM;j++){
-                            g_interpolator.start_pos[j]=g_interpolator.current_pos[j];
-                            g_interpolator.target_pos[j]=seg.target_pos[j];
-                            g_interpolator.dir_vec[j]=seg.dir_vec[j];
-                        }
-
-                        g_interpolator.total_distance=seg.total_distance;
-                        // 7段式 S 曲线绝对解析参数（planner 已预计算）
-                        g_interpolator.T1=seg.T1; g_interpolator.T2=seg.T2;
-                        g_interpolator.T3=seg.T3; g_interpolator.T4=seg.T4;
-                        g_interpolator.T5=seg.T5; g_interpolator.T6=seg.T6;
-                        g_interpolator.T7=seg.T7;
-                        g_interpolator.v0=seg.v0; g_interpolator.v1=seg.v1;
-                        g_interpolator.v2=seg.v2; g_interpolator.v3=seg.v3;
-                        g_interpolator.v4=seg.v4; g_interpolator.v5=seg.v5;
-                        g_interpolator.v6=seg.v6;
-                        g_interpolator.s0=seg.s0; g_interpolator.s1=seg.s1;
-                        g_interpolator.s2=seg.s2; g_interpolator.s3=seg.s3;
-                        g_interpolator.s4=seg.s4; g_interpolator.s5=seg.s5;
-                        g_interpolator.s6=seg.s6;
-                        g_interpolator.j1=seg.j1; g_interpolator.a2=seg.a2;
-                        g_interpolator.j3=seg.j3;
-                        g_interpolator.j5=seg.j5; g_interpolator.a6=seg.a6;
-                        g_interpolator.j7=seg.j7;
-                        g_interpolator.v_target=seg.v_target;
-                        g_interpolator.acc=seg.acc;
-                        g_interpolator.dec=seg.dec;
-                        g_interpolator.v_start=seg.v_start;
-                        g_interpolator.v_end=seg.v_end;
-                        g_interpolator.virtual_time_ms=0.0;
-
-                        if(seg.T_total > 0.5){
-                            g_interpolator.is_moving=1;
-                        }else{
-                            // 微段快进：T_total 过小无法插补，直接快进到目标位置
-                            for(int j=0;j<AXIS_NUM;j++){
-                                g_interpolator.current_pos[j]=g_interpolator.target_pos[j];
-                            }
-                            rt_log("micro-segment snap: T_total=%.3f dist=%.6f",seg.T_total,seg.total_distance);
-                        }
-                    }
-                }
-
-                // 非阻塞M代码等待逻辑
-                if(g_interpolator.is_waiting_mcode){
-                    if(g_interpolator.mcode_wait_timer < INT32_MAX) {
-                        g_interpolator.mcode_wait_timer++;
-                    }
-                    int wait_target_ms;
-                    switch(g_interpolator.current_mcode){
-                        case 3:  wait_target_ms=2000; break;
-                        case 5:  wait_target_ms=1000; break;
-                        default: wait_target_ms=1000; break;
-                    }
-                    if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
-                       g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
-                        g_interpolator.is_waiting_mcode=0;
-                        g_interpolator.mcode_wait_timer=0;
-                    }
-                }
-
                 for(int j=0;j<AXIS_NUM;j++){
                     g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
                     if(g_coord_mgr.current_coord==COORD_G53){
@@ -714,11 +891,14 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
         // ---- 队列饥饿看门狗 ----
         // 路径 A：解析器已停止 → 队列中任意数量的未释放段均需强制释放
         // 路径 B：解析器标记为运行但实际卡死 → 二级超时兜底
+        // 看门狗线程 (非 RT) acquire 读两侧游标,与生产者/RT 消费者 release 写配对。
         {
-            int count = (g_cmd_queue.head - g_cmd_queue.tail + QUEUE_SIZE) % QUEUE_SIZE;
+            int wd_head = atomic_load_explicit(&g_cmd_queue.write_head, memory_order_acquire);
+            int wd_tail = atomic_load_explicit(&g_cmd_queue.read_tail, memory_order_acquire);
+            int count = (wd_head - wd_tail + QUEUE_SIZE) % QUEUE_SIZE;
             if(count > 0 && !g_parser_ctrl.is_running) {
                 // 路径 A：解析器已停，不限段数
-                if(g_cmd_queue.head == last_queue_head) {
+                if(wd_head == last_queue_head) {
                     starvation_counter++;
                     if(starvation_counter >= STARVATION_THRESHOLD) {
                         planner_recalculate(1);
@@ -726,12 +906,12 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
                     }
                 } else {
                     starvation_counter = 0;
-                    last_queue_head = g_cmd_queue.head;
+                    last_queue_head = wd_head;
                 }
             } else if(count > 0) {
                 // 路径 B：解析器仍标记运行，但队列首尾均无进展 → 可能卡死
-                if(g_cmd_queue.head == last_stuck_head &&
-                   g_cmd_queue.tail == last_stuck_tail) {
+                if(wd_head == last_stuck_head &&
+                   wd_tail == last_stuck_tail) {
                     stuck_counter++;
                     if(stuck_counter >= STUCK_THRESHOLD) {
                         planner_recalculate(1);
@@ -739,15 +919,15 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
                     }
                 } else {
                     stuck_counter = 0;
-                    last_stuck_head = g_cmd_queue.head;
-                    last_stuck_tail = g_cmd_queue.tail;
+                    last_stuck_head = wd_head;
+                    last_stuck_tail = wd_tail;
                 }
             } else {
                 starvation_counter = 0;
                 stuck_counter = 0;
-                last_queue_head = g_cmd_queue.head;
-                last_stuck_head = g_cmd_queue.head;
-                last_stuck_tail = g_cmd_queue.tail;
+                last_queue_head = wd_head;
+                last_stuck_head = wd_head;
+                last_stuck_tail = wd_tail;
             }
         }
 
