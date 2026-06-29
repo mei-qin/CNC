@@ -34,3 +34,15 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+
+# ==== AI 工具本地配置 (AI Tool Local Config) ====
+# 这些是个人开发辅助工具的本地状态, 不应进入团队仓库
+.workbuddy/
+.codebuddy/
+.claude/
+.cursor/
+.github-copilot/
+
+# ==== 仿真运行时产物 (Sim Runtime Output) ====
+# 控制台 stdout 重定向文件, 团队成员本地各自生成
+tests/output/scenario_log/
