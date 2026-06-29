@@ -1,0 +1,152 @@
+============================================================
+P0-3 测试规范：M1/M2 回归验证 (M3 引入后)
+状态：✓ 已通过 (2026-06-29)
+============================================================
+
+1. 测试标识
+   测试 ID         : P0-3
+   测试目标       : 确认 M3 (WHILE/END 词法分支 + scan_while_pairs
+                   预扫描 + GCodeProgram_t 扩展字段) 未破坏 M1
+                   (GOTO) 和 M2 (IF/GOTO) 控制流路径
+   回归用例 1     : tests/gcode/test_goto.nc (M1, 前向 GOTO)
+   回归用例 2     : tests/gcode/test_if_loop.nc (M2, IF + 反向 GOTO)
+   基线产物       : log_goto.csv (3627 行) / log_if_loop.csv (5331 行)
+                   已存在, 作为 diff 基准
+   预计耗时       : 0.5 天
+
+2. 回归风险点
+   R1  WHILE 关键字误匹配
+       M3 在 parse_gcode_line 入口加 W-H-I-L-E+!isalpha 检测
+       若 NC 行首字母是 W 可能误入
+   R2  END 关键字误匹配
+       END 分支检测 E-N-D+!isalpha
+       M1/M2 用例无 END 开头, 但需核对
+   R3  scan_while_pairs 错误拒绝
+       M1/M2 用例无 WHILE 行, 预扫描应输出 "配对完成: 0 对"
+       若 strstr_skip_ws 误判, Program_Load 返回 NULL, 文件无法运行
+   R4  GCodeProgram_t 结构布局回归
+       M3 加了 do_to_end[MAX_PROGRAM_LINES] + end_to_do[MAX_PROGRAM_LINES]
+       共 160KB BSS, 若 Program_Init 未正确初始化可能干扰 n_labels 二分
+   R5  词法分支顺序错误
+       M3 的 WHILE/END 分支必须在 IF 分支之前 (关键字长度递减)
+
+3. 测试前置条件
+   E1  P0-1 / P0-2 已通过 (M3 主路径已验证)
+   E2  WSL2 cnc_core 二进制已含 M3 改动
+   E3  基线 CSV log_goto.csv / log_if_loop.csv 已备份 (禁止覆盖)
+   E4  tests/gcode/test_goto.nc 与 test_if_loop.nc 内容未被改动
+
+4. 测试执行步骤
+
+   4.1 备份基线 CSV (保险)
+       mkdir -p /mnt/d/code/CNC/tests/output/baseline
+       cp /mnt/d/code/CNC/log_goto.csv \
+          /mnt/d/code/CNC/tests/output/baseline/log_goto_baseline.csv
+       cp /mnt/d/code/CNC/log_if_loop.csv \
+          /mnt/d/code/CNC/tests/output/baseline/log_if_loop_baseline.csv
+
+   4.2 执行 M1 回归 (test_goto.nc)
+       cd /home/meiqin/cnc_ws
+       (
+         echo "4"
+         echo "/mnt/d/code/CNC/tests/gcode/test_goto.nc"
+         sleep 10
+         echo "0"
+       ) | timeout 20 ./cnc_core sim > sim_goto.out 2>&1
+
+       CSV=$(ls -t cnc_trace_log_*.csv | head -1)
+       cp "$CSV" /mnt/d/code/CNC/tests/output/scenario_log/log_goto_new.csv
+       cp sim_goto.out /mnt/d/code/CNC/tests/output/scenario_log/sim_goto.out
+
+   4.3 执行 M2 回归 (test_if_loop.nc)
+       (
+         echo "4"
+         echo "/mnt/d/code/CNC/tests/gcode/test_if_loop.nc"
+         sleep 15
+         echo "0"
+       ) | timeout 25 ./cnc_core sim > sim_if_loop.out 2>&1
+
+       CSV=$(ls -t cnc_trace_log_*.csv | head -1)
+       cp "$CSV" /mnt/d/code/CNC/tests/output/scenario_log/log_if_loop_new.csv
+       cp sim_if_loop.out /mnt/d/code/CNC/tests/output/scenario_log/sim_if_loop.out
+
+5. 通过判据
+
+   5.1 M1 回归: test_goto.nc
+
+   控制台日志 (sim_goto.out):
+   G-L1  [Loader] 加载完成: 9 行, 6 个 N 标签               -  1 次
+   G-L2  [Loader] WHILE/DO/END 配对完成: 0 对               -  1 次
+   G-L3  [Loader] 错误:                                     -  0 次
+   G-L4  [Parser] GOTO 200 -> 跳转到行索引 (源行 7)         -  1 次
+   G-L5  N130 / N140 在 G01 日志中不出现                    -  0 次
+   G-L6  [Parser] WHILE                                    -  0 次
+   G-L7  [Parser] END 跳回                                  -  0 次
+   G-L8  [Parser] 文件处理完成.*PC 步进                     -  1 次
+
+   CSV (log_goto_new.csv):
+   G-C1  末行 X ≈ 20.000000
+   G-C2  末行 Y ≈ 0       (N130 跳过, Y 不动)
+   G-C3  末行 Z ≈ 10.000000 (N110 G00 Z10 生效, N140 跳过)
+   G-C4  行数与基线 (3627) 差异 < 5%
+
+   5.2 M2 回归: test_if_loop.nc
+
+   控制台日志 (sim_if_loop.out):
+   I-L1  [Loader] 加载完成: 7 行, 1 个 N 标签               -  1 次
+   I-L2  [Loader] WHILE/DO/END 配对完成: 0 对               -  1 次
+   I-L3  [Loader] 错误:                                     -  0 次
+   I-L4  IF [...] GOTO 100 (条件真) -> 行索引 (源行)        -  4 次
+   I-L5  IF [...] GOTO 100 (条件假, 不跳)                   -  1 次
+   I-L6  [Parser] WHILE                                    -  0 次
+   I-L7  [Parser] END 跳回                                  -  0 次
+   I-L8  [Parser] 文件处理完成.*PC 步进                     -  1 次
+
+   CSV (log_if_loop_new.csv):
+   I-C1  末行 X ≈ 40.000000
+   I-C2  末行 Y / Z ≈ 0
+   I-C3  行数与基线 (5331) 差异 < 5%
+   I-C4  与基线 diff, X 列数值差异 < 1e-3 (每行)
+
+   5.3 I-C4 逐行 diff 命令
+       awk -F, '
+         NR==FNR { base[FNR] = $4; next }
+         {
+           diff = $4 - base[FNR]
+           if (diff < 0) diff = -diff
+           if (diff > 1e-3) {
+             printf "行 %d: 基线 %.6f, 新值 %.6f\n", FNR, base[FNR], $4
+             bad++
+           }
+         }
+         END {
+           if (bad == 0) print "PASS"
+           else exit 1
+         }
+       ' /mnt/d/code/CNC/tests/output/baseline/log_if_loop_baseline.csv \
+         /mnt/d/code/CNC/tests/output/scenario_log/log_if_loop_new.csv
+
+6. 失败诊断矩阵
+   现象                                     根因
+   G-L2/I-L2 出现 0 对但前面有 [Loader] 错误  scan_while_pairs 把非 WHILE 行误识别
+   G-L6/I-L6 出现 WHILE 误触发               parser 词法分支顺序错乱
+   G-L7/I-L7 出现 END 误触发                 END 分支 !isalpha(p[3]) 守卫失效
+   G-C3 末行 Z ≠ 10                          GOTO 跳过了不该跳过的行
+   I-C4 多行 X 差异 > 1e-3                   严重回归信号, 立即回滚 commit
+   行数差异 > 5%                             M3 改动影响了 PC 步进或插补点数
+
+7. 测试退出条件
+   §5.1 G-L1~G-L8 + G-C1~G-C4 全部通过
+   §5.2 I-L1~I-L8 + I-C1~I-C4 全部通过
+   → P0-3 PASS, 全部 P0 闭环, 可进 P1/P2
+
+8. 备注
+   - 基线 CSV 必须保留, §4.1 强制备份
+   - cycle 列是全局累计值, I-C4 只 diff X 列 ($4), 不 diff cycle ($1)
+   - diff 容差 1e-3 依据浮点 planner 1ms 插补累积误差量级
+   - M3 改动仅新增分支, 未修改 M1/M2 任何现有代码路径
+     理论回归风险 < 5%, 仍需跑一遍以闭环
+
+============================================================
+归档时间: 2026-06-29
+============================================================

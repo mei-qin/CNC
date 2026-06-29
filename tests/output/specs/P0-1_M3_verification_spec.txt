@@ -1,0 +1,103 @@
+============================================================
+P0-1 测试规范：M3 WHILE/DO/END WSL2 sim 验证
+状态：✓ 已通过 (2026-06-29)
+============================================================
+
+1. 测试标识
+   测试 ID         : P0-1
+   测试目标       : Phase 2B M3 (WHILE/DO/END 块循环) 功能验证
+   测试用例文件   : D:\code\CNC\tests\gcode\test_while.nc
+   被测代码改动   : commit 97cb15b 之后的 06-24 改动
+                   (inc/program_loader.h + src/program_loader.c
+                    + src/gcode_parser.c)
+   测试环境       : WSL2 Ubuntu (/home/meiqin/cnc_ws)
+   预计耗时       : 0.5 天
+
+2. 测试前置条件 (Entry Criteria)
+   E1  src/gcode_parser.c 第 356/408 行存在 M3 词法分支
+   E2  src/program_loader.c 含 scan_while_pairs 函数
+   E3  inc/program_loader.h 含 do_to_end / end_to_do 字段
+   E4  tests/gcode/test_while.nc 文件存在且 8 行非空
+   E5  WSL2 工作目录与 Windows 端文件已同步
+
+3. 测试用例 NC 程序语义
+   行 4: #1 = 0            (宏变量初始化)
+   行 5: WHILE [#1 LT 5] DO 1  (循环头)
+   行 6: G01 X[#1 * 10] F500   (5 次线性运动 X=0/10/20/30/40)
+   行 7: #1 = #1 + 1           (计数器自增)
+   行 8: END 1                 (无条件跳回 WHILE)
+   行 9: M30                   (文件结束)
+
+   预期执行序列:
+     轮 1: #1=0, 条件真, G01 X=0
+     轮 2: #1=1, 条件真, G01 X=10
+     轮 3: #1=2, 条件真, G01 X=20
+     轮 4: #1=3, 条件真, G01 X=30
+     轮 5: #1=4, 条件真, G01 X=40
+     退出: #1=5, 条件假, 跳过循环体直达 M30
+
+4. 测试执行步骤
+   4.1 编译
+       cd /home/meiqin/cnc_ws
+       make clean && make all
+
+   4.2 执行 sim
+       (
+         echo "4"
+         echo "/mnt/d/code/CNC/tests/gcode/test_while.nc"
+         sleep 15
+         echo "0"
+       ) | timeout 25 ./cnc_core sim > sim_while.out 2>&1
+
+   4.3 收集产物
+       CSV=$(ls -t cnc_trace_log_*.csv | head -1)
+       cp "$CSV" /mnt/d/code/CNC/tests/output/scenario_log/log_while.csv
+       cp sim_while.out /mnt/d/code/CNC/tests/output/scenario_log/sim_while.out
+
+5. 通过判据 (Pass Criteria)
+
+   5.1 预扫描阶段 (控制台日志)
+   L1  [Loader] WHILE/DO/END 配对完成: 1 对  -  恰好 1 次
+   L2  [Loader] 错误:                  -  0 次
+
+   5.2 运行时阶段 (控制台日志)
+   R1  [Parser] WHILE [...] (条件真) 进入循环 (源行 5)  -  恰好 5 次
+   R2  [Parser] WHILE [...] (条件假) 跳到行索引 6 (源行 5, 跳过循环体)  -  恰好 1 次
+   R3  [Parser] END 跳回 WHILE 行索引 2 (源行 5, 重新求值条件)  -  恰好 5 次
+   R4  [Macro] #1 = 0  -  1 次 (行 4 初始化)
+   R5  [Macro] #1 = [1-5]  -  5 次 (每轮自增后)
+   R6  [Parser] PC 步进超 1000000  -  0 次 (未触发死循环保护)
+   R7  [Parser] 文件处理完成.*PC 步进 [0-9]+  -  1 次
+       PC 步进期望区间: 23 ~ 32 (5 轮 × 5 步 + 退出 2 步 ≈ 27, ±5 容差)
+
+   5.3 运动轨迹 (CSV: log_while.csv)
+   表头: cycle,stage_id,virtual_time_ms,X,Y,Z,C,B,v_target
+   C1  CSV 行数 > 100 (每个 G01 至少 20 个 1ms 插补点)
+   C2  X 终值 = 40.000000
+   C3  Y / Z / C / B 终值 ≈ 0 (±1e-3)
+   C4  X 单调不减
+   C5  X 出现 5 个明显平台 (0/10/20/30/40)
+   C6  与 log_if_loop.csv (M2 等价语义) 末行 X 差值 < 1e-3
+
+6. 失败诊断矩阵
+   现象                              可能根因
+   L1 不出现, L2 出现缺 DO          strstr_skip_ws 没找到 DO
+   R1 出现 ≠5 次                    WHILE 条件求值错误
+   R2 不出现 (永不退出)             死循环保护触发 (查 R5)
+   R3 出现 ≠5 次                    end_to_do 索引填反
+   C2 终值 X ≠ 40                   G01 用了未更新的 #1 (off-by-one)
+   C4 X 非单调                      planner 队列乱序或跳转漏 PC++
+   R6 触发                          WHILE 条件恒真
+
+7. 测试退出条件
+   §5.1 L1~L2 + §5.2 R1~R7 + §5.3 C1~C6 全部通过 → P0-1 PASS
+
+8. 备注
+   - WSL2 stdin pipe EOF 陷阱: 必须用 (echo; sleep; echo) 模式
+   - timeout 25s, sleep 15s 余量充足
+   - cycle 列是全局累计值, 判据只看相对值与末行
+   - log_if_loop.csv 作为 M2 等价基准
+
+============================================================
+归档时间: 2026-06-29
+============================================================
