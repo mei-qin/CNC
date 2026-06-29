@@ -20,6 +20,22 @@ from mpl_toolkits.mplot3d import Axes3D
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'STSong']
 matplotlib.rcParams['axes.unicode_minus'] = False
 
+# 路径常量 (脚本位于 scripts/, 数据/输出位于 tests/output/)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCENARIO_LOG_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "tests", "output", "scenario_log"))
+VERIFICATION_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "tests", "output", "verification"))
+os.makedirs(VERIFICATION_DIR, exist_ok=True)
+
+
+def _scenario_csv(name):
+    """返回 tests/output/scenario_log/ 下的 CSV 完整路径。"""
+    return os.path.join(SCENARIO_LOG_DIR, name)
+
+
+def _verify_png(name):
+    """返回 tests/output/verification/ 下的 PNG 完整路径。"""
+    return os.path.join(VERIFICATION_DIR, name)
+
 # ================================================================
 # 通用工具
 # ================================================================
@@ -46,7 +62,7 @@ def module_a_rtcp():
     print("模块 A: RTCP 逆解物理轨迹分析 (log_rtcp.csv)")
     print("=" * 65)
 
-    df, x, y, z, b, c, t, v = load("log_rtcp.csv")
+    df, x, y, z, b, c, t, v = load(_scenario_csv("log_rtcp.csv"))
     active = trim_active(x, y, z)
     print(f"  总记录: {len(df)}, 活跃点: {len(active)}")
     print(f"  B 轴范围: [{b.min():.1f}, {b.max():.1f}] deg")
@@ -82,9 +98,9 @@ def module_a_rtcp():
     ax.set_title('RTCP: Physical Joint Trajectory\n(Tool tip logically stationary, joints compensate B rotation)')
     ax.legend()
     plt.tight_layout()
-    plt.savefig('verify_rtcp_3d.png', dpi=120)
+    plt.savefig(_verify_png('verify_rtcp_3d.png'), dpi=120)
     plt.close()
-    print(f"  [PLOT] verify_rtcp_3d.png")
+    print(f"  [PLOT] {_verify_png('verify_rtcp_3d.png')}")
 
     # B-X 耦合图
     fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
@@ -96,9 +112,9 @@ def module_a_rtcp():
     ax2.set_xlabel('B axis (deg)'); ax2.set_ylabel('Z (mm)')
     ax2.set_title('B vs Z coupling'); ax2.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('verify_rtcp_coupling.png', dpi=120)
+    plt.savefig(_verify_png('verify_rtcp_coupling.png'), dpi=120)
     plt.close()
-    print(f"  [PLOT] verify_rtcp_coupling.png")
+    print(f"  [PLOT] {_verify_png('verify_rtcp_coupling.png')}")
     print()
 
     return {'b_range': b_range, 'x_range': x_range, 'z_range': z_range}
@@ -112,7 +128,7 @@ def module_b_bspline():
     print("模块 B: B-Spline 压缩平滑 & M05 屏障 (log_bspline.csv)")
     print("=" * 65)
 
-    df, x, y, z, b, c, t, v = load("log_bspline.csv")
+    df, x, y, z, b, c, t, v = load(_scenario_csv("log_bspline.csv"))
     active = trim_active(x, y, z)
     print(f"  总记录: {len(df)}, 活跃点: {len(active)}")
 
@@ -219,9 +235,9 @@ def module_b_bspline():
         ax.set_aspect('equal')
     ax.legend(loc='upper left', fontsize=9)
     plt.tight_layout()
-    plt.savefig('verify_bspline_xy.png', dpi=150)
+    plt.savefig(_verify_png('verify_bspline_xy.png'), dpi=150)
     plt.close()
-    print(f"  [PLOT] verify_bspline_xy.png")
+    print(f"  [PLOT] {_verify_png('verify_bspline_xy.png')}")
     print()
 
     return {'v_min_tail': v_min_tail}
@@ -235,7 +251,7 @@ def module_c_g93():
     print("模块 C: G93 倒数时间守恒 (log_g93.csv)")
     print("=" * 65)
 
-    df, x, y, z, b, c, t, v = load("log_g93.csv")
+    df, x, y, z, b, c, t, v = load(_scenario_csv("log_g93.csv"))
 
     # 自动检测 G93 CSV 格式:
     # v1 (旧): virtual_time_ms 每微段重置 1.000→2.000
@@ -308,9 +324,9 @@ def module_c_g93():
     fig.suptitle(f'G93: Axis Positions vs Time (T={elapsed:.0f}ms)',
                  fontsize=13, fontweight='bold')
     plt.tight_layout()
-    plt.savefig('verify_g93_time.png', dpi=120)
+    plt.savefig(_verify_png('verify_g93_time.png'), dpi=120)
     plt.close()
-    print(f"  [PLOT] verify_g93_time.png")
+    print(f"  [PLOT] {_verify_png('verify_g93_time.png')}")
     print()
 
     return {'elapsed': elapsed, 'expected': expected, 'deviation': deviation}
@@ -368,6 +384,7 @@ if __name__ == "__main__":
     print("  产出图表:")
     for f in ['verify_rtcp_3d.png', 'verify_rtcp_coupling.png',
               'verify_bspline_xy.png', 'verify_g93_time.png']:
-        if os.path.exists(f):
-            print(f"    {f}")
+        full = _verify_png(f)
+        if os.path.exists(full):
+            print(f"    {full}")
     print()

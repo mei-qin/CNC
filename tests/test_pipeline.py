@@ -153,17 +153,28 @@ def make_overlay_plot(data_list, labels, test_name, is_3d=False, xyz_keys=('X', 
 
 
 def make_ecg_plot(data, test_name):
-    """生成速度心电图。"""
+    """生成速度心电图。对重复 virtual_time_ms 自动去重避免"刷状涂影"。"""
     t = data.get('virtual_time_ms', np.arange(len(data.get('v_target', [0]))))
     v = data.get('v_target', np.zeros_like(t))
 
     # 构建累积时间轴 (处理 G93 重置)
     if np.max(t) - np.min(t) < 10:
-        # G93 模式: 累积段数
-        seg = (np.abs(t - 2.0) < 0.001).astype(float)
-        cum_t = np.cumsum(seg)
+        cum_t = np.cumsum((np.abs(t - 2.0) < 0.001).astype(float))
     else:
         cum_t = t - t[0]
+
+    # ── 去重: 当 virtual_time_ms 大量重复时 (stage_id=5 每周期记录),
+    #    每个虚拟毫秒内 v_target 理论上恒定, 只保留每个时间点的首次值
+    if len(np.unique(t)) < len(t) * 0.5 and len(np.unique(t)) > 10:
+        _, uidx = np.unique(t, return_index=True)
+        uidx = np.sort(uidx)
+        cum_t = cum_t[uidx]
+        v = v[uidx]
+        # 同步处理位置/角度数据
+        for key in ['X','Y','Z','B','C']:
+            if key in data:
+                data[key] = data[key][uidx]
+        print(f"  [ECG] 去重: {len(t)} → {len(uidx)} 点 (每虚拟 ms 保留首值)")
 
     fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
 

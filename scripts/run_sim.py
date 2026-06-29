@@ -9,12 +9,12 @@ import os
 
 WSL_EXE = 'C:/Windows/System32/wsl.exe'
 WS_DIR = '/home/meiqin/cnc_ws'
-WIN_DIR = '/mnt/d/code/CNC'
+WIN_DIR = '/mnt/d/code/CNC/tests/output/scenario_log'
 
 TESTS = {
-    'L1': ('tests/gcode/L1_sharp_corner.nc', 'log_bspline.csv', 60),
-    'L2': ('tests/gcode/L2_g93_strict.nc', 'log_g93.csv', 120),
-    'L3': ('tests/gcode/L3_kinematics_rtcp.nc', 'log_rtcp.csv', 60),
+    'sysvar':  ('test_sysvar.nc',     'log_sysvar.csv',  30),
+    'g81':     ('test_g81_drill.nc',  'log_g81.csv',     30),
+    'g83':     ('test_g83_peck.nc',   'log_g83.csv',     30),
 }
 
 

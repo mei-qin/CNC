@@ -37,8 +37,8 @@ def csv_dir(request):
     path = request.config.getoption("--csv-dir")
     if path:
         return Path(path)
-    # Default: project root
-    return Path(__file__).resolve().parent.parent
+    # Default: tests/output/scenario_log (log_*.csv 归档位置)
+    return Path(__file__).resolve().parent / "output" / "scenario_log"
 
 
 def load_trace(csv_file: Path):

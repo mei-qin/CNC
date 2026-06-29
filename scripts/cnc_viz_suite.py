@@ -30,6 +30,10 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (register 3d projection)
 from scipy.signal import savgol_filter
 
+# 脚本路径常量 (脚本位于 scripts/, 输出落盘到 tests/output/viz_dashboard/)
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__)) if not hasattr(sys, 'frozen') else os.path.dirname(sys.executable)
+VIZ_OUT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "tests", "output", "viz_dashboard"))
+
 # 中文字体支持
 matplotlib.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'STSong']
 matplotlib.rcParams['axes.unicode_minus'] = False
@@ -503,12 +507,13 @@ def render_error_heatmap(data, output_path='viz_error_heatmap.png',
 
 # ==================== 一键全管线仪表盘 ====================
 
-def render_dashboard(csv_path, out_dir='.', a_max=200.0, jerk_max=5000.0,
+def render_dashboard(csv_path, out_dir=VIZ_OUT_DIR, a_max=200.0, jerk_max=5000.0,
                      savgol_window=5, savgol_poly=2, use_3d=True):
     """
     一键加载 CSV 并生成全部三大视图, 返回 {view_name: png_path}。
     """
     print(f"\n[Viz] 加载管线 CSV: {csv_path}")
+    os.makedirs(out_dir, exist_ok=True)
     data = load_pipeline_csv(csv_path)
     for k in ['parser', 'comp', 'bspline', 'planner', 'rt']:
         print(f"  stage {k:8s}: {len(data.get(k, pd.DataFrame())):6d} 条")
@@ -537,7 +542,7 @@ if __name__ == '__main__':
     import argparse
     ap = argparse.ArgumentParser(description='CNC 多级管线可视化仪表盘')
     ap.add_argument('csv', help='输入 CSV 路径 (cnc_trace_log.csv 或 sim 输出)')
-    ap.add_argument('--out-dir', default='.', help='图表输出目录')
+    ap.add_argument('--out-dir', default=VIZ_OUT_DIR, help='图表输出目录 (默认 tests/output/viz_dashboard/)')
     ap.add_argument('--a-max', type=float, default=200.0,
                     help='最大加速度阈值 mm/s^2 (默认 200, 与 axis_ctrl.c 一致)')
     ap.add_argument('--jerk-max', type=float, default=5000.0,

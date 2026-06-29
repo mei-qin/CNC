@@ -19,6 +19,8 @@ make all 2>&1 | grep -E "编译成功|error" || true
 echo "      编译完成 ($(stat -c%s cnc_core) bytes)"
 
 GCODE_DIR="$WS/tests/gcode"
+WIN_SCENARIO_LOG_DIR="/mnt/d/code/CNC/tests/output/scenario_log"
+mkdir -p "$WIN_SCENARIO_LOG_DIR"
 
 # ── 辅助函数: 运行单个测试 ──
 run_test() {
@@ -46,31 +48,36 @@ run_test() {
 }
 
 # ── 测试1: L1 B-Spline (短) ──
-run_test "L1_sharp_corner" "$GCODE_DIR/L1_sharp_corner.nc" "log_bspline.csv" 10
+run_test "L1_sharp_corner" "$GCODE_DIR/L1_sharp_corner.nc" "$WIN_SCENARIO_LOG_DIR/log_bspline.csv" 10
 
 # ── 测试2: L2 G93 (中等) ──
-run_test "L2_g93_strict" "$GCODE_DIR/L2_g93_strict.nc" "log_g93.csv" 30
+run_test "L2_g93_strict" "$GCODE_DIR/L2_g93_strict.nc" "$WIN_SCENARIO_LOG_DIR/log_g93.csv" 30
 
 # ── 测试3: L3 RTCP (中等) ──
-run_test "L3_kinematics_rtcp" "$GCODE_DIR/L3_kinematics_rtcp.nc" "log_rtcp.csv" 15
+run_test "L3_kinematics_rtcp" "$GCODE_DIR/L3_kinematics_rtcp.nc" "$WIN_SCENARIO_LOG_DIR/log_rtcp.csv" 15
 
 # ── 清理时间戳 CSV ──
 rm -f cnc_trace_log_*.csv
 
 # ── 复制回 Windows 文件系统 ──
 echo ""
-echo "[*] 复制结果到 /mnt/d/code/CNC/ ..."
-for f in log_bspline.csv log_g93.csv log_rtcp.csv cnc_core; do
+echo "[*] 复制结果到 $WIN_SCENARIO_LOG_DIR/ ..."
+for f in log_bspline.csv log_g93.csv log_rtcp.csv; do
     if [ -f "$f" ]; then
-        cp "$f" /mnt/d/code/CNC/"$f"
-        echo "      $f → /mnt/d/code/CNC/$f"
+        cp "$f" "$WIN_SCENARIO_LOG_DIR/$f"
+        echo "      $f → $WIN_SCENARIO_LOG_DIR/$f"
     fi
 done
+# cnc_core 二进制仍归项目根
+if [ -f "cnc_core" ]; then
+    cp "cnc_core" /mnt/d/code/CNC/"cnc_core"
+    echo "      cnc_core → /mnt/d/code/CNC/cnc_core"
+fi
 
 echo ""
 echo "================================================"
 echo "  测试完成!"
-echo "  log_bspline.csv : $(wc -l < log_bspline.csv 2>/dev/null || echo 0) 行"
-echo "  log_g93.csv     : $(wc -l < log_g93.csv 2>/dev/null || echo 0) 行"
-echo "  log_rtcp.csv    : $(wc -l < log_rtcp.csv 2>/dev/null || echo 0) 行"
+echo "  log_bspline.csv : $(wc -l < "$WIN_SCENARIO_LOG_DIR/log_bspline.csv" 2>/dev/null || echo 0) 行"
+echo "  log_g93.csv     : $(wc -l < "$WIN_SCENARIO_LOG_DIR/log_g93.csv" 2>/dev/null || echo 0) 行"
+echo "  log_rtcp.csv    : $(wc -l < "$WIN_SCENARIO_LOG_DIR/log_rtcp.csv" 2>/dev/null || echo 0) 行"
 echo "================================================"

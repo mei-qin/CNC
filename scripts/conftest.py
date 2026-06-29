@@ -17,9 +17,23 @@ import pytest
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRACE_LOG_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "tests", "output", "trace_log"))
+
+
+def _latest_trace_csv():
+    """返回 trace_log 目录下最新的 cnc_trace_log_*.csv，没有则返回 None。"""
+    import glob
+    candidates = glob.glob(os.path.join(_TRACE_LOG_DIR, "cnc_trace_log_*.csv"))
+    if not candidates:
+        return None
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    return candidates[0]
+
+
 DEFAULT_CSV_PATH = os.environ.get(
     'CNC_TRACE_CSV',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cnc_trace_log.csv')
+    _latest_trace_csv() or os.path.join(_TRACE_LOG_DIR, 'cnc_trace_log.csv')
 )
 
 

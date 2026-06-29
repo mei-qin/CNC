@@ -48,10 +48,21 @@ _FAIL_STASH = get_fail_stash()
 
 # ==================== 全局参数 (可通过命令行 / 环境变量覆盖) ====================
 
-DEFAULT_CSV_PATH = os.environ.get(
-    'CNC_TRACE_CSV',
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cnc_trace_log.csv')
-)
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_TRACE_LOG_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "..", "tests", "output", "trace_log"))
+
+
+def _latest_trace_csv():
+    """返回 trace_log 目录下最新的 cnc_trace_log_*.csv，没有则返回占位路径。"""
+    import glob
+    candidates = glob.glob(os.path.join(_TRACE_LOG_DIR, "cnc_trace_log_*.csv"))
+    if not candidates:
+        return os.path.join(_TRACE_LOG_DIR, 'cnc_trace_log.csv')
+    candidates.sort(key=os.path.getmtime, reverse=True)
+    return candidates[0]
+
+
+DEFAULT_CSV_PATH = os.environ.get('CNC_TRACE_CSV', _latest_trace_csv())
 DEFAULT_A_MAX    = float(os.environ.get('CNC_A_MAX', '200.0'))    # mm/s^2
 DEFAULT_JERK_MAX = float(os.environ.get('CNC_JERK_MAX', '5000.0')) # mm/s^3
 PATH_ERR_TOL_MM  = 0.05  # 路径跟随误差容忍 (mm)

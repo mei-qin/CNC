@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 G41 cutter comp geometry analysis — data-driven corner validation
-用法: python analyze_crc.py [csv_path]   (默认找最新的 cnc_trace_log_*.csv)
+用法: python analyze_crc.py [csv_path]   (默认找最新的 tests/output/trace_log/cnc_trace_log_*.csv)
 """
 import sys, os, re, glob, io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -11,8 +11,12 @@ import pandas as pd
 import numpy as np
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRACE_LOG_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "tests", "output", "trace_log"))
+
+
 def find_latest_csv():
-    candidates = glob.glob("cnc_trace_log_*.csv")
+    candidates = glob.glob(os.path.join(TRACE_LOG_DIR, "cnc_trace_log_*.csv"))
     if not candidates:
         return None
     candidates.sort(key=os.path.getmtime, reverse=True)

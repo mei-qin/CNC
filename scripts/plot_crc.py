@@ -24,6 +24,11 @@ matplotlib.use('Agg')  # 无头模式，仅输出图片
 import matplotlib.pyplot as plt
 
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+TRACE_LOG_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "tests", "output", "trace_log"))
+CRC_OUT_DIR = os.path.normpath(os.path.join(SCRIPT_DIR, "..", "tests", "output", "crc_analysis"))
+
+
 def extract_timestamp(csv_path):
     """从文件名中提取时间戳: cnc_trace_log_20260613_001200.csv → 20260613_001200"""
     m = re.search(r'(\d{8}_\d{6})', os.path.basename(csv_path))
@@ -31,8 +36,8 @@ def extract_timestamp(csv_path):
 
 
 def find_latest_csv():
-    """查找工作目录下最新的 cnc_trace_log_*.csv"""
-    candidates = glob.glob("cnc_trace_log_*.csv")
+    """查找 tests/output/trace_log/ 下最新的 cnc_trace_log_*.csv"""
+    candidates = glob.glob(os.path.join(TRACE_LOG_DIR, "cnc_trace_log_*.csv"))
     if not candidates:
         return None
     candidates.sort(key=os.path.getmtime, reverse=True)
@@ -149,10 +154,11 @@ def main():
     plt.tight_layout()
 
     # 5. 输出文件 (带时间戳)
+    os.makedirs(CRC_OUT_DIR, exist_ok=True)
     if ts:
-        out_path = f"crc_analysis_{ts}.png"
+        out_path = os.path.join(CRC_OUT_DIR, f"crc_analysis_{ts}.png")
     else:
-        out_path = "crc_analysis.png"
+        out_path = os.path.join(CRC_OUT_DIR, "crc_analysis.png")
     plt.savefig(out_path, dpi=150, bbox_inches='tight')
     print(f"[INFO] 图表已保存至: {out_path}")
     plt.close()
