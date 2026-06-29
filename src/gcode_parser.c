@@ -3,12 +3,44 @@
 #include "axis_ctrl.h"
 #include "kinematics.h"
 #include "bspline_engine.h"
+#include "macro_eval.h"   // 宏变量与表达式引擎
+#include "program_loader.h"  // Phase 2B M1: 文件加载器 + N 标签 + GOTO
 #include <math.h>
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
 #define RTCP_LINEAR_SEGMENT_MM 0.5 // RTCP直线微段打碎步长，单位mm
 
-GCodeState_t g_state = {{0}, 1000.0, 1, 17, 1, FEED_MODE_G94, 0, 0, 0}; // rtcp=0, bspline=0, comp=OFF
+// C99 designated initializer: Phase 2A.2 固定循环字段自动归零 (active_cycle=0, retract_mode=0)
+GCodeState_t g_state = {
+    .feedrate_mm_min   = 1000.0,
+    .is_absolute       = 1,
+    .active_plane      = 17,
+    .motion_mode       = 1,
+    .feed_mode         = FEED_MODE_G94,
+};
+
+// ---- Phase 2B M1: PC 寄存器与跳转信号 ----
+// 仅 parser_thread_func 修改 PC; parse_gcode_line 通过 g_pc_jump_pending 信号触发跳转
+// 全部为 parser 后台线程独占访问, 无需锁
+static int g_pc = 0;                    // 当前程序计数器 (lines[] 索引)
+static int g_pc_jump_pending = 0;       // parse_gcode_line 设置, parser_thread_func 消费
+static int g_pc_jump_target = 0;        // 跳转目标 lines[] 索引
+static GCodeProgram_t *g_current_program = NULL;  // 当前运行程序 (NULL 表示走旧路径)
+static int g_pc_step_counter = 0;       // 步进计数器, 防 GOTO 死循环
+
+// ---- Phase 2B M5: 子程序调用栈 ----
+// M98 压栈保存调用者上下文, M99 弹栈恢复
+// 现代语义: #1-#33 局部变量 + modal G-code 状态都完全隔离
+#define MAX_CALL_DEPTH 8  // 子程序嵌套深度上限 (Fanuc 0i=4, 30i=10, 取中)
+typedef struct {
+    int          return_pc;          // 调用者 PC (M98 行的下一行)
+    int          entry_line;         // 子程序入口 (O-label 行索引), 用于 L<重复> 再次跳入
+    int          repeat_remaining;   // L-1 后剩余次数, 每次 M99 减一
+    double       saved_locals[34];   // 调用者 #1-#33 快照 (索引 1..33)
+    GCodeState_t saved_state;        // 调用者 modal G-code 状态快照
+} CallFrame_t;
+static CallFrame_t g_call_stack[MAX_CALL_DEPTH];
+static int         g_call_stack_top = 0;
 ParserControl_t g_parser_ctrl = {"", 0, 0, 0}; // 全局G-code解析控制变量，初始值为未运行、未暂停、未请求中止
 extern int api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_trajectory_g93(double target_pos[AXIS_NUM],double speed,double acc,double dec,double g93_dt_sec);
@@ -308,7 +340,13 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
 
 int parse_gcode_line(const char *gcode_line)
 {
-    char buffer[128];
+    // 宏赋值行首拦截：#N = <expr>
+    // 标准 CNC 中赋值必须独占一行（不会出现 G01 X10 #100 = 5 这种语法）
+    if(Macro_TryParseAssignment(gcode_line)){
+        return 0;
+    }
+
+    char buffer[256];   // 从 128 提升：宏表达式可较长，与上游 line_buffer[256] 对齐
     strncpy(buffer, gcode_line, sizeof(buffer) - 1);
     buffer[sizeof(buffer) - 1] = '\0';
 
@@ -319,14 +357,237 @@ int parse_gcode_line(const char *gcode_line)
     int m_code=-1;
     double s_value=0.0;
     double p_value=0.0, q_value=0.0, r_value=0.0; // M代码扩展参数
+    int l_value=1;       // Phase 2B M5: M98 L<重复次数>, 默认 1
     int is_non_motion_g=0; // 非运动组拦截锁：G04/G10/G28/G92 等
     int has_f=0;           // F 值存在标志（G93 非模态校验）
+    int has_r=0;           // R 值存在标志（G91 固定循环 R/Z 顺序处理）
     int is_G53_this_block=0;  // G53 非模态机械坐标：仅影响本行
 
     char *p=buffer;
     while(*p!='\0'){
         p=(char*)skip_spaces(p);
         if(*p=='\0') break;
+
+        // ---- Phase 2B M5: O<num> 子程序标签 ----
+        // 两种语义:
+        //   (a) 栈顶帧 entry_line == g_pc: M98 跳入此行, O 行视为 no-op 标签, 继续执行子程序体
+        //   (b) 主流程 fall-through: 跳到 o_labels[].skip_to (子程序 M99 之后)
+        if(toupper((unsigned char)p[0])=='O' && isdigit((unsigned char)p[1])){
+            char *end;
+            long o_num = strtol(p + 1, &end, 10);
+            if(end == p + 1){
+                printf("[Parser] O 后缺编号 (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            // 推进主游标到行尾
+            while(*end) end++;
+            p = end;
+
+            if(!g_current_program){
+                printf("[Parser] O 标签在无 program 上下文\n");
+                return -1;
+            }
+            // 判断是 M98 跳入 (栈顶 entry_line == g_pc) 还是主流程穿越
+            int via_m98 = (g_call_stack_top > 0 &&
+                          g_call_stack[g_call_stack_top - 1].entry_line == g_pc);
+            if(via_m98){
+                printf("[Parser] O%d 子程序入口 (M98 跳入, 源行 %d)\n",
+                       (int)o_num, g_current_program->lines[g_pc].line_no);
+                // PC++ 由主循环处理, 继续子程序体第一行
+            } else {
+                int idx = Program_FindOLabel(g_current_program, (int)o_num);
+                if(idx < 0 || g_current_program->o_labels[idx].skip_to < 0){
+                    printf("[Parser] O%d 跳转目标无效 (源行 %d)\n",
+                           (int)o_num, g_current_program->lines[g_pc].line_no);
+                    return -1;
+                }
+                g_pc_jump_target = g_current_program->o_labels[idx].skip_to;
+                g_pc_jump_pending = 1;
+                printf("[Parser] 主流程穿越 O%d, 跳到行索引 %d (源行 %d)\n",
+                       (int)o_num, g_pc_jump_target,
+                       g_current_program->lines[g_pc].line_no);
+            }
+            continue;
+        }
+
+        // ---- Phase 2B M3: WHILE [<cond>] DO n (块循环头部) ----
+        // 求值条件: 真则进入循环体 (PC++), 假则跳到匹配 END 之后
+        // WHILE 后必须非字母 (防 WHILEX 误匹配)
+        if(toupper((unsigned char)p[0])=='W' && toupper((unsigned char)p[1])=='H' &&
+           toupper((unsigned char)p[2])=='I' && toupper((unsigned char)p[3])=='L' &&
+           toupper((unsigned char)p[4])=='E' && !isalpha((unsigned char)p[5])){
+            char *w_p = p + 5;
+            while(*w_p == ' ' || *w_p == '\t') w_p++;
+            if(*w_p != '['){
+                printf("[Parser] WHILE 后缺 '[' (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            w_p++;
+            const char *cond_p = w_p;
+            double cond = Evaluate_Expression(&cond_p);
+            while(*cond_p == ' ' || *cond_p == '\t') cond_p++;
+            if(*cond_p != ']'){
+                printf("[Parser] WHILE 条件缺 ']' (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            cond_p++;
+            // cond_p 此后应是 "DO n", 运行时不需解析编号 (预扫描已配对)
+            // 推进主游标到行尾
+            while(*cond_p) cond_p++;
+            p = (char *)cond_p;
+
+            if(!g_current_program){
+                printf("[Parser] WHILE 在无 program 上下文\n");
+                return -1;
+            }
+            int end_idx = g_current_program->do_to_end[g_pc];
+            if(end_idx < 0){
+                printf("[Parser] WHILE 行未配对 END (预扫描遗漏? 源行 %d)\n",
+                       g_current_program->lines[g_pc].line_no);
+                return -1;
+            }
+
+            if(cond != 0.0){
+                printf("[Parser] WHILE [...] (条件真) 进入循环 (源行 %d)\n",
+                       g_current_program->lines[g_pc].line_no);
+                // PC++ 由主循环处理
+            } else {
+                g_pc_jump_target = end_idx + 1;
+                g_pc_jump_pending = 1;
+                printf("[Parser] WHILE [...] (条件假) 跳到行索引 %d (源行 %d, 跳过循环体)\n",
+                       end_idx + 1, g_current_program->lines[end_idx].line_no);
+            }
+            continue;
+        }
+
+        // ---- Phase 2B M3: END n (块循环尾部, 无条件跳回 WHILE) ----
+        if(toupper((unsigned char)p[0])=='E' && toupper((unsigned char)p[1])=='N' &&
+           toupper((unsigned char)p[2])=='D' && !isalpha((unsigned char)p[3])){
+            // 推进主游标到行尾 (END n 的编号运行时不需校验, 预扫描已验证)
+            while(*p) p++;
+
+            if(!g_current_program){
+                printf("[Parser] END 在无 program 上下文\n");
+                return -1;
+            }
+            int do_idx = g_current_program->end_to_do[g_pc];
+            if(do_idx < 0){
+                printf("[Parser] END 行未配对 DO (预扫描遗漏? 源行 %d)\n",
+                       g_current_program->lines[g_pc].line_no);
+                return -1;
+            }
+            g_pc_jump_target = do_idx;
+            g_pc_jump_pending = 1;
+            printf("[Parser] END 跳回 WHILE 行索引 %d (源行 %d, 重新求值条件)\n",
+                   do_idx, g_current_program->lines[do_idx].line_no);
+            continue;
+        }
+
+        // ---- Phase 2B M2: IF [<cond>] GOTO n (条件跳转) ----
+        // 单行格式: IF [条件] GOTO 标签号
+        // 条件真则触发 g_pc_jump_pending (复用 M1 的跳转信号), 假则继续下一行
+        // IF 后必须非字母 (排除 IFX 等误匹配)
+        if(toupper((unsigned char)p[0])=='I' && toupper((unsigned char)p[1])=='F' &&
+           !(isalpha((unsigned char)p[2]))){
+            char *if_p = p + 2;
+            while(*if_p == ' ' || *if_p == '\t') if_p++;
+            if(*if_p != '['){
+                printf("[Parser] IF 后缺 '[' (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            if_p++;
+            const char *cond_p = if_p;
+            double cond = Evaluate_Expression(&cond_p);
+            while(*cond_p == ' ' || *cond_p == '\t') cond_p++;
+            if(*cond_p != ']'){
+                printf("[Parser] IF 条件缺 ']' (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            cond_p++;
+            while(*cond_p == ' ' || *cond_p == '\t') cond_p++;
+
+            // 期望 "GOTO n"
+            if(!(toupper((unsigned char)cond_p[0])=='G' &&
+                 toupper((unsigned char)cond_p[1])=='O' &&
+                 toupper((unsigned char)cond_p[2])=='T' &&
+                 toupper((unsigned char)cond_p[3])=='O')){
+                printf("[Parser] IF [...] 后必须跟 GOTO n (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            cond_p += 4;
+            while(*cond_p == ' ' || *cond_p == '\t') cond_p++;
+            char *end;
+            long label = strtol(cond_p, &end, 10);
+            if(end == cond_p){
+                printf("[Parser] IF GOTO 后缺标签号 (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            p = end;  // 推进主游标 (IF 行通常到此结束)
+
+            if(cond != 0.0){
+                if(!g_current_program){
+                    printf("[Parser] IF GOTO 在无 program 上下文\n");
+                    return -1;
+                }
+                int target = Program_FindLabel(g_current_program, (int)label);
+                if(target < 0){
+                    printf("[Parser] IF GOTO %d: 未定义的 N 标签 (源行 %d)\n",
+                           (int)label,
+                           g_current_program->lines[g_pc].line_no);
+                    return -1;
+                }
+                g_pc_jump_target = target;
+                g_pc_jump_pending = 1;
+                printf("[Parser] IF [...] GOTO %d (条件真) -> 行索引 %d (源行 %d)\n",
+                       (int)label, target,
+                       g_current_program->lines[target].line_no);
+            } else {
+                printf("[Parser] IF [...] GOTO %d (条件假, 不跳)\n", (int)label);
+            }
+            continue;
+        }
+
+        // ---- Phase 2B M1: GOTO 特殊词法 (4 字母关键字, 不走 letter+value 单字符解析) ----
+        // 大小写不敏感匹配 "GOTO", 后跟空格 + N 标签号
+        // 触发 g_pc_jump_pending 信号, parser_thread_func 主循环消费并跳转
+        if(toupper((unsigned char)p[0])=='G' && toupper((unsigned char)p[1])=='O' &&
+           toupper((unsigned char)p[2])=='T' && toupper((unsigned char)p[3])=='O'){
+            char *gp = p + 4;
+            while(*gp == ' ' || *gp == '\t') gp++;
+            char *end;
+            long label = strtol(gp, &end, 10);
+            if(end == gp){
+                printf("[Parser] GOTO 后缺标签号 (源行 %d)\n",
+                       g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
+            p = end;  // 推进主游标 (本行 GOTO 后通常无内容, 推进到行尾)
+
+            if(!g_current_program){
+                printf("[Parser] GOTO 在无 program 上下文 (旧调用路径?), 拒绝\n");
+                return -1;
+            }
+            int target = Program_FindLabel(g_current_program, (int)label);
+            if(target < 0){
+                printf("[Parser] GOTO %d: 未定义的 N 标签 (源行 %d)\n",
+                       (int)label,
+                       g_current_program->lines[g_pc].line_no);
+                return -1;
+            }
+            g_pc_jump_target = target;
+            g_pc_jump_pending = 1;
+            printf("[Parser] GOTO %d -> 跳转到行索引 %d (源行 %d)\n",
+                   (int)label, target,
+                   g_current_program->lines[target].line_no);
+            continue;
+        }
 
         // 括号注释 (...) — 支持 M03(LSON) 等紧贴写法
         if(*p=='('){
@@ -339,9 +600,36 @@ int parse_gcode_line(const char *gcode_line)
         // 换行符：行尾自然结束
         if(*p=='\n' || *p=='\r') break;
 
+        // ---- Fix C: 非 ASCII 字节 (UTF-8 中文等多字节字符) 静默跳过 ----
+        // 防止中文夹在词法单元中间污染 letter 语义 (如 "R中文-18" 被解析成 R=0)
+        // UTF-8 首字节 (0xC0-0xFD) 和续字节 (0x80-0xBF) 均高位为 1, 此检测覆盖所有非 ASCII
+        if(((unsigned char)*p) & 0x80){
+            p++;
+            continue;
+        }
+
         char letter=toupper(*p);
         p++;
-        double value=strtod(p, &p);
+
+        // 宏表达式/变量分支：遇到 '[' 或 '#' 走递归下降求值，否则继续 strtod
+        // 例：X[10*SIN[30]]、X#100、F[#101+5]
+        double value;
+        if(*p == '[' || *p == '#'){
+            const char *cp = p;                 // const 中转，避免 char** ↔ const char** 类型冲突
+            value = Evaluate_Expression(&cp);
+            p = (char *)cp;
+        } else {
+            // ---- Fix B: strtod 失败检测 ----
+            // 字母后无有效数值时 strtod 返回 0.0 且不推进 p, 旧逻辑会静默用 0 更新
+            // 模态字段 (如 R=0), 在 G91 下导致 cycle_R_plane 严重错误。
+            // 现改为: 检测 p 未推进 → 警告并跳过本词法单元, 不进入 switch
+            const char *before = p;
+            value = strtod(p, &p);
+            if(p == before){
+                printf("[Parser] 警告: '%c' 后无有效数值, 跳过该词法单元\n", letter);
+                continue;
+            }
+        }
 
         switch(letter){
             case 'G':
@@ -374,12 +662,80 @@ int parse_gcode_line(const char *gcode_line)
                 else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
                 else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
                 else if(value>=54.0 && value<=59.0) g_coord_mgr.current_coord = (int)value - 53; // 54->1(G54), 55->2(G55)...
+                // ---- Phase 2A.2: 固定循环 G80/G81/G82/G83/G98/G99 ----
+                else if(value == 80.0){
+                    // G80: 取消固定循环
+                    if(g_state.bspline_enabled) BSpline_Flush();
+                    g_state.active_cycle = 0;
+                }
+                else if(value == 81.0 || value == 82.0 || value == 83.0){
+                    // G81/G82/G83: 激活固定循环
+                    // 首次激活 (或 G80 后重新激活) 时捕获 cycle_initial_Z (G98 退回点)
+                    int z_idx_g81 = g_axis_map['Z' - 'A'];
+                    if(g_state.active_cycle == 0 && z_idx_g81 >= 0){
+                        g_state.cycle_initial_Z = g_state.current_pos[z_idx_g81];
+                    }
+                    g_state.active_cycle = (int)value;
+                }
+                else if(value == 98.0) g_state.cycle_retract_mode = 98;
+                else if(value == 99.0) g_state.cycle_retract_mode = 99;
                 break;
             case 'F':g_state.feedrate_mm_min=value;has_f=1;break;
             case 'I':offset_i=value;has_move=1;break;
             case 'J':offset_j=value;has_move=1;break;
             case 'K':offset_k=value;has_move=1;break;
-            case 'M':m_code=(int)value;break;
+            case 'L':
+                // Phase 2B M5: M98 L<重复次数>; 其他语境下 L 暂未使用
+                if(value < 0 || value > MAX_M98_REPEAT){
+                    printf("[Parser] L 值越界 (%g, 允许 0..%d, 源行 %d)\n",
+                           value, MAX_M98_REPEAT,
+                           g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                    return -1;
+                }
+                l_value = (int)value;
+                break;
+            case 'M':
+                m_code=(int)value;
+                // Phase 2B M1: 主程序中 M99 = 回到首行 (子程序 M99 行为留给 M5)
+                // Phase 2B M5: 栈非空时 M99 = 子程序返回 / 重复调用
+                if(m_code == 99 && g_current_program){
+                    if(g_call_stack_top > 0){
+                        CallFrame_t *f = &g_call_stack[g_call_stack_top - 1];
+                        if(f->repeat_remaining > 0){
+                            // 重复调用: 不弹栈, 不恢复 (modal/locals 保持隔离)
+                            // 每轮独立: 再次清零 #1-#33
+                            f->repeat_remaining--;
+                            Macro_ClearLocals();
+                            g_pc_jump_target  = f->entry_line;
+                            g_pc_jump_pending = 1;
+                            printf("[Parser] M99 重复调用 (剩 %d 次, 跳回入口 %d, 源行 %d)\n",
+                                   f->repeat_remaining, f->entry_line,
+                                   g_current_program->lines[g_pc].line_no);
+                        } else {
+                            // 真正返回: 恢复调用者 #1-#33 + modal 状态, 弹栈
+                            int ret = f->return_pc;
+                            Macro_SetLocals(f->saved_locals);
+                            g_state = f->saved_state;
+                            g_call_stack_top--;
+                            g_pc_jump_target  = ret;
+                            g_pc_jump_pending = 1;
+                            printf("[Parser] M99 返回调用者 (PC=%d, depth=%d, 源行 %d)\n",
+                                   ret, g_call_stack_top,
+                                   g_current_program->lines[g_pc].line_no);
+                        }
+                        m_code = -1;  // 不入队 M99
+                    } else {
+                        // 主程序 M99: 回到首行
+                        g_pc_jump_target = 0;
+                        g_pc_jump_pending = 1;
+                        printf("[Parser] M99 主程序循环 -> 回到首行\n");
+                        m_code = -1;
+                    }
+                }
+                // Phase 2B M5: M98 子程序调用
+                // 处理推迟到字母循环结束 (需要检查严格字母 + 已收齐 P/L)
+                // 这里仅标记, 不在 case 内立即处理
+                break;
             case 'D':
                 // D 代码: 刀具半径补偿值 (mm)
                 // 当 G41/G42 已在本行声明时，配合 D 值激活补偿
@@ -390,9 +746,20 @@ int parse_gcode_line(const char *gcode_line)
                     g_state.pending_comp_mode = COMP_OFF;
                 }
                 break;
-            case 'P':p_value=value;break;
-            case 'Q':q_value=value;break;
-            case 'R':r_value=value;break;
+            case 'P':
+                p_value=value;
+                if(g_state.active_cycle == 82) g_state.cycle_dwell_ms = value;
+                break;
+            case 'Q':
+                q_value=value;
+                if(g_state.active_cycle == 83) g_state.cycle_peck_depth = value;
+                break;
+            case 'R':
+                r_value=value;
+                has_r=1;
+                // 注: cycle_R_plane 的捕获延迟到运动门控分支
+                // (G91 模式下 R 相对 cycle_initial_Z, 需先确定 G90/G91 再转换)
+                break;
             case 'S':s_value=value;break;
             default:
                 // 动态轴映射：任何 A-Z 字母若在 g_axis_map 中有映射则视为运动轴
@@ -402,11 +769,69 @@ int parse_gcode_line(const char *gcode_line)
                         val_axis[idx] = value;
                         has_move = 1;
                         has_axis[idx] = 1;
+                        // 注: Z 值到 cycle_Z_bottom 的捕获延迟到运动门控分支
+                        // (G91 模式下 Z 相对 R 平面, 需 G90/G91 转换 + R 先于 Z 处理)
                     }
                     // 未映射字母静默忽略（可能是注释残留或非标指令）
                 }
                 break;
         }
+    }
+
+    // ---- Phase 2B M5: M98 子程序调用 (字母循环结束后统一处理) ----
+    // 严格字母检查: M98 行只允许 P (子程序号) 和 L (重复次数)
+    // 任何轴字母 (X/Y/Z/A/B/C/I/J/K/R/D/F/S...) 出现 → 报错
+    // L=0 视为 no-op (Fanuc 0i/30i 标准)
+    if(m_code == 98){
+        if(has_move){
+            printf("[Parser] M98 行不允许运动指令字母 (源行 %d)\n",
+                   g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+            return -1;
+        }
+        if(!g_current_program){
+            printf("[Parser] M98 在无 program 上下文\n");
+            return -1;
+        }
+        if(l_value == 0){
+            // L=0 no-op: 不调用, M98 行视为空操作
+            printf("[Parser] M98 P%d L0 no-op (源行 %d)\n",
+                   (int)p_value, g_current_program->lines[g_pc].line_no);
+            return 0;
+        }
+        if(p_value < 1.0){
+            printf("[Parser] M98 缺 P<Onum> 或 P<1 (源行 %d)\n",
+                   g_current_program->lines[g_pc].line_no);
+            return -1;
+        }
+        int o_idx = Program_FindOLabel(g_current_program, (int)p_value);
+        if(o_idx < 0){
+            printf("[Parser] M98 P%d 未找到子程序 (源行 %d)\n",
+                   (int)p_value, g_current_program->lines[g_pc].line_no);
+            return -1;
+        }
+        if(g_call_stack_top >= MAX_CALL_DEPTH){
+            printf("[Parser] M98 子程序嵌套超 %d (源行 %d)\n",
+                   MAX_CALL_DEPTH, g_current_program->lines[g_pc].line_no);
+            return -1;
+        }
+        int entry = g_current_program->o_labels[o_idx].line_idx;
+        // 压栈: 保存调用者 PC, 入口, 剩余次数, 局部变量, modal 状态
+        CallFrame_t *f = &g_call_stack[g_call_stack_top];
+        f->return_pc        = g_pc + 1;
+        f->entry_line       = entry;
+        f->repeat_remaining = l_value - 1;
+        Macro_GetLocals(f->saved_locals);
+        f->saved_state      = g_state;
+        g_call_stack_top++;
+        // 现代语义: 子程序看到的 #1-#33 是清零的副本 (隔离)
+        Macro_ClearLocals();
+        // 跳到子程序入口 (O 行)
+        g_pc_jump_target  = entry;
+        g_pc_jump_pending = 1;
+        printf("[Parser] M98 P%d L%d 调用子程序 (entry=%d, depth=%d, 源行 %d)\n",
+               (int)p_value, l_value, entry, g_call_stack_top,
+               g_current_program->lines[g_pc].line_no);
+        return 0;  // 不入 mcode 队列
     }
 
     // 处理M代码：压入队列作为同步屏障
@@ -428,6 +853,74 @@ int parse_gcode_line(const char *gcode_line)
             }
             printf("[Parser] 解析M代码: M%02d S%.1f P%.1f Q%.1f R%.1f\n", m_code, s_value, p_value, q_value, r_value);
         }
+    }
+
+    // ---- Phase 2A.2: 固定循环优先路径 (在常规运动门控前拦截) ----
+    // 固定循环激活时, XY 运动展开为钻孔循环; 跳过常规 G00/G01/G02/G03 分发
+    if(has_move && !is_non_motion_g && g_state.active_cycle != 0){
+        int z_idx_fc = g_axis_map['Z' - 'A'];
+        if(z_idx_fc < 0){
+            printf("[Parser] 固定循环要求 Z 轴已映射！拒绝执行\n");
+            return -1;
+        }
+
+        // ---- Phase 2A++: G90/G91 双模式 R/Z 捕获 (顺序: 先 R 后 Z) ----
+        // G90 (绝对): R 和 Z 直接使用本行原始值
+        // G91 (相对, Fanuc 标准):
+        //   R 相对 cycle_initial_Z (本行激活时已捕获)
+        //   Z 相对 (本行新 R 或上一次模态 R) 平面
+        if(has_r){
+            if(g_state.is_absolute){
+                g_state.cycle_R_plane = r_value;
+            } else {
+                g_state.cycle_R_plane = g_state.cycle_initial_Z + r_value;
+            }
+        }
+        if(has_axis[z_idx_fc]){
+            if(g_state.is_absolute){
+                g_state.cycle_Z_bottom = val_axis[z_idx_fc];
+            } else {
+                // G91: Z 相对 R 平面 (本行已更新的 R 优先, 否则用模态 R)
+                g_state.cycle_Z_bottom = g_state.cycle_R_plane + val_axis[z_idx_fc];
+            }
+        }
+
+        // 构造 cycle 目标位置 (统一转为绝对坐标, G91 在此转换)
+        double cycle_target[AXIS_NUM];
+        for(int i = 0; i < AXIS_NUM; i++){
+            if(has_axis[i]){
+                cycle_target[i] = g_state.is_absolute
+                                  ? val_axis[i]
+                                  : g_state.current_pos[i] + val_axis[i];
+            } else {
+                cycle_target[i] = g_state.current_pos[i];
+            }
+        }
+
+        // 钻孔尖角不应平滑: 进入循环前强制 Flush
+        if(g_state.bspline_enabled) BSpline_Flush();
+
+        if(generate_fixed_cycle(cycle_target, g_state.current_pos,
+                                 g_state.feedrate_mm_min) < 0){
+            printf("[Parser] 固定循环入队失败(报警)，中止当前文件！\n");
+            return -1;
+        }
+
+        // 更新 g_state.current_pos 到退回点 (G98=initial_Z, G99=R_plane)
+        double retract_Z = (g_state.cycle_retract_mode == 99)
+                           ? g_state.cycle_R_plane : g_state.cycle_initial_Z;
+        for(int i = 0; i < AXIS_NUM; i++){
+            if(i == z_idx_fc){
+                g_state.current_pos[i] = retract_Z;
+            } else {
+                g_state.current_pos[i] = cycle_target[i];
+            }
+        }
+
+        printf("[Parser] 固定循环 G%d 完成: 孔深 Z=%.3f, R平面=%.3f, 退回=%s\n",
+               g_state.active_cycle, g_state.cycle_Z_bottom, g_state.cycle_R_plane,
+               (g_state.cycle_retract_mode == 99) ? "R平面(G99)" : "初始Z(G98)");
+        return 0;
     }
 
     // 运动门控：仅当本行包含显式轴运动且非运动参数指令时才触发轨迹下发
@@ -609,25 +1102,23 @@ int parse_gcode_line(const char *gcode_line)
 }
 
 OSAL_THREAD_FUNC parser_thread_func(void *arg){
-    char line_buffer[256];
-    
     while(1){
-
-        //1.
         if(g_parser_ctrl.is_running==1){
-
-
             while(!g_all_axis_op_ready){
-                osal_usleep(100000); // 等待所有轴准备就   
+                osal_usleep(100000); // 等待所有轴准备就绪
             }
-            
+
             printf("[Parser] Processing file: %s\n", g_parser_ctrl.filepath);
-            FILE *fp=fopen(g_parser_ctrl.filepath,"r");
-            if(fp==NULL){
-                printf("[Parser错误] 无法打开文件: %s\n", g_parser_ctrl.filepath);
+
+            // ---- Phase 2B M1: 全文加载替代 fgets 流 ----
+            // 一次性把文件读入内存, 建立 N 标签表, 供 PC 游标遍历 + GOTO 跳转
+            GCodeProgram_t *prog = Program_Load(g_parser_ctrl.filepath);
+            if(!prog){
+                printf("[Parser错误] 加载失败: %s\n", g_parser_ctrl.filepath);
                 g_parser_ctrl.is_running=0;
                 continue;
             }
+            g_current_program = prog;
 
             while(!is_trajectory_finished()){
                 osal_usleep(100000); // 等待当前轨迹执行完成，检查频率为100ms
@@ -638,37 +1129,221 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             for(int i=0;i<AXIS_NUM;i++){
                 g_state.current_pos[i]=api_get_cursor(i);
             }
-            //g_state.current_x_mm=api_get_cursor_x();
-            //g_state.current_y_mm=api_get_cursor_y();
-            //g_state.current_z_mm=api_get_cursor_z();
 
-            while(fgets(line_buffer,sizeof(line_buffer),fp)!=NULL){
+            // ---- Phase 2B M1: PC 游标主循环 (替代原 fgets while) ----
+            g_pc = 0;
+            g_pc_jump_pending = 0;
+            g_pc_step_counter = 0;
+            g_call_stack_top = 0;   // Phase 2B M5: 子程序调用栈重置 (防上次运行残留)
+            int abort_file = 0;
+
+            while(g_pc < prog->num_lines){
+                // 步进计数器防死循环 (无条件 GOTO 后向跳转的兜底保护)
+                if(g_pc_step_counter >= MAX_PC_STEPS){
+                    printf("[Parser] PC 步进超 %d (疑似死循环), 中止文件\n",
+                           MAX_PC_STEPS);
+                    abort_file = 1;
+                    break;
+                }
+                g_pc_step_counter++;
+
                 if(g_parser_ctrl.abort_request){
                     printf("[Parser] 中止请求已收到，停止解析文件: %s\n", g_parser_ctrl.filepath);
+                    abort_file = 1;
                     break;
                 }
                 // 暂停检查
                 while(g_parser_ctrl.is_paused){
                     osal_usleep(100000); // 暂停时每100ms检查一次状态
                 }
-                // 解析当前行G-code命令，入队失败(报警)则中止文件
-                if(parse_gcode_line(line_buffer) < 0){
-                    printf("[Parser] 入队失败，中止文件解析: %s\n", g_parser_ctrl.filepath);
+
+                // 解析当前行 G-code 命令 (PC 指向), 入队失败或 GOTO 错则中止文件
+                if(parse_gcode_line(prog->lines[g_pc].text) < 0){
+                    printf("[Parser] 行 %d 解析失败, 中止文件: %s\n",
+                           prog->lines[g_pc].line_no, g_parser_ctrl.filepath);
+                    abort_file = 1;
                     break;
                 }
+
+                // 跳转信号消费: parse_gcode_line 内部设置 g_pc_jump_pending
+                if(g_pc_jump_pending){
+                    g_pc = g_pc_jump_target;
+                    g_pc_jump_pending = 0;
+                } else {
+                    g_pc++;
+                }
             }
-            fclose(fp);
+
+            Program_Free(prog);
+            g_current_program = NULL;
+
             if(g_state.bspline_enabled){
                 BSpline_Flush();
             }
             api_flush_planner();
-            printf("[Parser] 文件处理完成: %s\n", g_parser_ctrl.filepath);
+
+            // Phase 2B M5: 子程序未返回检测 (非致命, 便于调试)
+            if(!abort_file && g_call_stack_top != 0){
+                printf("[Parser] 警告: 文件结束时调用栈非空 (depth=%d, 子程序缺 M99?)\n",
+                       g_call_stack_top);
+                g_call_stack_top = 0;  // 强制清零, 防污染下次运行
+            }
+
+            if(!abort_file){
+                printf("[Parser] 文件处理完成: %s (PC 步进 %d)\n",
+                       g_parser_ctrl.filepath, g_pc_step_counter);
+            }
             g_parser_ctrl.is_running=0; // 处理完成后重置状态
             g_parser_ctrl.abort_request=0; // 重置中止请求
         }
 
         osal_usleep(50000); // 主循环每50ms检查一次状态
     }
+}
+
+// @Context: Non-RealTime Background Thread (parser)
+// @Safe: 纯坐标计算 + api_push_trajectory 入队, 与 generate_arc_trajectory 同级
+//
+// 固定循环展开 (G81/G82/G83):
+//   1. 快速 XY 到孔位 (Z 保持当前)
+//   2. 快速 Z 降到 R 平面 (若当前 Z 高于 R)
+//   3. 工进 Z 到孔底:
+//      - G81/G82: 单次工进
+//      - G83: 啄钻循环 (每 cycle_peck_depth mm 退回 R 排屑, 安全上限 10000 次)
+//   4. 快速 Z 退回: G98=cycle_initial_Z, G99=R 平面
+//
+// 限制 (Phase 2A.2 简化版):
+//   - G82 孔底暂停 (cycle_dwell_ms) 暂未实现, 行为同 G81
+//   - G83 退回后无 "快速降至距上次切削 0.5mm" 优化
+//
+// 安全检查:
+//   - Z 轴必须已映射
+//   - Z_bottom 必须 < R_plane
+//   - G83 cycle_peck_depth 必须 > 0
+//   - G83 啄钻次数 <= 10000 (防 Q 极小死循环)
+//
+// 返回值: 0=成功, -1=安全检查失败或入队被拒
+int generate_fixed_cycle(double target_pos[AXIS_NUM],
+                          double start_pos[AXIS_NUM],
+                          double feedrate_mm_min)
+{
+    int z_idx = g_axis_map['Z' - 'A'];
+    if(z_idx < 0){
+        printf("[Parser] 固定循环要求 Z 轴已映射！\n");
+        return -1;
+    }
+
+    double R_plane   = g_state.cycle_R_plane;
+    double Z_bottom  = g_state.cycle_Z_bottom;
+    double retract_Z = (g_state.cycle_retract_mode == 99)
+                        ? R_plane : g_state.cycle_initial_Z;
+
+    // ---- 安全检查 ----
+    if(Z_bottom >= R_plane){
+        printf("[Parser] 固定循环 G%d: 孔底 Z(%.3f) 必须 < R 平面(%.3f)！拒绝\n",
+               g_state.active_cycle, Z_bottom, R_plane);
+        return -1;
+    }
+    if(g_state.active_cycle == 83 && g_state.cycle_peck_depth <= 0.0){
+        printf("[Parser] G83 啄钻步进 Q 必须 > 0！当前 Q=%.3f\n", g_state.cycle_peck_depth);
+        return -1;
+    }
+
+    double pos[AXIS_NUM];
+    memcpy(pos, start_pos, sizeof(double) * AXIS_NUM);
+
+    double rapid_speed = RAPID_SPEED_MM_MIN / 60.0;   // mm/s
+    double feed_speed  = feedrate_mm_min / 60.0;
+    if(feed_speed < 1e-6) feed_speed = 1e-6;
+
+    // ---- 1. 快速 XY 到孔位 (Z 保持) ----
+    for(int i = 0; i < AXIS_NUM; i++){
+        if(i == z_idx) continue;
+        pos[i] = target_pos[i];
+    }
+    if(api_push_trajectory(pos, rapid_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+
+    // ---- 2. 快速 Z 降到 R 平面 (若当前 Z 高于 R) ----
+    if(pos[z_idx] > R_plane){
+        pos[z_idx] = R_plane;
+        if(api_push_trajectory(pos, rapid_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+    }
+
+    // ---- 3. 工进 / 啄钻 ----
+    if(g_state.active_cycle == 83){
+        // G83: 啄钻循环 (Phase 2A++ 优化版)
+        // 工业标准: 退回 R 排屑后, 快速降至 last_cut_Z + CLEARANCE_MM,
+        //           再工进 peck_depth (减少空切削时间)
+        // 切削量保证: 每次工进 feed_end_Z - feed_start_Z = peck_depth (最后一段可能更短)
+        const int peck_limit = 10000;
+        const double CLEARANCE_MM = 0.5;  // 快速降至距上次孔底 0.5mm
+        double last_cut_Z = R_plane;     // 上次工进终点 (首次从 R 开始)
+        int peck_count = 0;
+
+        while(last_cut_Z > Z_bottom + 1e-9 && peck_count < peck_limit){
+            // 本次工进起点: 首次为 R, 后续为 last_cut_Z + CLEARANCE_MM
+            double feed_start_Z = (peck_count == 0)
+                                  ? R_plane : last_cut_Z + CLEARANCE_MM;
+            if(feed_start_Z > R_plane) feed_start_Z = R_plane;
+            // 本次工进终点: peck_depth 之下, 但不超过 Z_bottom
+            double feed_end_Z = feed_start_Z - g_state.cycle_peck_depth;
+            if(feed_end_Z < Z_bottom) feed_end_Z = Z_bottom;
+
+            // (非首次) 快速降至 feed_start_Z (排屑后回切)
+            if(peck_count > 0){
+                pos[z_idx] = feed_start_Z;
+                if(api_push_trajectory(pos, rapid_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+            }
+
+            // 工进 feed_end_Z (切削)
+            pos[z_idx] = feed_end_Z;
+            if(api_push_trajectory(pos, feed_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+
+            // 退回 R 平面 (排屑)
+            pos[z_idx] = R_plane;
+            if(api_push_trajectory(pos, rapid_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+
+            last_cut_Z = feed_end_Z;
+            peck_count++;
+        }
+        if(peck_count >= peck_limit){
+            printf("[Parser] G83 啄钻次数超限 %d, 中止 (Q=%.3f 可能过小)\n",
+                   peck_limit, g_state.cycle_peck_depth);
+            return -1;
+        }
+    } else {
+        // G81/G82: 单次工进
+        pos[z_idx] = Z_bottom;
+        if(api_push_trajectory(pos, feed_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+
+        // ---- Phase 2A++: G82 孔底暂停 (parser 级阻塞方案) ----
+        // 实现: 等待队列排空 (确保工进到位) → 轮询 sleep dwell_ms
+        // 已知限制:
+        //   - 暂停期间 parser 阻塞, 后续 G-code 行延迟处理 (短 dwell 可接受)
+        //   - dwell 期间通过 10ms 轮询响应 abort_request
+        if(g_state.active_cycle == 82 && g_state.cycle_dwell_ms > 0.0){
+            while(!is_trajectory_finished()){
+                if(g_parser_ctrl.abort_request) return -1;
+                osal_usleep(1000);  // 1ms 轮询队列状态
+            }
+            int dwell_us = (int)(g_state.cycle_dwell_ms * 1000.0);
+            const int poll_step_us = 10000;  // 10ms 轮询步长
+            int elapsed_us = 0;
+            while(elapsed_us < dwell_us){
+                if(g_parser_ctrl.abort_request) return -1;
+                int step = (dwell_us - elapsed_us < poll_step_us)
+                           ? (dwell_us - elapsed_us) : poll_step_us;
+                osal_usleep(step);
+                elapsed_us += step;
+            }
+        }
+    }
+
+    // ---- 4. 快速 Z 退回 ----
+    pos[z_idx] = retract_Z;
+    if(api_push_trajectory(pos, rapid_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+
+    return 0;
 }
 
 // @Context: Non-RealTime Background Thread (parser)
