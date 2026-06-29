@@ -1,0 +1,74 @@
+[SIM] *** 纯软件仿真模式已激活 ***
+
+==============================================
+     SMC 五轴高端数控系统内核 (V2.0) 
+     [SIMULATION MODE - 无真实硬件]
+==============================================
+[系统初始化] 五轴控制系统已初始化，等待SOEM主站配置...
+[SMC_API] 配置 'X' → 房间[0], 字母 'X', 单驱 ID:5
+[SMC_API] 配置 'Y' → 房间[1], 字母 'Y', 双驱 主ID:3 从ID:4
+[SMC_API] 配置 'Z' → 房间[2], 字母 'Z', 单驱 ID:6
+[SMC_API] 配置 'C' → 房间[3], 字母 'C', 单驱 ID:1
+[SMC_API] 配置 'B' → 房间[4], 字母 'B', 单驱 ID:2
+[SMC_API] X 动力学: type=0, Vmax=50.0, Amax=200.0, Dmax=200.0, eq_radius=0.00
+[SMC_API] Y 动力学: type=0, Vmax=50.0, Amax=200.0, Dmax=200.0, eq_radius=0.00
+[SMC_API] Z 动力学: type=0, Vmax=30.0, Amax=100.0, Dmax=100.0, eq_radius=0.00
+[SMC_API] C 动力学: type=1, Vmax=18.0, Amax=72.0, Dmax=72.0, eq_radius=50.00
+[SMC_API] B 动力学: type=1, Vmax=18.0, Amax=72.0, Dmax=72.0, eq_radius=80.00
+[SMC_API] 运动学偏置: tool_len=150.00 mm, pivot=(0.00, 0.00, 200.00) mm
+[SMC_API] 运动学构型: type=1, R1=[idx=4,axis=1], R2=[idx=3,axis=2]
+[SMC_API] 规划器参数: tolerance=0.0500, centripetal_acc=500.0
+[SMC_API] 正在初始化运动控制内核...
+[BSpline] 引擎初始化完成 (step=0.20mm, wake=30, core=2)
+[BSpline] 平滑线程已启动
+[BSpline] 已绑定到 CPU Core 2
+[Trace] 无锁探针队列初始化完成 (RT SPSC=8192, Pipeline MPMC=4096)
+[SimEngine] 双缓冲采集器就绪 (容量=1048576 x2, 72 MB/buf, 格式=CSV, 文件=cnc_trace_log_20260629_105905.csv)
+[SimEngine] 落盘线程已启动
+[SMC_API] 仿真模式: 跳过 ecat_bringup
+[SMC_API] 等待伺服全轴使能并进入 CSP 同步...
+[RT] 已设置FIFO调度，优先级99
+[RT] 初始化完成，等待dorun启动
+[SMC_API] 内核启动完毕，伺服就绪！
+
+[系统] 上电物理原点已锚定 (G53 机械坐标建立)。
+[API] 已设置 G54 坐标系零点，当前G53位置 (0.000, 0.000, 0.000)
+[系统] G54 逻辑坐标系初始化完毕！准备接受操作员指令。
+
+----------------------------------------------
+  1. 回归原点 (回到 G54 工件坐标 0,0,0,0,0)
+  2. 设定原点 (将当前位置锚定为新 G54 原点)
+  3. 相对点动 (智能量纲 JOG 面板)
+  4. 加工图纸 (运行 G 代码文件)
+  5. 刹车测试 (运行中途触发 Feedhold 暂停)
+  0. 关机退出
+----------------------------------------------
+请输入操作编号 (0-5): 
+请输入要运行的 G代码 文件名 (如 test.txt): [执行] 开始后台加工图纸 tests/gcode/test_if_loop.nc...
+[Parser] Processing file: tests/gcode/test_if_loop.nc
+[Loader] WHILE/DO/END 配对完成: 0 对
+[Loader] 加载完成: 9 行, 1 个 N 标签 (源文件: tests/gcode/test_if_loop.nc)
+[Macro] #1 = 0
+[Parser] G01 X[#1 * 10] F500
+ -> X=0.000 Y=0.000 Z=0.000 B=0.000 C=0.000 F=500.0
+[Macro] #1 = 1
+[Parser] IF [...] GOTO 100 (条件真) -> 行索引 4 (源行 5)
+[Parser] G01 X[#1 * 10] F500
+ -> X=10.000 Y=0.000 Z=0.000 B=0.000 C=0.000 F=500.0
+[Macro] #1 = 2
+[Parser] IF [...] GOTO 100 (条件真) -> 行索引 4 (源行 5)
+[Parser] G01 X[#1 * 10] F500
+ -> X=20.000 Y=0.000 Z=0.000 B=0.000 C=0.000 F=500.0
+[Macro] #1 = 3
+[Parser] IF [...] GOTO 100 (条件真) -> 行索引 4 (源行 5)
+[Parser] G01 X[#1 * 10] F500
+ -> X=30.000 Y=0.000 Z=0.000 B=0.000 C=0.000 F=500.0
+[Macro] #1 = 4
+[Parser] IF [...] GOTO 100 (条件真) -> 行索引 4 (源行 5)
+[Parser] G01 X[#1 * 10] F500
+ -> X=40.000 Y=0.000 Z=0.000 B=0.000 C=0.000 F=500.0
+[Macro] #1 = 5
+[Parser] IF [...] GOTO 100 (条件假, 不跳)
+[Parser] 解析M代码: M30 S0.0 P0.0 Q0.0 R0.0
+[Parser] 文件处理完成: tests/gcode/test_if_loop.nc (PC 步进 25)
+[K[IDLE ] Q:  0 | X:  40.000 mm  Y:   0.000 mm  Z:   0.000 mm  B:   0.000 °  C:   0.000 °  
