@@ -1,0 +1,273 @@
+#ifndef SMC_PROTOCOL_H
+#define SMC_PROTOCOL_H
+
+/* =====================================================================
+ *  smc_protocol.h  ——  CNC Core RPC 共享通讯协议 (全量映射 smc_api.h)
+ *
+ *  作用: CNC Core (Linux/纯C) 与 CAM/HMI (Windows或Linux/C++) 之间
+ *        通过自定义二进制 TCP 协议交换的"信封"与"载荷"定义。
+ *
+ *  设计原则:
+ *    1. 纯 C 语法, 同时被 rpc_server.c (C) 与 SmcControllerSdk (C++) 包含。
+ *    2. #pragma pack(push, 1) 强制一字节对齐, 防止跨编译器/跨位宽结构体空洞。
+ *    3. 所有整数字段使用 stdint.h 精确位宽 (uint16_t/int32_t/...),
+ *       SDK 公开方法可用 int 接收, 隐式转换到 int32_t 入 wire。
+ *    4. 字符串字段使用定长数组 (netif_name/axis_name/filepath/status_str),
+ *       C 端无需做长度前缀解析, 接收端再强制 '\0' 终结防越界。
+ *    5. 函数原本返回 void 时, 不定义 Res 结构 (响应 data_len = 0);
+ *       原本返回 int 时, Res 仅含 int32_t ret_code, 与协议层 err_code 解耦。
+ *
+ *  字节序: 默认双方同字节序 (x86/ARM 小端)。跨序部署需在 SmcReqHeader
+ *          加 magic 字段并对多字节字段做 ntohl/htonl。当前版本暂不引入。
+ * ===================================================================== */
+
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#pragma pack(push, 1)
+
+/* ============================================================
+ * 1. 公共常量
+ * ============================================================ */
+#define SMC_MAX_PAYLOAD_BYTES    4096   /* 单包 payload 防御性上限 */
+#define SMC_AXIS_ALL             '*'    /* 全轴通配符, 与 smc_api.h 一致 */
+
+#define SMC_NETIF_NAME_MAX_LEN   32     /* 网卡名 e.g. "eth0" */
+#define SMC_AXIS_NAME_MAX_LEN    32     /* 轴名 e.g. "X轴", "B" */
+#define SMC_FILEPATH_MAX_LEN     256    /* G 代码文件绝对路径 */
+#define SMC_STATUS_STR_MAX_LEN   32     /* 系统状态字符串缓冲 */
+
+/* ============================================================
+ * 2. 命令类型枚举
+ *    按功能段划分并预留空号, 便于未来追加新 API 而不打乱编号。
+ * ============================================================ */
+typedef enum {
+    /* --- 系统生命周期 0x0001 ~ 0x000F --- */
+    SMC_CMD_INIT_AND_START           = 0x0001,
+    SMC_CMD_CLOSE                    = 0x0002,
+
+    /* --- 轴配置 0x0010 ~ 0x001F --- */
+    SMC_CMD_CONFIG_AXIS_TOPOLOGY     = 0x0010,
+    SMC_CMD_CONFIG_SOFT_LIMIT        = 0x0011,
+    SMC_CMD_CONFIG_GANTRY_SYNC_ALARM = 0x0012,
+    SMC_CMD_CONFIG_PULSE_PER_UNIT    = 0x0013,
+    SMC_CMD_CONFIG_AXIS_DYNAMICS     = 0x0014,
+    SMC_CMD_CONFIG_PLANNER_PARAMS    = 0x0015,
+    SMC_CMD_CONFIG_KINEMATICS_OFFSET = 0x0016,
+    SMC_CMD_CONFIG_KINEMATICS        = 0x0017,
+
+    /* --- 坐标与状态查询 0x0020 ~ 0x002F --- */
+    SMC_CMD_GET_LOGICAL_POS          = 0x0020,
+    SMC_CMD_IS_PARSER_RUNNING        = 0x0021,
+    SMC_CMD_IS_MOTION_DONE           = 0x0022,
+    SMC_CMD_GET_QUEUE_COUNT          = 0x0023,
+    SMC_CMD_IS_AXIS_CONFIGURED       = 0x0024,
+    SMC_CMD_GET_SYSTEM_STATUS        = 0x0025,
+
+    /* --- 运动控制 0x0030 ~ 0x003F --- */
+    SMC_CMD_SET_ZERO                 = 0x0030,
+    SMC_CMD_MOVE_RELATIVE            = 0x0031,
+    SMC_CMD_GO_ZERO                  = 0x0032,
+
+    /* --- G 代码加工 0x0040 ~ 0x004F --- */
+    SMC_CMD_RUN_GCODE_FILE           = 0x0040,
+    SMC_CMD_PAUSE_PROCESSING         = 0x0041,
+    SMC_CMD_RESUME_PROCESSING        = 0x0042,
+    SMC_CMD_ABORT_PROCESSING         = 0x0043,
+} SmcCmdType;
+
+/* ============================================================
+ * 3. 协议层错误码
+ *    正数/0 = 成功; 负数 = 协议层/调用层失败。
+ *    业务函数的返回值 (如 SMC_RunGCodeFile 的 int) 不复用此空间,
+ *    放进各自 Response Payload, 二者职责分离。
+ * ============================================================ */
+typedef enum {
+    SMC_OK              =  0,
+    SMC_ERR_UNKNOWN_CMD = -1,   /* 未知 cmd_type */
+    SMC_ERR_PARAM       = -2,   /* payload 长度不足或字段非法 */
+    SMC_ERR_SOCKET      = -3,   /* recv/send 失败或对端关闭 */
+    SMC_ERR_INTERNAL    = -4,   /* 内存分配/流失步等内部错误 */
+} SmcErrCode;
+
+/* ============================================================
+ * 4. 包头 (一切命令通用, 定长)
+ *    一次完整请求 = SmcReqHeader + Payload[data_len]
+ *    一次完整响应 = SmcResHeader + Payload[data_len]
+ * ============================================================ */
+typedef struct {
+    uint16_t cmd_type;     /* SmcCmdType */
+    uint16_t data_len;     /* 紧随其后的 payload 字节数 */
+} SmcReqHeader;            /* 4 字节 */
+
+typedef struct {
+    int32_t  err_code;     /* SmcErrCode, SMC_OK 表示业务成功 */
+    uint32_t data_len;     /* 紧随其后的 payload 字节数 */
+} SmcResHeader;            /* 8 字节 */
+
+/* ============================================================
+ * 5. 业务 Payload (与 smc_api.h 全量对应)
+ * ============================================================ */
+
+/* ----- 系统生命周期 ----- */
+typedef struct {
+    char netif_name[SMC_NETIF_NAME_MAX_LEN];
+} SmcInitAndStartReq;
+
+typedef struct {
+    int32_t ret_code;
+} SmcInitAndStartRes;
+
+/* SMC_CLOSE: 无 Req, 无 Res (业务 void 返回) */
+
+/* ----- 轴配置 ----- */
+typedef struct {
+    char    axis_name[SMC_AXIS_NAME_MAX_LEN];
+    int32_t is_dual_drive;
+    int32_t master_id;
+    int32_t slave_id;
+} SmcConfigAxisTopologyReq;
+typedef struct {
+    int32_t ret_code;
+} SmcConfigAxisTopologyRes;
+
+typedef struct {
+    char    axis_letter;
+    int32_t enable;
+    double  neg_limit_mm;
+    double  pos_limit_mm;
+} SmcConfigSoftLimitReq;
+typedef struct {
+    int32_t ret_code;
+} SmcConfigSoftLimitRes;
+
+typedef struct {
+    char    axis_letter;
+    int32_t enable;
+    int32_t tolerance_pulse;
+    int32_t max_error_pulse;
+    int32_t time_ms;
+} SmcConfigGantrySyncAlarmReq;
+typedef struct {
+    int32_t ret_code;
+} SmcConfigGantrySyncAlarmRes;
+
+typedef struct {
+    char   axis_letter;
+    double pulse_per_unit;
+} SmcConfigPulsePerUnitReq;
+/* SMC_CONFIG_PULSE_PER_UNIT: void 返回, 无 Res */
+
+typedef struct {
+    char    axis_letter;
+    int32_t type;
+    double  max_v;
+    double  max_a;
+    double  max_d;
+    double  equivalent_radius;
+} SmcConfigAxisDynamicsReq;
+typedef struct {
+    int32_t ret_code;
+} SmcConfigAxisDynamicsRes;
+
+typedef struct {
+    double tolerance;
+    double max_centripetal_acc;
+} SmcConfigPlannerParamsReq;
+typedef struct {
+    int32_t ret_code;
+} SmcConfigPlannerParamsRes;
+
+typedef struct {
+    double tool_len;
+    double pivot_x;
+    double pivot_y;
+    double pivot_z;
+} SmcConfigKinematicsOffsetReq;
+/* SMC_CONFIG_KINEMATICS_OFFSET: void 返回, 无 Res */
+
+typedef struct {
+    int32_t type;
+    int32_t r1_idx;
+    int32_t r1_axis;
+    int32_t r2_idx;
+    int32_t r2_axis;
+    double  tool_off[3];
+    double  pivot_off[3];
+} SmcConfigKinematicsReq;
+/* SMC_CONFIG_KINEMATICS: void 返回, 无 Res */
+
+/* ----- 坐标与状态查询 ----- */
+typedef struct {
+    char axis_letter;
+} SmcGetLogicalPosReq;
+typedef struct {
+    double position;       /* 单位: 脉冲 (机械绝对当量) */
+} SmcGetLogicalPosRes;
+
+/* SMC_IS_PARSER_RUNNING: 无 Req */
+typedef struct {
+    int32_t running;       /* 1=解析/加工中, 0=空闲 */
+} SmcIsParserRunningRes;
+
+/* SMC_IS_MOTION_DONE: 无 Req */
+typedef struct {
+    int32_t done;          /* 1=运动结束, 0=进行中 */
+} SmcIsMotionDoneRes;
+
+/* SMC_GET_QUEUE_COUNT: 无 Req */
+typedef struct {
+    int32_t count;         /* FIFO 堆积指令数 */
+} SmcGetQueueCountRes;
+
+typedef struct {
+    char axis_letter;
+} SmcIsAxisConfiguredReq;
+typedef struct {
+    int32_t configured;    /* 1=已映射, 0=未配置 */
+} SmcIsAxisConfiguredRes;
+
+/* SMC_GET_SYSTEM_STATUS_STR: 无 Req */
+typedef struct {
+    char status_str[SMC_STATUS_STR_MAX_LEN];  /* "ALARM"/"HOLD"/"RUN"/"IDLE" */
+} SmcGetSystemStatusRes;
+
+/* ----- 运动控制 ----- */
+typedef struct {
+    char axis_letter;      /* '*' 全轴归零 */
+} SmcSetZeroReq;
+/* SMC_SET_ZERO: void 返回, 无 Res */
+
+typedef struct {
+    char   axis_letter;    /* '*' 全轴联动 */
+    double distance;       /* mm */
+    double speed;          /* 速度参数, 透明转发 */
+} SmcMoveRelativeReq;
+/* SMC_MOVE_RELATIVE: void 返回, 无 Res */
+
+typedef struct {
+    char   axis_letter;    /* '*' 全轴联动 */
+    double speed;
+} SmcGoZeroReq;
+/* SMC_GO_ZERO: void 返回, 无 Res */
+
+/* ----- G 代码加工 ----- */
+typedef struct {
+    char filepath[SMC_FILEPATH_MAX_LEN];
+} SmcRunGCodeFileReq;
+typedef struct {
+    int32_t ret_code;      /* SMC_RunGCodeFile 原返回值 */
+} SmcRunGCodeFileRes;
+
+/* SMC_PAUSE_PROCESSING / RESUME_PROCESSING / ABORT_PROCESSING: 无 Req, 无 Res */
+
+#pragma pack(pop)
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif
+
+#endif /* SMC_PROTOCOL_H */

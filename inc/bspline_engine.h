@@ -32,6 +32,11 @@ typedef struct {
     double pos[AXIS_NUM];    // 机械绝对坐标 (mm / deg)
     double speed;            // 合成速度 (mm/s)，已经过 G94/G93 换算
     double g93_time;         // G93 时间预算 (秒)，0.0 = G94 模式
+    CoordSystem_t wcs;       // 捕获时的模态 WCS (parser 线程在 PushDirtyPoint 入队时盖章)
+                             // 避免 bspline 线程读 g_state.modal_wcs 的数据竞争;
+                             // 同时保证段在被 bspline 重离散化后仍携带正确的 WCS 标签。
+    double wcs_offset_snap[AXIS_NUM]; // 捕获时 work_offsets[wcs-1] 的快照 (H-1)
+                                      // 避免 bspline 线程读 g_coord_mgr.work_offsets 的竞争。
 } DirtyPoint_t;
 
 // 脏点环形队列 (parser 生产, B-Spline 线程消费)

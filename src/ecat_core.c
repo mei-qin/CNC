@@ -415,11 +415,28 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                           (rt_tail + 1) % QUEUE_SIZE,
                                           memory_order_release);
 
+                    // 段内带内 WCS + 偏置快照同步:
+                    //   current_coord = seg.active_wcs (WCS 切换不超前)
+                    //   active_offset  = seg.wcs_offset_snap (隔离 #5221/G10 L2 中途改 work_offsets 的污染)
+                    // 两者都是 g_coord_mgr 内 RT 单写者字段。普通 store 即可 — UI/宏/TCP 都是读者,
+                    // 通过下个 PDO 周期的 happens-before 自然可见,无需原子或锁。
+                    g_coord_mgr.current_coord = seg.active_wcs;
+                    for(int j = 0; j < AXIS_NUM; j++){
+                        g_coord_mgr.active_offset[j] = seg.wcs_offset_snap[j];
+                    }
+
                     // M 代码段: 进入等待屏障
                     if (seg.cmd_type == CMD_TYPE_MCODE) {
                         g_interpolator.is_waiting_mcode = 1;
                         g_interpolator.mcode_wait_timer = 0;
                         g_interpolator.current_mcode = seg.m_code;
+                        // ---- P1': 同步 aux 状态镜像 (RT 单写者, CSV 读) ----
+                        // parser 入队时已把 g_state aux 字段快照到 seg;
+                        // 这里消费 seg 时一次性拷到 g_interpolator._rt, 供 sim CSV trace。
+                        g_interpolator.spindle_mode_rt    = seg.aux_spindle_mode;
+                        g_interpolator.spindle_rpm_rt     = seg.aux_spindle_rpm;
+                        g_interpolator.coolant_state_rt   = seg.aux_coolant;
+                        g_interpolator.current_tool_id_rt = seg.aux_tool_id;
                         break;
                     }
 
@@ -559,10 +576,22 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // @Danger: sim_engine_push 无锁无阻塞, 双缓冲原子交换+sem_post
             // 生产 1:1 完整物理轨迹供上位机 3D 渲染比对
             if (g_sim_mode && should_log_this_cycle) {
+                double local_off[3];
+                for (int i = 0; i < 3; i++) local_off[i] = g_coord_mgr.active_offset[i];
+                int x_idx = g_axis_map['X' - 'A'];
+                double off_g54_x = (x_idx >= 0) ? g_coord_mgr.work_offsets[0][x_idx] : 0.0;
                 sim_engine_push((uint64_t)cycle,
                                 g_interpolator.virtual_time_ms,
                                 g_interpolator.current_pos,
-                                log_velocity);
+                                log_velocity,
+                                (int)g_coord_mgr.current_coord,
+                                g_coord_mgr.current_logical_pos,
+                                local_off,
+                                off_g54_x,
+                                g_interpolator.spindle_mode_rt,
+                                g_interpolator.spindle_rpm_rt,
+                                g_interpolator.coolant_state_rt,
+                                g_interpolator.current_tool_id_rt);
             }
 
             if(g_all_axis_op_ready){
@@ -602,9 +631,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 }
                 int wait_target_ms;
                 switch(g_interpolator.current_mcode){
-                    case 3:  wait_target_ms=2000; break;
-                    case 5:  wait_target_ms=1000; break;
-                    default: wait_target_ms=1000; break;
+                    // ---- P1': 按语义分类的等待时间 ----
+                    case 3:  wait_target_ms=2000; break;  // M3 spindle CW 加速
+                    case 4:  wait_target_ms=2000; break;  // M4 spindle CCW
+                    case 5:  wait_target_ms=1500; break;  // M5 spindle stop (含减速)
+                    case 6:  wait_target_ms=3000; break;  // M6 换刀 (sim 中占位)
+                    case 7:  wait_target_ms=500;  break;  // M7 mist coolant
+                    case 8:  wait_target_ms=500;  break;  // M8 flood coolant
+                    case 9:  wait_target_ms=500;  break;  // M9 coolant off
+                    case 19: wait_target_ms=1000; break;  // M19 spindle orient
+                    default: wait_target_ms=500;  break;
                 }
                 if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
                    g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
@@ -614,15 +650,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             }
 
             // ---- 坐标系管理器更新 (阶段 2 保留) ----
+            // H-1 修复: 不再读 g_coord_mgr.work_offsets[idx] (那张表可被 parser 中途写污染),
+            // 改读 RT 单写者的 active_offset (段消费时已 = seg.wcs_offset_snap)。
+            // G53 段的 active_offset 全零,等价于"逻辑坐标 = 机械坐标",不再需要分支。
             if(g_all_axis_op_ready){
                 for(int j=0;j<AXIS_NUM;j++){
                     g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
-                    if(g_coord_mgr.current_coord==COORD_G53){
-                        g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j];
-                    }else{
-                        int idx=g_coord_mgr.current_coord-1;
-                        g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j]-g_coord_mgr.work_offsets[idx][j];
-                    }
+                    g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j]
+                                                       - g_coord_mgr.active_offset[j];
                 }
             }
 
@@ -767,7 +802,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
                 for(int s=0;s<g_axis[i].slave_count;s++){
                     int slave_id=g_axis[i].slave_ids[s];
-                    int32_t logical_pulse=(int32_t)round(g_axis[i].current_cmd_pos*g_axis[i].pulse_per_unit);
+                    /* round-half-away-from-zero 不走 libm: 硬 RT 线程禁止 round()/math.h (libcall → 上下文切换) */
+                    double _pos_pulse=g_axis[i].current_cmd_pos*g_axis[i].pulse_per_unit;
+                    int32_t logical_pulse=(int32_t)(_pos_pulse>=0.0?_pos_pulse+0.5:_pos_pulse-0.5);
                     int32_t phys_pos_to_send=logical_pulse+g_axis[i].home_offset[s];
                     axis_pdo_write(slave_id,output_cw,phys_pos_to_send);
                 }

@@ -233,6 +233,14 @@ typedef struct{
     int32_t mcode_wait_timer;   // M代码非阻塞延时计数器（ms）
     int current_mcode;          // 当前等待中的M代码编号
 
+    // ---- P1': 辅助状态机 RT 镜像 (RT 单写者, 消费 M 代码段时从 seg 同步) ----
+    // parser 端 g_state 的对应 modal 字段先快照到 TrajectorySegment_t,
+    // RT 消费时拷到这里, 供 sim CSV trace / 未来 HMI RPC 读出。
+    int    spindle_mode_rt;     // 0=off(M5), 1=CW(M3), 2=CCW(M4)
+    double spindle_rpm_rt;      // S 代码最近值 (rpm)
+    int    coolant_state_rt;    // 0=off(M9), 1=flood(M8), 2=mist(M7)
+    int    current_tool_id_rt;  // T 代码当前刀号 (M6 切换后)
+
 }Interpolator_t;
 
 /*
@@ -242,6 +250,22 @@ typedef struct{
  * T1=加加速结束, T2=匀加速结束, T3=减加速结束, T4=匀速结束,
  * T5=加减速结束, T6=匀减速结束, T7=减减速结束=总时长。
  */
+
+// ================================================================
+// 坐标系枚举 — 必须在 TrajectorySegment_t 之前定义
+// (TrajectorySegment_t.active_wcs / CoordManager_t.current_coord 都用此类型)
+// ================================================================
+typedef enum{
+
+    COORD_G53=0,
+    COORD_G54=1,
+    COORD_G55=2,
+    COORD_G56=3,
+    COORD_G57=4,
+    COORD_G58=5,
+    COORD_G59=6,
+
+}CoordSystem_t;
 
 typedef struct{
     double target_pos[AXIS_NUM];
@@ -254,11 +278,27 @@ typedef struct{
     int is_rtcp_active; // 1=RTCP 路径产生段(经 Kinematics_Inverse 物理逆解);
                         // 仅元数据: 供 Trace 日志分类与未来度量扩展,
                         // 不参与插补决策 (target_pos 已是物理关节坐标)
+    // 工件坐标系索引 (G53..G59)，由 Parser 在 push 时从 g_state.modal_wcs 盖章。
+    // RT 线程在消费本段时据此更新 g_coord_mgr.current_coord，避免 parser/RT 时序错位
+    // 导致 UI 显示与宏系统变量 #5001+ 跳变到"未来坐标系"。
+    // 见 CLAUDE.md 红线 #2: 段内 target_pos 已是机械绝对坐标，本字段仅用于 UI/宏显示侧。
+    CoordSystem_t active_wcs;
+    // WCS 偏置向量快照 (H-1 修复): 段入队时刻 work_offsets[wcs-1] 的值拷贝。
+    // RT 线程消费段时拷到 g_coord_mgr.active_offset, 用于 current_logical_pos 推导。
+    // 目的: 杜绝 parser 解析中途 `#5221=..` / G10 L2 改 work_offsets 时,
+    // RT 用新偏置推旧位置的瞬间撕裂。G53 段此向量全 0。
+    double wcs_offset_snap[AXIS_NUM];
     int m_code;         // M代码编号（如 3=M03, 5=M05）
     double s_value;     // S值（如主轴转速）
     double p_value;     // P参数（激光功率、宏程序参数等）
     double q_value;     // Q参数
     double r_value;     // R参数
+    // ---- P1': 辅助状态机快照 (parser 入队时从 g_state 拷贝) ----
+    // RT 消费 M 代码段时同步到 g_interpolator 的 _rt 镜像字段。
+    int    aux_spindle_mode;    // 0=off, 1=CW, 2=CCW
+    double aux_spindle_rpm;     // rpm
+    int    aux_coolant;         // 0=off, 1=flood, 2=mist
+    int    aux_tool_id;         // 当前刀号
 
     double total_distance;
     double dir_vec[AXIS_NUM];
@@ -330,22 +370,16 @@ typedef struct {
     _Alignas(64) atomic_flag queue_spinlock;
 } CommandQueue_t;
 
-typedef enum{
-
-    COORD_G53=0, 
-    COORD_G54=1,
-    COORD_G55=2,
-    COORD_G56=3,
-    COORD_G57=4,
-    COORD_G58=5,
-    COORD_G59=6,
-
-}CoordSystem_t;
-
 typedef struct{
 
-    CoordSystem_t current_coord;   // 当前坐标系
-    double work_offsets[6][AXIS_NUM]; // 各坐标系的工件坐标偏移（mm或度），例如 word_offsets[1] 就是 G54 的偏移
+    CoordSystem_t current_coord;   // 当前坐标系 (RT 线程为唯一写者: 消费段时 = seg.active_wcs)
+    double work_offsets[6][AXIS_NUM]; // 各坐标系的工件坐标偏置（mm或度），例如 word_offsets[1] 就是 G54 的偏置
+                                   // NOTE: 此表 RT 不再读 — RT 用 active_offset 推导逻辑坐标。
+                                   //       仅 parser / SMC API / Macro 读, parser 可直接写。
+    double work_offsets_ext[48][AXIS_NUM]; // P5': G54.1 P1-P48 扩展 WCS 偏置 (Fanuc 标准 48 组)
+                                   // 写入路径: macro_eval.c #7001-#7948, 或未来 G10 L20 Pn
+    double active_offset[AXIS_NUM]; // 当前生效偏置向量 (RT 单写者, = seg.wcs_offset_snap)
+                                    // current_logical_pos = current_g53_pos - active_offset
     double current_g53_pos[AXIS_NUM]; // 当前G53坐标位置（机床坐标），实时更新用于UI显示和坐标转换
     double current_logical_pos[AXIS_NUM];// 当前逻辑坐标位置（相对于当前坐标系），实时更新用于UI显示和控制
 

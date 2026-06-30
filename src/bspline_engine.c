@@ -30,6 +30,8 @@ static double batch_ctrl[BSPLINE_MAX_CTRL_POINTS][AXIS_NUM];
 static double batch_knots[BSPLINE_KNOT_VEC_MAX];
 static double batch_speeds[BSPLINE_MAX_CTRL_POINTS];
 static double batch_g93[BSPLINE_MAX_CTRL_POINTS];
+static CoordSystem_t batch_wcs[BSPLINE_MAX_CTRL_POINTS];               // 与脏点 wcs 一一对应, push 时透传
+static double batch_offsets[BSPLINE_MAX_CTRL_POINTS][AXIS_NUM];        // 与脏点 wcs_offset_snap 一一对应 (H-1)
 
 // 弧长反查 LUT
 typedef struct {
@@ -159,6 +161,31 @@ int BSpline_PushDirtyPoint(double pos[AXIS_NUM], double speed, double g93_time)
     memcpy(dp->pos, pos, sizeof(double) * AXIS_NUM);
     dp->speed    = speed;
     dp->g93_time = g93_time;
+    dp->wcs      = g_state.modal_wcs;  // parser 线程捕获,避免 bspline 线程跨线程读 g_state
+    // H-1 + P2' + P5': 冻结入队瞬间的偏置向量 (work_offsets 或 ext + G52 local_offset)。
+    // 与 axis_ctrl.c snapshot_wcs_offset 同语义 (各编译单元独立 static, 避免跨单元耦合)。
+    // 优先级: G54.1 Pn ext > G54-G59 work_offsets > G53 (零基准)
+    // G52 叠加仅 G54-G59 / G54.1 Pn 路径; G53 走 else 分支输出零, 不叠加。
+    {
+        int wcs_idx = (g_state.modal_wcs >= COORD_G54 && g_state.modal_wcs <= COORD_G59)
+                      ? (g_state.modal_wcs - 1) : -1;
+        if(wcs_idx >= 0){
+            if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+                int ext_idx = g_state.modal_ext_wcs_p - 1;
+                for(int i = 0; i < AXIS_NUM; i++)
+                    dp->wcs_offset_snap[i] = g_coord_mgr.work_offsets_ext[ext_idx][i];
+            } else {
+                for(int i = 0; i < AXIS_NUM; i++)
+                    dp->wcs_offset_snap[i] = g_coord_mgr.work_offsets[wcs_idx][i];
+            }
+            if(g_state.local_offset_active){
+                for(int i = 0; i < AXIS_NUM; i++)
+                    dp->wcs_offset_snap[i] += g_state.local_offset[i];
+            }
+        }else{
+            for(int i = 0; i < AXIS_NUM; i++) dp->wcs_offset_snap[i] = 0.0;
+        }
+    }
 
     g_dirty_queue.head = next_head;
 
@@ -302,6 +329,8 @@ static void bspline_drain_queue(int count)
         memcpy(batch_ctrl[actual], dp->pos, sizeof(double) * AXIS_NUM);
         batch_speeds[actual] = dp->speed;
         batch_g93[actual]    = dp->g93_time;
+        batch_wcs[actual]    = dp->wcs;
+        memcpy(batch_offsets[actual], dp->wcs_offset_snap, sizeof(double) * AXIS_NUM);
         actual++;
         g_dirty_queue.tail = (g_dirty_queue.tail + 1) % BSPLINE_DIRTY_QUEUE_SIZE;
     }
@@ -347,8 +376,9 @@ static void bspline_process_batch_from(int start, int count)
             int idx = start + i;
             double speed = batch_speeds[idx];
             if (speed < 1e-6) speed = 1e-6;
-            api_push_trajectory_passthrough(batch_ctrl[idx], speed,
-                                             DEFAULT_ACC, DEFAULT_DEC);
+            api_push_trajectory_passthrough_wcs(batch_ctrl[idx], speed,
+                                                 DEFAULT_ACC, DEFAULT_DEC,
+                                                 batch_wcs[idx], batch_offsets[idx]);
         }
         return;
     }
@@ -364,10 +394,13 @@ static void bspline_process_batch_from(int start, int count)
 
     if (total_arc < 1e-6) {
         // 退化: 所有点几乎重合, 只推最后一个点
-        api_push_trajectory(batch_ctrl[start + count - 1],
-                           batch_speeds[start + count - 1] > 1e-6
-                               ? batch_speeds[start + count - 1] : 1e-6,
-                           DEFAULT_ACC, DEFAULT_DEC);
+        // 用 passthrough_wcs 透传 (bspline 线程禁止读 g_state.modal_wcs)
+        double v = batch_speeds[start + count - 1] > 1e-6
+                       ? batch_speeds[start + count - 1] : 1e-6;
+        api_push_trajectory_passthrough_wcs(batch_ctrl[start + count - 1],
+                                             v, DEFAULT_ACC, DEFAULT_DEC,
+                                             batch_wcs[start + count - 1],
+                                             batch_offsets[start + count - 1]);
         return;
     }
 
@@ -450,6 +483,9 @@ static void bspline_process_batch_from(int start, int count)
         }
 
         // 入队 (整段步长 = step,末段 = last_seg_arc,速度恒定)
+        // 全部用 _wcs 变体: bspline 线程不得读 parser 的 g_state.modal_wcs 与 work_offsets。
+        // WCS/offset 取 batch_wcs[start] / batch_offsets[start]:
+        //   parser 切 WCS 或写 #5221 时已 BSpline_Flush,同批次 WCS+偏置恒定。
         double seg_speed;
         int push_ret;
         if (total_g93_time > 1e-9) {
@@ -458,15 +494,19 @@ static void bspline_process_batch_from(int start, int count)
             seg_speed = g93_avg_speed;
             if (seg_speed < 1e-6) seg_speed = 1e-6;
             double dt_this = current_seg_arc / total_arc * total_g93_time;
-            push_ret = api_push_trajectory_g93(curr_pos, seg_speed,
-                                                DEFAULT_ACC, DEFAULT_DEC, dt_this);
+            push_ret = api_push_trajectory_g93_wcs(curr_pos, seg_speed,
+                                                    DEFAULT_ACC, DEFAULT_DEC,
+                                                    dt_this, batch_wcs[start],
+                                                    batch_offsets[start]);
         } else {
             // G94 模式: B-样条已输出严格等距平滑段,必须透传(is_fillet=1),
             // 否则 Planner 的 G64 拐角抹圆会对 B-样条段做二次篡改,破坏等距性。
             seg_speed = avg_speed;
             if (seg_speed < 1e-6) seg_speed = 1e-6;
-            push_ret = api_push_trajectory_passthrough(curr_pos, seg_speed,
-                                                        DEFAULT_ACC, DEFAULT_DEC);
+            push_ret = api_push_trajectory_passthrough_wcs(curr_pos, seg_speed,
+                                                             DEFAULT_ACC, DEFAULT_DEC,
+                                                             batch_wcs[start],
+                                                             batch_offsets[start]);
         }
         if (push_ret < 0) {
             printf("[BSpline] 入队失败 (报警)，中止本批次\n");

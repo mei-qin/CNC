@@ -11,6 +11,9 @@
 #define SYSVAR_MACHINE_POS_BASE  5021   // #5021+#5022+...+#5025 读机床坐标 (G53)
 #define SYSVAR_LOGICAL_POS_BASE  5031   // #5031+...+#5035       读逻辑坐标 (当前 WCS)
 #define SYSVAR_WCS_OFFSET_BASE   5221   // #5221-#5325           WCS 偏置 (G54-G59) 读/写
+#define SYSVAR_EXT_WCS_OFFSET_BASE 7001  // P5': #7001-#7948      扩展 WCS 偏置 (G54.1 P1-P48) 读/写
+                                          // 公式: stride=20, p_idx=(N-7001)/20, axis_off=(N-7001)%20
+                                          // 例: #7001-#7005 = P1 的 X/Y/Z/C/B, #7021+ = P2
 #define SYSVAR_USER_ALARM        3000   // 写触发软停机 (g_sys_alarm_state = 1)
 #define SYSVAR_OPERATOR_MSG      3006   // 写打印操作员消息 (奇数值=暂停, 偶数值=仅显示)
 

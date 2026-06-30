@@ -23,12 +23,27 @@
 
 // 每条轨迹采样记录 (AXIS_NUM=5 时 64 bytes 起步, 已含 stage_id 列)
 // stage_id 恒为 STAGE_RT_INTERPOLATOR —— sim_engine 仅采集 1ms RT 插补物理波形
+// ---- WCS 同步验证扩展字段 (Phase 2C) ----
+// current_coord:         RT 当前工件坐标系 (0=G53..6=G59), 断言 A/B/C 关键列
+// current_logical_pos[]: RT 推导的 UI 逻辑坐标 (物理坐标 - 生效偏置)
+// active_offset[]:       当前生效的 X/Y/Z 三轴偏置 (即 work_offsets[current_coord])
+// 这些字段在 sim_engine_finish 后与物理坐标一起回填 CSV，验证完可回退。
 typedef struct {
     int      stage_id;         // 管线阶段标签 (固定 STAGE_RT_INTERPOLATOR)
     uint64_t cycle;            // RT 周期计数
     double   virtual_time_ms;  // 插补器虚拟时间 (ms)
     double   pos[AXIS_NUM];    // 各轴物理坐标 (mm / deg)
     double   v_target;         // 目标速度 (mm/ms)
+    // ---- WCS 同步验证 (临时扩展队列, 验证完移除) ----
+    int      current_coord;                // RT 当前 WCS 索引 (0=G53..6=G59)
+    double   current_logical_pos[AXIS_NUM]; // RT 逻辑坐标
+    double   active_offset[3];             // 生效偏置 X/Y/Z (= work_offsets[current_coord][0..2])
+    double   work_offsets_g54_x;           // H-1: parser 对 work_offsets[G54][X] 的当前写入值
+    // ---- P1': 辅助状态机 CSV 追踪 (从 g_interpolator._rt 镜像读) ----
+    int      spindle_mode;                // 0=off, 1=CW(M3), 2=CCW(M4)
+    double   spindle_rpm;                 // rpm
+    int      coolant_state;               // 0=off, 1=flood(M8), 2=mist(M7)
+    int      tool_id;                     // 当前刀号 (M6 切换后)
 } sim_trace_record_t;
 
 // 二进制文件头 (固定 512 bytes, record_count 在关闭时回填)
@@ -47,7 +62,7 @@ typedef struct {
 #pragma pack(pop)
 
 // 双缓冲容量: 每个缓冲 1M 条 ≈ 64 MB (AXIS_NUM=5)
-#define SIM_BUF_CAPACITY  (1 << 20)
+#define SIM_BUF_CAPACITY  (1 << 18)  /* 256K records ≈ 38 MB/buf @ extended struct size; temp reduce for WSL2 */
 
 // 双缓冲控制器
 // RT 线程写端与落盘线程读端按 cache-line 隔离, 杜绝 false sharing
@@ -99,7 +114,13 @@ void sim_engine_finish(void);
 // RT 线程每周期调用: 写入插补器坐标到活跃缓冲;
 // 缓冲满时原子交换 active_idx 并 sem_post 唤醒落盘线程。
 static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
-                                     const double pos[AXIS_NUM], double v_target);
+                                     const double pos[AXIS_NUM], double v_target,
+                                     int current_coord,
+                                     const double current_logical_pos[AXIS_NUM],
+                                     const double active_offset[3],
+                                     double work_offsets_g54_x,
+                                     int spindle_mode, double spindle_rpm,
+                                     int coolant_state, int tool_id);
 
 // 落盘线程入口
 void *sim_flush_thread_func(void *arg);
@@ -111,7 +132,13 @@ void *sim_flush_thread_func(void *arg);
 // 双缓冲写入: 活跃缓冲满 → 检查另一缓冲可用性 → 交换或静默丢弃。
 // 绝不自旋等待: 若另一缓冲仍在落盘, 直接丢弃当前记录 (不阻塞 RT 线程)。
 static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
-                                     const double pos[AXIS_NUM], double v_target)
+                                     const double pos[AXIS_NUM], double v_target,
+                                     int current_coord,
+                                     const double current_logical_pos[AXIS_NUM],
+                                     const double active_offset[3],
+                                     double work_offsets_g54_x,
+                                     int spindle_mode, double spindle_rpm,
+                                     int coolant_state, int tool_id)
 {
     sim_logger_t *L = &g_sim_logger;
     int idx = atomic_load_explicit(&L->active_idx, memory_order_relaxed);
@@ -119,33 +146,33 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
 
     if (count >= L->capacity) {
         int next = 1 - idx;
-
-        // 先检查另一缓冲是否可用 (已在 flush_pending == 0 表示落盘完成)
         if (atomic_load_explicit(&L->flush_pending[next], memory_order_acquire)) {
-            // 另一缓冲仍在落盘 → 静默丢弃 (绝不自旋等待)
             atomic_fetch_add_explicit(&L->dropped_records, 1, memory_order_relaxed);
             return;
         }
-
-        // 另一缓冲可用: 标记当前缓冲待落盘, 交换
         atomic_store_explicit(&L->flush_pending[idx], 1, memory_order_release);
         atomic_store_explicit(&L->counts[next], 0, memory_order_relaxed);
         atomic_store_explicit(&L->active_idx, next, memory_order_release);
         sem_post(&L->flush_sem);
-
         idx = next;
         count = 0;
     }
 
-    // 写入记录 (纯内存操作, 零系统调用)
     sim_trace_record_t *r = &L->bufs[idx][count];
-    r->stage_id        = STAGE_RT_INTERPOLATOR;  // 标记 1ms RT 插补器物理执行阶段
+    r->stage_id        = STAGE_RT_INTERPOLATOR;
     r->cycle           = cycle;
     r->virtual_time_ms = virtual_time_ms;
     for (int i = 0; i < AXIS_NUM; i++) r->pos[i] = pos[i];
     r->v_target        = v_target;
+    r->current_coord   = current_coord;
+    for (int i = 0; i < AXIS_NUM; i++) r->current_logical_pos[i] = current_logical_pos[i];
+    for (int i = 0; i < 3; i++)           r->active_offset[i]       = active_offset[i];
+    r->work_offsets_g54_x = work_offsets_g54_x;
+    r->spindle_mode   = spindle_mode;
+    r->spindle_rpm    = spindle_rpm;
+    r->coolant_state  = coolant_state;
+    r->tool_id        = tool_id;
 
-    // Release store: 确保记录数据对落盘线程可见后再更新 count
     atomic_store_explicit(&L->counts[idx], count + 1, memory_order_release);
     atomic_fetch_add_explicit(&L->total_records, 1, memory_order_relaxed);
 }

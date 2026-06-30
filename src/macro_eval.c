@@ -69,6 +69,18 @@ double Macro_GetValue(int index)
         return g_coord_mgr.work_offsets[wcs_idx][phys];
     }
 
+    // ---- P5': 系统变量: 扩展 WCS 偏置 (G54.1 P1-P48) ----
+    // 公式: stride=20, p_idx = (N - 7001) / 20, axis_off = (N - 7001) % 20
+    // p_idx 0=P1..47=P48; axis_off 0..4 对应 X/Y/Z/C/B
+    if(index >= SYSVAR_EXT_WCS_OFFSET_BASE && index <= 7948){
+        int p_idx    = (index - SYSVAR_EXT_WCS_OFFSET_BASE) / 20;
+        int axis_off = (index - SYSVAR_EXT_WCS_OFFSET_BASE) % 20;
+        if(p_idx > 47 || axis_off >= AXIS_NUM) return 0.0;
+        int phys = g_axis_map[sysvar_letter(axis_off) - 'A'];
+        if(phys < 0) return 0.0;
+        return g_coord_mgr.work_offsets_ext[p_idx][phys];
+    }
+
     // ---- 系统变量: 报警/消息 (写专用，读返回 0) ----
     if(index == SYSVAR_USER_ALARM || index == SYSVAR_OPERATOR_MSG){
         return 0.0;
@@ -100,6 +112,23 @@ void Macro_SetValue(int index, double val)
             return;
         }
         g_coord_mgr.work_offsets[wcs_idx][phys] = val;
+        return;
+    }
+
+    // ---- P5': 系统变量: 扩展 WCS 偏置写入 (G54.1 P1-P48) ----
+    if(index >= SYSVAR_EXT_WCS_OFFSET_BASE && index <= 7948){
+        int p_idx    = (index - SYSVAR_EXT_WCS_OFFSET_BASE) / 20;
+        int axis_off = (index - SYSVAR_EXT_WCS_OFFSET_BASE) % 20;
+        if(p_idx > 47 || axis_off >= AXIS_NUM){
+            printf("[Macro] 无效扩展 WCS 偏置变量 #%d\n", index);
+            return;
+        }
+        int phys = g_axis_map[sysvar_letter(axis_off) - 'A'];
+        if(phys < 0){
+            printf("[Macro] 扩展 WCS 偏置 #%d 对应轴未映射\n", index);
+            return;
+        }
+        g_coord_mgr.work_offsets_ext[p_idx][phys] = val;
         return;
     }
 

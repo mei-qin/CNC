@@ -114,16 +114,51 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
                                      double speed_sec_mm, double acc_sec_mm,
                                      double dec_sec_mm, int is_g93_strict,
                                      double g93_dt_sec, int is_fillet,
-                                     int is_rtcp_active);
+                                     int is_rtcp_active, CoordSystem_t wcs,
+                                     const double wcs_offset_snap[AXIS_NUM]);
+
+// @Context: Non-RealTime Background Thread (parser / bspline 入队前调用)
+// @Thread-Safety: 读 g_coord_mgr.work_offsets + g_state.local_offset — 仅在 parser 线程或 setup API 上下文调用。
+// 把当前模态 WCS 对应的偏置向量从 work_offsets 拷出。G53 (idx<0) 输出全零。
+// 设计目的: 让段在入队瞬间"冻结"此刻的偏置, RT 后续用此快照推导 UI 逻辑坐标,
+// 不再受 parser 中途 `#5221=..` / G10 L2 改 work_offsets 的污染 (H-1)。
+// P2': G54-G59 路径上叠加 g_state.local_offset (Fanuc G52 局部坐标系)。
+//      G53 路径不叠加 (机械坐标天然 bypass WCS+G52)。
+static inline void snapshot_wcs_offset(CoordSystem_t wcs, double out[AXIS_NUM])
+{
+    int idx = (wcs >= COORD_G54 && wcs <= COORD_G59) ? (wcs - 1) : -1;
+    if(idx >= 0){
+        // P5': G54.1 Pn 扩展 WCS 优先 (modal_ext_wcs_p 1-48)
+        // 激活时覆盖 modal_wcs 路径, 否则走原 G54-G59 表
+        if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+            int ext_idx = g_state.modal_ext_wcs_p - 1;
+            for(int i = 0; i < AXIS_NUM; i++)
+                out[i] = g_coord_mgr.work_offsets_ext[ext_idx][i];
+        } else {
+            for(int i = 0; i < AXIS_NUM; i++) out[i] = g_coord_mgr.work_offsets[idx][i];
+        }
+        // P2': G52 局部坐标系叠加 (仅 G54-G59 路径)
+        if(g_state.local_offset_active){
+            for(int i = 0; i < AXIS_NUM; i++) out[i] += g_state.local_offset[i];
+        }
+    }else{
+        // G53 或未定义 WCS: 零基准, 不叠加 G52
+        for(int i = 0; i < AXIS_NUM; i++) out[i] = 0.0;
+    }
+}
 
 // @Context: Non-RealTime Background Thread (parser / 上层管理线程)
 // @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
-// 常规入队包装: 走完整的短板效应限幅路径。
+// 常规入队包装: 走完整的短板效应限幅路径。WCS 盖章取 parser 模态 g_state.modal_wcs,
+// 偏置快照在入队瞬间从 work_offsets 冻结。
 int api_push_trajectory(double target_pos[AXIS_NUM],
                          double speed_sec_mm, double acc_sec_mm, double dec_sec_mm)
 {
+    double snap[AXIS_NUM];
+    snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
-                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 0);
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 0,
+                                     g_state.modal_wcs, snap);
 }
 
 // @Context: Non-RealTime Background Thread (parser / bspline)
@@ -134,19 +169,54 @@ int api_push_trajectory_g93(double target_pos[AXIS_NUM],
                              double speed_sec_mm, double acc_sec_mm,
                              double dec_sec_mm, double g93_dt_sec)
 {
+    double snap[AXIS_NUM];
+    snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
-                                     acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0);
+                                     acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0,
+                                     g_state.modal_wcs, snap);
 }
 
 // @Context: Non-RealTime Background Thread (bspline)
 // @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
 // 免抹圆透传包装: is_fillet=1,planner_fillet_preprocess 跳过本段。
+// bspline 线程须改用 api_push_trajectory_passthrough_wcs 显式传 WCS+快照,避免读 g_state。
 int api_push_trajectory_passthrough(double target_pos[AXIS_NUM],
                                      double speed_sec_mm, double acc_sec_mm,
                                      double dec_sec_mm)
 {
+    double snap[AXIS_NUM];
+    snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
-                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 1, 0);
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 1, 0,
+                                     g_state.modal_wcs, snap);
+}
+
+// @Context: Non-RealTime Background Thread (bspline 专用)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// 显式 WCS+偏置快照透传: wcs/snap 均来自 DirtyPoint_t (脏点捕获时已冻结),
+// 避免 bspline 线程跨线程读 parser 的 g_state.modal_wcs 与 g_coord_mgr.work_offsets。
+int api_push_trajectory_passthrough_wcs(double target_pos[AXIS_NUM],
+                                         double speed_sec_mm, double acc_sec_mm,
+                                         double dec_sec_mm, CoordSystem_t wcs,
+                                         const double wcs_offset_snap[AXIS_NUM])
+{
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 1, 0,
+                                     wcs, wcs_offset_snap);
+}
+
+// @Context: Non-RealTime Background Thread (bspline 专用)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// 显式 WCS+偏置快照的 G93 强一致性入队 (G93 + BSpline 复合路径)。
+int api_push_trajectory_g93_wcs(double target_pos[AXIS_NUM],
+                                   double speed_sec_mm, double acc_sec_mm,
+                                   double dec_sec_mm,
+                                   double g93_dt_sec, CoordSystem_t wcs,
+                                   const double wcs_offset_snap[AXIS_NUM])
+{
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0,
+                                     wcs, wcs_offset_snap);
 }
 
 // @Context: Non-RealTime Background Thread (RTCP 路径专用)
@@ -158,8 +228,11 @@ int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],
                               double speed_sec_mm, double acc_sec_mm,
                               double dec_sec_mm)
 {
+    double snap[AXIS_NUM];
+    snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
-                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 1);
+                                     acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 1,
+                                     g_state.modal_wcs, snap);
 }
 
 // @Context: Non-RealTime Background Thread (parser / 上层管理线程)
@@ -173,11 +246,18 @@ int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],
 // is_fillet:    1=标记为免抹圆段,planner_fillet_preprocess 跳过本段。
 // is_rtcp_active: 1=RTCP 路径产生的段 (target_pos 已是物理关节坐标),
 //                 仅元数据,不参与插补决策。
+// wcs: 本段所属工件坐标系索引 (G53..G59)。RT 线程消费段时据此更新
+//      g_coord_mgr.current_coord,使 UI 显示/宏系统变量与物理运动严格同步。
+//      parser 调用方传 g_state.modal_wcs; bspline 调用方传 DirtyPoint_t.wcs。
+// wcs_offset_snap: 段入队瞬间 work_offsets[wcs-1] 的快照。RT 拷到 active_offset,
+//                  用于 current_logical_pos 推导,隔离 parser 中途改 work_offsets 的污染。
 static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
                                      double speed_sec_mm, double acc_sec_mm,
                                      double dec_sec_mm,
                                      int is_g93_strict, double g93_dt_sec,
-                                     int is_fillet, int is_rtcp_active)
+                                     int is_fillet, int is_rtcp_active,
+                                     CoordSystem_t wcs,
+                                     const double wcs_offset_snap[AXIS_NUM])
 {
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
         printf("[SAFETY] 系统报警中，拒绝入队运动指令！\n");
@@ -334,6 +414,10 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->is_fillet = is_fillet ? 1 : 0;
     seg->is_g93_strict = (is_g93_strict && g93_dt_sec > 1e-9) ? 1 : 0;
     seg->is_rtcp_active = is_rtcp_active ? 1 : 0;
+    seg->active_wcs = wcs;   // 段内带内 WCS, RT 消费时同步 g_coord_mgr.current_coord
+    for(int i = 0; i < AXIS_NUM; i++){
+        seg->wcs_offset_snap[i] = wcs_offset_snap[i];  // H-1: 冻结入队瞬间的偏置向量
+    }
     seg->m_code = 0;
     seg->s_value = 0.0;
     seg->total_distance = dist;
@@ -442,6 +526,13 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     memset(seg, 0, sizeof(TrajectorySegment_t));
 
     seg->cmd_type      = CMD_TYPE_MCODE;
+    seg->active_wcs    = g_state.modal_wcs;  // M 代码段也需携带 WCS: RT 消费 M 代码时同步翻 UI 坐标系
+    {
+        // H-1: M 代码段同样冻结偏置快照, RT 在 M 代码等待屏障期间推导 UI 逻辑坐标要用
+        double snap[AXIS_NUM];
+        snapshot_wcs_offset(g_state.modal_wcs, snap);
+        for(int i = 0; i < AXIS_NUM; i++) seg->wcs_offset_snap[i] = snap[i];
+    }
     seg->m_code        = m_code;
     seg->s_value       = s_value;
     seg->p_value       = p_value;
@@ -463,6 +554,12 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->s4=0; seg->s5=0; seg->s6=0;
     seg->j1=0; seg->a2=0; seg->j3=0;
     seg->j5=0; seg->a6=0; seg->j7=0;
+
+    // ---- P1': 辅助状态机快照 (parser 端 g_state → seg, 供 RT 消费时同步镜像) ----
+    seg->aux_spindle_mode = g_state.spindle_mode;
+    seg->aux_spindle_rpm  = g_state.spindle_rpm;
+    seg->aux_coolant      = g_state.coolant_state;
+    seg->aux_tool_id      = g_state.current_tool_id;
 
     // relaxed 推进 write_head: 由 spinlock release 建立可见性。
     atomic_store_explicit(&g_cmd_queue.write_head, next_head, memory_order_relaxed);
@@ -532,6 +629,10 @@ void api_motion_resume(){
 // 安全条件：全部轴使能就绪 + 全部轴跟随误差归零
 // 注意：不再检查队列和插补器状态（这两个检查曾导致死锁和竞态），
 //       实际复位动作由 RT 线程在确认电机刹停(HOLD_PAUSED)后执行
+//
+// Hazard 2 修复 (飞车防护): 复位必须先联动中止 Parser, 并同步等待其退出,
+// 再提交 RT 清队列请求。否则 parser 会继续基于报警前 cursor 推 target_pos 段,
+// RT 清队列后新段继续入队 → dir_vec 撕裂物理位置 → 飞车。
 int api_alarm_reset(void){
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==0){
         printf("[Alarm] 当前无报警，无需复位\n");
@@ -542,6 +643,27 @@ int api_alarm_reset(void){
     if(atomic_load_explicit(&g_interpolator.alarm_reset_request, memory_order_acquire)==1){
         printf("[Alarm] 上一次复位请求尚未被消化，请勿重复提交\n");
         return -2;
+    }
+
+    // ---- Hazard 2: 先联动中止 Parser ----
+    // 必须在提交 RT 复位之前确保 parser 已停止 push 段, 否则清队列后仍有新段入队。
+    if(g_parser_ctrl.is_running){
+        g_parser_ctrl.abort_request = 1;
+        printf("[Alarm] 联动中止 Parser, 等待解析线程退出...\n");
+        // Spin-wait 上限 2s: parser 主循环每行检查 abort_request (gcode_parser.c:1161),
+        // dwell 期间 10ms 轮询 (gcode_parser.c:1337/1344), 正常 <100ms 退出。
+        for(int i = 0; i < 2000; i++){
+            if(!g_parser_ctrl.is_running) break;
+            osal_usleep(1000);
+        }
+        if(g_parser_ctrl.is_running){
+            // 兜底: 超时仍未退出 (极端: parser 卡在阻塞系统调用), 强制继续复位。
+            // RT 清队列仍会丢弃未消费段, 但若 parser 此后才推新段, 仍可能撕裂 —
+            // 此处仅告警, 由上层决定是否进一步处置 (如 kill 线程)。
+            printf("[Alarm] 警告: Parser 2s 内未退出, 强制继续复位 (注意残留段风险)\n");
+        }
+        // abort_request 复位由下次 SMC_RunGCodeFile 统一处理 (smc_api.c:403),
+        // 不在此处清零 — 防 parser 在 exit 路径上误判。
     }
 
     // 提交复位请求，由 RT 线程在安全点(HOLD_PAUSED && op_ready)执行实际状态清理

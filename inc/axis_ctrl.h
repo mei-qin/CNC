@@ -62,6 +62,18 @@ int  api_push_trajectory_g93(double target_pos[AXIS_NUM],
 // 用于 B-Spline 引擎在锐角切批后直接透传的段,防止底层二次抹圆。
 int  api_push_trajectory_passthrough(double target_pos[AXIS_NUM],
                                       double speed,double acc,double dec);
+// 免抹圆透传 + 显式 WCS: B-Spline 线程专用, wcs 来自脏点捕获时的模态 WCS,
+// 避免读 parser 线程的 g_state.modal_wcs 造成数据竞争。
+// wcs_offset_snap: 段生效时的偏置向量快照 (脏点捕获时已固定), 透传到段内, RT 用它推导 UI 逻辑坐标。
+int  api_push_trajectory_passthrough_wcs(double target_pos[AXIS_NUM],
+                                          double speed,double acc,double dec,
+                                          CoordSystem_t wcs,
+                                          const double wcs_offset_snap[AXIS_NUM]);
+// G93 强一致性入队 + 显式 WCS: B-Spline 线程专用 (G93 + BSpline 复合路径)。
+int  api_push_trajectory_g93_wcs(double target_pos[AXIS_NUM],
+                                   double speed,double acc,double dec,
+                                   double g93_dt_sec, CoordSystem_t wcs,
+                                   const double wcs_offset_snap[AXIS_NUM]);
 // @Context: Non-RealTime Background Thread (RTCP 路径专用)
 // @Thread-Safety: queue_spinlock 互斥,与其他 push 函数共享。
 // RTCP 路径包装: 入队时设置 is_rtcp_active=1 元数据。

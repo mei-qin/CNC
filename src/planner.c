@@ -220,14 +220,32 @@ static void recompute_scurve_profile(TrajectorySegment_t *seg)
         double lo = fmax(v_s, v_e);
         double hi = v_m;
 
-        /* 内部距离熔断：若最低可行速度仍超距，钳制到 0 */
+        /* Hazard 1 修复: 距离熔断不再粗暴 v_s=v_e=0 (会导致密集微段 stop-go 卡顿)。
+         * 改为二分搜索 scale ∈ [0,1], 保持 v_s/v_e 比例不变, 找到最大可使
+         * sa(v_s*scale → lo*scale) + sd(lo*scale → v_e*scale) ≤ S 的比例。
+         * 段从而能以非零连续速度通过, 避免 0.01mm 球头刀 CAM 路径的哒哒卡顿。
+         * 注意: 仅当本段 v_s 或 v_e 非零时才需要 scale; 二者本就为 0 时 sa=sd=0, 不会进入此分支。
+         */
         {
             double sa_test, sd_test, d1, d2;
             compute_acc_profile(v_s, lo, a_max, J, &d1, &d2, &sa_test);
             compute_dec_profile(lo, v_e, d_max, J, &d1, &d2, &sd_test);
             if (sa_test + sd_test > S) {
-                v_s = 0.0; v_e = 0.0; lo = 0.0;
-                seg->v_start = 0.0; seg->v_end = 0.0;
+                double sc_lo = 0.0, sc_hi = 1.0;
+                for (int it = 0; it < SCURVE_BISECT_ITERS; it++) {
+                    double sc_mid = 0.5 * (sc_lo + sc_hi);
+                    double vs_t = v_s * sc_mid, ve_t = v_e * sc_mid;
+                    double lo_t = fmax(vs_t, ve_t);
+                    double sa_t, sd_t, d3, d4;
+                    compute_acc_profile(vs_t, lo_t, a_max, J, &d3, &d4, &sa_t);
+                    compute_dec_profile(lo_t, ve_t, d_max, J, &d3, &d4, &sd_t);
+                    if (sa_t + sd_t > S) sc_hi = sc_mid; else sc_lo = sc_mid;
+                }
+                v_s *= sc_lo;
+                v_e *= sc_lo;
+                lo = fmax(v_s, v_e);
+                seg->v_start = v_s;
+                seg->v_end   = v_e;
             }
         }
 
@@ -887,7 +905,9 @@ void planner_recalculate_locked(int force_flush)
                 continue;
             }
 
-            // 距离熔断预检：若最低速度仍超距，强制归零并反向传播
+            // Hazard 1 修复: 距离熔断改 scale-down (与 recompute_scurve_profile 同语义),
+            // 不再 v_start=v_end=0。反向传播把前一未释放段的 v_end 同步到本段 scaled v_start
+            // (速度连续), 不再硬性置零。
             {
                 double lo = fmax(seg->v_start, seg->v_end);
                 if (lo > 1e-12) {
@@ -898,15 +918,25 @@ void planner_recalculate_locked(int force_flush)
                     compute_acc_profile(seg->v_start, lo, a_m, J, &d1, &d2, &sa);
                     compute_dec_profile(lo, seg->v_end, d_m, J, &d1, &d2, &sd);
                     if (sa + sd > seg->total_distance) {
-                        seg->v_start = 0.0;
-                        seg->v_end   = 0.0;
-                        // 反向传播至前一未释放段
+                        double sc_lo = 0.0, sc_hi = 1.0;
+                        for (int it = 0; it < SCURVE_BISECT_ITERS; it++) {
+                            double sc_mid = 0.5 * (sc_lo + sc_hi);
+                            double vs_t = seg->v_start * sc_mid, ve_t = seg->v_end * sc_mid;
+                            double lo_t = fmax(vs_t, ve_t);
+                            double sa_t, sd_t, d3, d4;
+                            compute_acc_profile(vs_t, lo_t, a_m, J, &d3, &d4, &sa_t);
+                            compute_dec_profile(lo_t, ve_t, d_m, J, &d3, &d4, &sd_t);
+                            if (sa_t + sd_t > seg->total_distance) sc_hi = sc_mid; else sc_lo = sc_mid;
+                        }
+                        seg->v_start *= sc_lo;
+                        seg->v_end   *= sc_lo;
+                        // 反向传播至前一未释放段: v_end 必须等于本段 scaled v_start (速度连续)
                         if (curr != plan_tail) {
                             int prev_idx = (curr - 1 + QUEUE_SIZE) % QUEUE_SIZE;
                             TrajectorySegment_t *s_prev = &g_cmd_queue.buffer[prev_idx];
                             if (atomic_load_explicit(&s_prev->is_ready,
                                                      memory_order_acquire) == 0) {
-                                s_prev->v_end = 0.0;
+                                s_prev->v_end = seg->v_start;
                                 recompute_scurve_profile(s_prev);
                             }
                         }

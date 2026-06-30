@@ -11,11 +11,13 @@
 #define RTCP_LINEAR_SEGMENT_MM 0.5 // RTCP直线微段打碎步长，单位mm
 
 // C99 designated initializer: Phase 2A.2 固定循环字段自动归零 (active_cycle=0, retract_mode=0)
+// modal_wcs 默认 COORD_G54 (与 g_coord_mgr 启动初值一致, 典型 CNC 上电默认)
 GCodeState_t g_state = {
     .feedrate_mm_min   = 1000.0,
     .is_absolute       = 1,
     .active_plane      = 17,
     .motion_mode       = 1,
+    .modal_wcs         = COORD_G54,
     .feed_mode         = FEED_MODE_G94,
 };
 
@@ -29,15 +31,20 @@ static GCodeProgram_t *g_current_program = NULL;  // 当前运行程序 (NULL �
 static int g_pc_step_counter = 0;       // 步进计数器, 防 GOTO 死循环
 
 // ---- Phase 2B M5: 子程序调用栈 ----
-// M98 压栈保存调用者上下文, M99 弹栈恢复
+// M98/G65 压栈保存调用者上下文, M99 弹栈恢复
 // 现代语义: #1-#33 局部变量 + modal G-code 状态都完全隔离
 #define MAX_CALL_DEPTH 8  // 子程序嵌套深度上限 (Fanuc 0i=4, 30i=10, 取中)
 typedef struct {
-    int          return_pc;          // 调用者 PC (M98 行的下一行)
+    int          return_pc;          // 调用者 PC (M98/G65 行的下一行)
     int          entry_line;         // 子程序入口 (O-label 行索引), 用于 L<重复> 再次跳入
     int          repeat_remaining;   // L-1 后剩余次数, 每次 M99 减一
     double       saved_locals[34];   // 调用者 #1-#33 快照 (索引 1..33)
     GCodeState_t saved_state;        // 调用者 modal G-code 状态快照
+    // P4' G65: 字母参数 + 重复调用标志
+    // is_g65_frame=1 时, M99 repeat 路径需重新应用 g65_args 到 #1-#26 (Fanuc 语义)
+    int          is_g65_frame;
+    double       g65_args[27];       // 字母参数 (索引 1-26 对应 #1-#26)
+    int          g65_args_set[27];   // 哪些字母被指定 (1=指定)
 } CallFrame_t;
 static CallFrame_t g_call_stack[MAX_CALL_DEPTH];
 static int         g_call_stack_top = 0;
@@ -47,6 +54,14 @@ extern int api_push_trajectory_g93(double target_pos[AXIS_NUM],double speed,doub
 extern int api_push_trajectory_passthrough(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
+
+// P4' Phase 2: G65/G66 共用的宏调用分发 helper (前向声明)
+// 参数: o_num=目标O号, l_repeat=重复次数, args/args_set=字母参数(#1-#26),
+//       is_g65_frame=1 则 M99 repeat 路径重新应用 args, tag=日志标识("G65"/"G66-modal")
+// 返回: 0=成功(g_pc_jump_pending 已设), -1=错误, 1=L=0 no-op (调用方应 return 0)
+static int dispatch_macro_call(int o_num, int l_repeat,
+                                const double args[27], const int args_set[27],
+                                int is_g65_frame, const char *tag);
 
 const char* skip_spaces(const char* str)
 {
@@ -338,6 +353,84 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
     return 0;
 }
 
+// ============================================================
+// P4' Phase 2: G65/G66 共用的宏调用分发 helper
+// ============================================================
+// @Context: Non-RealTime Background Thread (parser)
+// @Safe: 仅修改 g_call_stack / g_pc_jump_*, 无阻塞 I/O
+//
+// 功能:
+//   1. 校验 P<Onum> / O-label 存在 / 调用栈深度
+//   2. 压 CallFrame (含 caller #1-#33 + modal 状态 + G65 args)
+//   3. ClearLocals + 应用 args 到 #1-#26 (G65/G66 共用语义)
+//   4. 设 g_pc_jump_target/pending 跳到子程序入口
+//
+// 返回: 0=成功跳转 / 1=L=0 no-op (调用方 return 0) / -1=错误 (调用方 return -1)
+// ============================================================
+static int dispatch_macro_call(int o_num, int l_repeat,
+                                const double args[27], const int args_set[27],
+                                int is_g65_frame, const char *tag)
+{
+    if(!g_current_program){
+        printf("[Parser] %s 在无 program 上下文\n", tag);
+        return -1;
+    }
+    if(o_num < 1){
+        printf("[Parser] %s 缺 P<Onum> (源行 %d)\n", tag,
+               g_current_program->lines[g_pc].line_no);
+        return -1;
+    }
+    if(l_repeat == 0){
+        printf("[Parser] %s P%d L0 no-op (源行 %d)\n", tag, o_num,
+               g_current_program->lines[g_pc].line_no);
+        return 1;  // no-op, 调用方 return 0
+    }
+    int o_idx = Program_FindOLabel(g_current_program, o_num);
+    if(o_idx < 0){
+        printf("[Parser] %s P%d 未找到子程序 (源行 %d)\n", tag, o_num,
+               g_current_program->lines[g_pc].line_no);
+        return -1;
+    }
+    if(g_call_stack_top >= MAX_CALL_DEPTH){
+        printf("[Parser] %s 子程序嵌套超 %d (源行 %d)\n", tag, MAX_CALL_DEPTH,
+               g_current_program->lines[g_pc].line_no);
+        return -1;
+    }
+    int entry = g_current_program->o_labels[o_idx].line_idx;
+
+    int argc = 0;
+    for(int n = 1; n <= 26; n++) if(args_set[n]) argc++;
+
+    CallFrame_t *f = &g_call_stack[g_call_stack_top];
+    f->return_pc        = g_pc + 1;
+    f->entry_line       = entry;
+    f->repeat_remaining = l_repeat - 1;
+    Macro_GetLocals(f->saved_locals);
+    f->saved_state      = g_state;
+    f->is_g65_frame     = is_g65_frame;
+    for(int n = 1; n <= 26; n++){
+        f->g65_args[n]     = args[n];
+        f->g65_args_set[n] = args_set[n];
+    }
+    g_call_stack_top++;
+
+    // P4' Phase 2: 进入子程序时清掉 modal_macro_active, 防止宏体内运动递归触发自身
+    // (M99 真返回时由 saved_state 自动恢复, M99 repeat 路径不恢复因 frame 仍占用)
+    g_state.modal_macro_active = 0;
+
+    Macro_ClearLocals();
+    for(int n = 1; n <= 26; n++){
+        if(args_set[n]) Macro_SetValue(n, args[n]);
+    }
+
+    g_pc_jump_target  = entry;
+    g_pc_jump_pending = 1;
+    printf("[Parser] %s P%d L%d 调用宏 (entry=%d, depth=%d, %d 个参数, 源行 %d)\n",
+           tag, o_num, l_repeat, entry, g_call_stack_top, argc,
+           g_current_program->lines[g_pc].line_no);
+    return 0;
+}
+
 int parse_gcode_line(const char *gcode_line)
 {
     // 宏赋值行首拦截：#N = <expr>
@@ -356,12 +449,22 @@ int parse_gcode_line(const char *gcode_line)
     double offset_i=0.0,offset_j=0.0,offset_k=0.0; // 圆弧偏移：非模态，逐行清零
     int m_code=-1;
     double s_value=0.0;
+    double t_value=0.0;  // P1': T 代码 (刀号)
     double p_value=0.0, q_value=0.0, r_value=0.0; // M代码扩展参数
     int l_value=1;       // Phase 2B M5: M98 L<重复次数>, 默认 1
     int is_non_motion_g=0; // 非运动组拦截锁：G04/G10/G28/G92 等
     int has_f=0;           // F 值存在标志（G93 非模态校验）
     int has_r=0;           // R 值存在标志（G91 固定循环 R/Z 顺序处理）
     int is_G53_this_block=0;  // G53 非模态机械坐标：仅影响本行
+    int is_g52_block=0;       // P2': G52 局部坐标系设定块, 字母循环后捕获
+    int is_g65_block=0;       // P4': G65 用户宏调用, 字母循环后处理
+    int is_g66_block=0;       // P4' Phase 2: G66 模态宏调用激活
+    int is_g541_block=0;      // P5': G54.1 Pn 扩展 WCS, 字母循环后处理
+
+    // P4': G65 字母参数捕获 (Fanuc Format I, 简化无 I/J/K 重复)
+    // 索引 1-26 对应 #1-#26; 索引 0 不用
+    double g65_args[27]     = {0};
+    int    g65_args_set[27] = {0};
 
     char *p=buffer;
     while(*p!='\0'){
@@ -631,6 +734,47 @@ int parse_gcode_line(const char *gcode_line)
             }
         }
 
+        // P4': G65/G66 用户宏参数捕获 (在 switch 之前, 与 axis 映射并行)
+        // Fanuc Format I 字母→#N 映射 (跳过 G/L/N/O/P, 它们有特殊语义):
+        //   A=#1, B=#2, C=#3, I=#4, J=#5, K=#6, D=#7, E=#8, F=#9,
+        //   H=#11, M=#13, Q=#17, R=#18, S=#19, T=#20, U=#21, V=#22, W=#23,
+        //   X=#24, Y=#25, Z=#26
+        if((is_g65_block || is_g66_block) && letter >= 'A' && letter <= 'Z'){
+            static const int letter_to_macro[26] = {
+                1,  // A
+                2,  // B
+                3,  // C
+                7,  // D
+                8,  // E
+                9,  // F
+                -1, // G (skip, G 代码组)
+                11, // H
+                4,  // I
+                5,  // J
+                6,  // K
+                -1, // L (skip, 重复次数)
+                13, // M
+                -1, // N (skip, 行号)
+                -1, // O (skip, 子程序号)
+                -1, // P (skip, G65 目标 O 号)
+                17, // Q
+                18, // R
+                19, // S
+                20, // T
+                21, // U
+                22, // V
+                23, // W
+                24, // X
+                25, // Y
+                26  // Z
+            };
+            int macro_n = letter_to_macro[letter - 'A'];
+            if(macro_n > 0){
+                g65_args[macro_n]     = value;
+                g65_args_set[macro_n] = 1;
+            }
+        }
+
         switch(letter){
             case 'G':
                 if(value==0.0)      g_state.motion_mode=0; // G00 快速
@@ -657,19 +801,58 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==91.0) g_state.is_absolute=0;
                 else if(value==92.0) is_non_motion_g=1;    // G92 坐标偏移
                 else if(value==53.0) is_G53_this_block=1;  // G53 非模态机械坐标
+                else if(value==52.0){
+                    // P2': G52 局部坐标系。具体 X/Y/Z 值在字母循环后捕获
+                    is_g52_block = 1;
+                    is_non_motion_g = 1;  // G52 本身不触发运动
+                }
+                else if(value == 65.0){
+                    // P4': G65 用户宏调用 — 字母循环后处理
+                    // P<Onum> 指定目标, L<重复>, A-Z 映射到子程序 #1-#26
+                    is_g65_block    = 1;
+                    is_non_motion_g = 1;
+                }
+                else if(value == 66.0){
+                    // P4' Phase 2: G66 模态宏调用激活 — 字母循环后处理
+                    is_g66_block    = 1;
+                    is_non_motion_g = 1;
+                }
+                else if(value == 67.0){
+                    // P4' Phase 2: G67 取消模态宏调用
+                    if(g_state.modal_macro_active){
+                        printf("[Parser] G67 取消模态宏调用 (源行 %d)\n",
+                               g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                        g_state.modal_macro_active = 0;
+                    }
+                    is_non_motion_g = 1;
+                }
                 else if(value==93.0) g_state.feed_mode=FEED_MODE_G93; // G93 倒数时间
                 else if(value==94.0) g_state.feed_mode=FEED_MODE_G94; // G94 每分钟
                 else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
                 else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
-                else if(value>=54.0 && value<=59.0) g_coord_mgr.current_coord = (int)value - 53; // 54->1(G54), 55->2(G55)...
+                else if(fabs(value - 54.1) < 0.05){
+                    // P5': G54.1 Pn 扩展 WCS — 字母循环后处理 (需读 P)
+                    // 必须在 G54-G59 范围检查之前匹配, 否则会被误判为 G54
+                    is_g541_block    = 1;
+                    is_non_motion_g = 1;
+                }
+                else if(value>=54.0 && value<=59.0){
+                    // 切换模态 WCS — 仅写 parser 本地 g_state.modal_wcs, 不再直接污染
+                    // g_coord_mgr.current_coord (那是 RT 线程消费段时的独占写者)。
+                    // 先同步 Flush BSpline 脏点队列,保证本批平滑段全在旧 WCS 下捕获,
+                    // 后续脏点用新 WCS — 杜绝 bspline 批次跨 WCS 边界。
+                    if(g_state.bspline_enabled) BSpline_Flush();
+                    g_state.modal_wcs = (CoordSystem_t)((int)value - 53); // 54->G54, 55->G55...
+                    g_state.modal_ext_wcs_p = 0;  // P5': G54-G59 切换时清空 ext WCS
+                }
                 // ---- Phase 2A.2: 固定循环 G80/G81/G82/G83/G98/G99 ----
                 else if(value == 80.0){
                     // G80: 取消固定循环
                     if(g_state.bspline_enabled) BSpline_Flush();
                     g_state.active_cycle = 0;
                 }
-                else if(value == 81.0 || value == 82.0 || value == 83.0){
-                    // G81/G82/G83: 激活固定循环
+                else if(value == 73.0 || value == 81.0 || value == 82.0 || value == 83.0){
+                    // G73/G81/G82/G83: 激活固定循环
                     // 首次激活 (或 G80 后重新激活) 时捕获 cycle_initial_Z (G98 退回点)
                     int z_idx_g81 = g_axis_map['Z' - 'A'];
                     if(g_state.active_cycle == 0 && z_idx_g81 >= 0){
@@ -706,11 +889,20 @@ int parse_gcode_line(const char *gcode_line)
                             // 每轮独立: 再次清零 #1-#33
                             f->repeat_remaining--;
                             Macro_ClearLocals();
+                            // P4' G65: 字母参数需在每次重复时重新应用 (Fanuc 语义:
+                            // G65 L<n> 表示用相同参数调用 n 次)
+                            if(f->is_g65_frame){
+                                for(int n = 1; n <= 26; n++){
+                                    if(f->g65_args_set[n])
+                                        Macro_SetValue(n, f->g65_args[n]);
+                                }
+                            }
                             g_pc_jump_target  = f->entry_line;
                             g_pc_jump_pending = 1;
-                            printf("[Parser] M99 重复调用 (剩 %d 次, 跳回入口 %d, 源行 %d)\n",
+                            printf("[Parser] M99 重复调用 (剩 %d 次, 跳回入口 %d, 源行 %d)%s\n",
                                    f->repeat_remaining, f->entry_line,
-                                   g_current_program->lines[g_pc].line_no);
+                                   g_current_program->lines[g_pc].line_no,
+                                   f->is_g65_frame ? " [G65 参数重应用]" : "");
                         } else {
                             // 真正返回: 恢复调用者 #1-#33 + modal 状态, 弹栈
                             int ret = f->return_pc;
@@ -735,6 +927,48 @@ int parse_gcode_line(const char *gcode_line)
                 // Phase 2B M5: M98 子程序调用
                 // 处理推迟到字母循环结束 (需要检查严格字母 + 已收齐 P/L)
                 // 这里仅标记, 不在 case 内立即处理
+                // ---- P1': M 代码辅助状态机分发 ----
+                // M0/M1/M2/M30 = parser 级拦截 (不入队, 不入 RT 等待)
+                // M3/M4/M5/M6/M7/M8/M9/M19 = 物理 M 代码, 仅更新 g_state modal,
+                //   后续 api_push_mcode 快照到 seg, RT 消费时同步 g_interpolator._rt 镜像
+                else if(m_code == 0){
+                    g_parser_ctrl.is_paused = 1;
+                    printf("[Parser] M0 程序暂停 (源行 %d)\n",
+                           g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                    m_code = -1;  // 不入队
+                }
+                else if(m_code == 1){
+                    // M1 可选停: P1' 阶段视为 no-op (默认禁用, 未来加 optional_stop_enabled 开关)
+                    printf("[Parser] M1 optional stop (当前禁用, no-op, 源行 %d)\n",
+                           g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                    m_code = -1;
+                }
+                else if(m_code == 2 || m_code == 30){
+                    g_parser_ctrl.is_running = 0;
+                    printf("[Parser] M%d 程序结束 (源行 %d)\n",
+                           m_code, g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                    m_code = -1;
+                }
+                else if(m_code == 3){ g_state.spindle_mode = 1; }   // CW
+                else if(m_code == 4){ g_state.spindle_mode = 2; }   // CCW
+                else if(m_code == 5){
+                    g_state.spindle_mode = 0;
+                    g_state.spindle_rpm  = 0.0;
+                }
+                else if(m_code == 7){ g_state.coolant_state = 2; }  // mist
+                else if(m_code == 8){ g_state.coolant_state = 1; }  // flood
+                else if(m_code == 9){ g_state.coolant_state = 0; }
+                else if(m_code == 6){
+                    // M6 换刀: T 字母已通过 case 'T' 写入 g_state.current_tool_id
+                    // 实际 ATC 物理动作留硬件阶段; sim 中仅入队触发 RT 等待 + 状态同步
+                    printf("[Parser] M6 换刀 -> T%d (源行 %d)\n",
+                           g_state.current_tool_id,
+                           g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                }
+                else if(m_code == 19){
+                    // M19 主轴定向: sim 中视为 M5 等价 (无实际角度控制硬件)
+                    g_state.spindle_mode = 0;
+                }
                 break;
             case 'D':
                 // D 代码: 刀具半径补偿值 (mm)
@@ -752,7 +986,9 @@ int parse_gcode_line(const char *gcode_line)
                 break;
             case 'Q':
                 q_value=value;
-                if(g_state.active_cycle == 83) g_state.cycle_peck_depth = value;
+                // P3': G73/G83 共用 cycle_peck_depth (Q, 啄钻步进)
+                if(g_state.active_cycle == 83 || g_state.active_cycle == 73)
+                    g_state.cycle_peck_depth = value;
                 break;
             case 'R':
                 r_value=value;
@@ -760,7 +996,15 @@ int parse_gcode_line(const char *gcode_line)
                 // 注: cycle_R_plane 的捕获延迟到运动门控分支
                 // (G91 模式下 R 相对 cycle_initial_Z, 需先确定 G90/G91 再转换)
                 break;
-            case 'S':s_value=value;break;
+            case 'S':
+                s_value=value;
+                g_state.spindle_rpm = value;  // P1': 立即更新 modal, M3/M4 时 RT 镜像同步生效
+                break;
+            case 'T':
+                // P1': T 代码 — 立即更新 modal 刀号; M6 时 RT 镜像同步
+                t_value = value;
+                g_state.current_tool_id = (int)value;
+                break;
             default:
                 // 动态轴映射：任何 A-Z 字母若在 g_axis_map 中有映射则视为运动轴
                 if(letter >= 'A' && letter <= 'Z'){
@@ -776,6 +1020,22 @@ int parse_gcode_line(const char *gcode_line)
                 }
                 break;
         }
+    }
+
+    // ---- P2': G52 局部坐标系捕获 (字母循环结束后) ----
+    // Fanuc 语义: G52 X_ Y_ Z_ 设定局部偏置绝对值, 未指定轴归零
+    // 全零 (X0 Y0 Z0) 视为取消 local_offset_active
+    if(is_g52_block){
+        for(int i = 0; i < AXIS_NUM; i++){
+            g_state.local_offset[i] = has_axis[i] ? val_axis[i] : 0.0;
+        }
+        int all_zero = 1;
+        for(int i = 0; i < AXIS_NUM; i++){
+            if(fabs(g_state.local_offset[i]) > 1e-9){ all_zero = 0; break; }
+        }
+        g_state.local_offset_active = !all_zero;
+        printf("[Parser] G52 局部坐标系 %s\n",
+               g_state.local_offset_active ? "激活" : "取消");
     }
 
     // ---- Phase 2B M5: M98 子程序调用 (字母循环结束后统一处理) ----
@@ -822,6 +1082,7 @@ int parse_gcode_line(const char *gcode_line)
         f->repeat_remaining = l_value - 1;
         Macro_GetLocals(f->saved_locals);
         f->saved_state      = g_state;
+        f->is_g65_frame     = 0;  // P4': M98 帧不走 G65 字母重应用路径
         g_call_stack_top++;
         // 现代语义: 子程序看到的 #1-#33 是清零的副本 (隔离)
         Macro_ClearLocals();
@@ -832,6 +1093,66 @@ int parse_gcode_line(const char *gcode_line)
                (int)p_value, l_value, entry, g_call_stack_top,
                g_current_program->lines[g_pc].line_no);
         return 0;  // 不入 mcode 队列
+    }
+
+    // ---- P4': G65 用户宏调用 (字母循环结束后处理) ----
+    // 与 M98 区别: M98 子程序看到清零的 #1-#33; G65 子程序看到清零 + 字母映射的 #1-#26
+    // 完全复用 M5 CallFrame 栈与 M99 返回路径; Phase 2 重构为 dispatch_macro_call helper
+    if(is_g65_block){
+        int rc = dispatch_macro_call((int)p_value, l_value,
+                                      g65_args, g65_args_set,
+                                      1, "G65");
+        if(rc < 0) return -1;
+        return 0;  // 0=已调用或 L=0 no-op, 都不再走后续 motion/mcode 路径
+    }
+
+    // ---- P4' Phase 2: G66 模态宏调用激活 (字母循环结束后处理) ----
+    // G66 P- A-...Z- : 激活 modal macro, 此后每个运动段后自动调用一次
+    // G66 行本身无运动 (is_non_motion_g=1), 仅记录参数到 g_state
+    if(is_g66_block){
+        if(!g_current_program){
+            printf("[Parser] G66 在无 program 上下文\n");
+            return -1;
+        }
+        if(p_value < 1.0){
+            printf("[Parser] G66 缺 P<Onum> (源行 %d)\n",
+                   g_current_program->lines[g_pc].line_no);
+            return -1;
+        }
+        int o_idx = Program_FindOLabel(g_current_program, (int)p_value);
+        if(o_idx < 0){
+            printf("[Parser] G66 P%d 未找到子程序 (源行 %d)\n",
+                   (int)p_value, g_current_program->lines[g_pc].line_no);
+            return -1;
+        }
+        // 激活 modal macro: 存参数到 g_state
+        g_state.modal_macro_active = 1;
+        g_state.modal_macro_O_num  = (int)p_value;
+        for(int n = 1; n <= 26; n++){
+            g_state.modal_macro_args[n]     = g65_args[n];
+            g_state.modal_macro_args_set[n] = g65_args_set[n];
+        }
+        int argc = 0;
+        for(int n = 1; n <= 26; n++) if(g65_args_set[n]) argc++;
+        printf("[Parser] G66 P%d 激活模态宏调用 (%d 个参数, 源行 %d)\n",
+               (int)p_value, argc, g_current_program->lines[g_pc].line_no);
+        return 0;
+    }
+
+    // ---- P5': G54.1 Pn 扩展 WCS (字母循环结束后处理) ----
+    // Fanuc 标准: G54.1 P1-P48 选择 48 组扩展 WCS 之一
+    // 优先级: G54.1 激活时覆盖 modal_wcs (G54-G59); G54-G59 任意一切换会清零 modal_ext_wcs_p
+    if(is_g541_block){
+        int p = (int)p_value;
+        if(p < 1 || p > 48){
+            printf("[Parser] G54.1 P%d 越界 (允许 1-48, 源行 %d)\n", p,
+                   g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+            return -1;
+        }
+        if(g_state.bspline_enabled) BSpline_Flush();
+        g_state.modal_ext_wcs_p = p;
+        printf("[Parser] G54.1 P%d 激活扩展 WCS (源行 %d)\n", p,
+               g_current_program ? g_current_program->lines[g_pc].line_no : -1);
     }
 
     // 处理M代码：压入队列作为同步屏障
@@ -931,18 +1252,29 @@ int parse_gcode_line(const char *gcode_line)
         double machine_start_pos[AXIS_NUM];
 
         // 工件坐标偏置查询（G53 行内标记不影响模态 WCS）
-        int wcs_idx = (g_coord_mgr.current_coord >= COORD_G54 &&
-                       g_coord_mgr.current_coord <= COORD_G59)
-                      ? (g_coord_mgr.current_coord - 1) : -1;
+        // 读 parser 模态 g_state.modal_wcs (本线程独占写), 不读 g_coord_mgr.current_coord
+        // (那是 RT 线程消费段时才更新的"物理当前 WCS",滞后于解析)。
+        int wcs_idx = (g_state.modal_wcs >= COORD_G54 &&
+                       g_state.modal_wcs <= COORD_G59)
+                      ? (g_state.modal_wcs - 1) : -1;
 
         if(is_G53_this_block){
             // G53 非模态：val_axis 是机械绝对坐标，强制 G90，忽略 G91
+            // P2': back-calc 用的 w 必须用 effective offset (WCS+G52),
+            //       否则下一行正常模式下 start_pos 与 machine_start 会对不上 G52 量
+            // P5': w 优先取 ext WCS (G54.1 Pn), 否则 regular WCS (G54-G59)
             for(int i=0;i<AXIS_NUM;i++){
-                double w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                double w;
+                if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+                    w = g_coord_mgr.work_offsets_ext[g_state.modal_ext_wcs_p - 1][i];
+                } else {
+                    w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                }
+                if(g_state.local_offset_active && wcs_idx >= 0) w += g_state.local_offset[i];
                 start_pos[i] = g_state.current_pos[i];
                 machine_start_pos[i] = start_pos[i] + w;
                 machine_target_pos[i] = has_axis[i] ? val_axis[i] : machine_start_pos[i];
-                // 反推逻辑坐标，保证下一行回到正常模式时起点不撕裂
+                // 反推逻辑坐标 (在 WCS+G52 空间), 保证下一行回到正常模式时起点不撕裂
                 target_pos[i] = machine_target_pos[i] - w;
             }
         }else{
@@ -956,7 +1288,16 @@ int parse_gcode_line(const char *gcode_line)
                 }
             }
             for(int i=0;i<AXIS_NUM;i++){
-                double w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                // P2': push 时也需包含 G52 stacking, 与 snapshot_wcs_offset 保持一致,
+                // 否则 RT 用 snap 反推 logical 会撕裂 G52 量
+                // P5': 优先用 ext WCS (G54.1 Pn) 偏置, 否则 regular WCS
+                double w;
+                if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+                    w = g_coord_mgr.work_offsets_ext[g_state.modal_ext_wcs_p - 1][i];
+                } else {
+                    w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                }
+                if(g_state.local_offset_active) w += g_state.local_offset[i];
                 machine_target_pos[i] = target_pos[i] + w;
                 machine_start_pos[i] = start_pos[i] + w;
             }
@@ -1096,6 +1437,21 @@ int parse_gcode_line(const char *gcode_line)
             }
         }
         printf("F=%.1f\n", run_speed_mm);
+    }
+
+    // ---- P4' Phase 2: G66 模态宏调用触发 ----
+    // 仅在"运动已下发"时触发 (与运动门控同条件: has_move && !is_non_motion_g)
+    // G66 行本身 is_non_motion_g=1, 不触发; G67 同理
+    // 触发 = 单次宏调用 (L=1), 复用 dispatch_macro_call, is_g65_frame=1 让 M99 重应用参数
+    // (每次触发独立, repeat_remaining=0, M99 真返回)
+    if(g_state.modal_macro_active && has_move && !is_non_motion_g){
+        int rc = dispatch_macro_call(g_state.modal_macro_O_num, 1,
+                                      g_state.modal_macro_args,
+                                      g_state.modal_macro_args_set,
+                                      1, "G66-modal");
+        if(rc < 0) return -1;
+        // rc=0 (已调用) 或 rc=1 (L=0 no-op, 不会发生因 L=1 固定)
+        return 0;
     }
 
     return 0;
@@ -1244,8 +1600,10 @@ int generate_fixed_cycle(double target_pos[AXIS_NUM],
                g_state.active_cycle, Z_bottom, R_plane);
         return -1;
     }
-    if(g_state.active_cycle == 83 && g_state.cycle_peck_depth <= 0.0){
-        printf("[Parser] G83 啄钻步进 Q 必须 > 0！当前 Q=%.3f\n", g_state.cycle_peck_depth);
+    if((g_state.active_cycle == 83 || g_state.active_cycle == 73)
+       && g_state.cycle_peck_depth <= 0.0){
+        printf("[Parser] G%d 啄钻步进 Q 必须 > 0！当前 Q=%.3f\n",
+               g_state.active_cycle, g_state.cycle_peck_depth);
         return -1;
     }
 
@@ -1270,7 +1628,42 @@ int generate_fixed_cycle(double target_pos[AXIS_NUM],
     }
 
     // ---- 3. 工进 / 啄钻 ----
-    if(g_state.active_cycle == 83){
+    if(g_state.active_cycle == 73){
+        // P3': G73 高速啄钻 (断屑, 不排屑)
+        // 与 G83 区别: 每次工进后仅局部退回 RETRACT_MM (默认 0.5mm), 不退到 R
+        // 工业价值: 少 50-70% 空行程时间 (浅-中深孔节拍优先场景)
+        const int peck_limit = 10000;
+        const double RETRACT_MM = 0.5;  // Fanuc 默认 d=0.5mm (参数 5101)
+        double cur_Z = pos[z_idx];      // 当前 Z (已降到 R 或更低)
+        int peck_count = 0;
+
+        while(cur_Z > Z_bottom + 1e-9 && peck_count < peck_limit){
+            // 本次工进终点: cur_Z - peck_depth, 但不超 Z_bottom
+            double next_Z = cur_Z - g_state.cycle_peck_depth;
+            if(next_Z < Z_bottom) next_Z = Z_bottom;
+
+            // 工进 (切削)
+            pos[z_idx] = next_Z;
+            if(api_push_trajectory(pos, feed_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+
+            // 局部断屑退刀 (仅未到孔底时; 已到孔底由第 4 步统一退刀)
+            if(next_Z > Z_bottom + 1e-9){
+                double retract_to = next_Z + RETRACT_MM;
+                if(retract_to > R_plane) retract_to = R_plane;  // 钳制: 不超过 R
+                pos[z_idx] = retract_to;
+                if(api_push_trajectory(pos, rapid_speed, DEFAULT_ACC, DEFAULT_DEC) < 0) return -1;
+            }
+
+            cur_Z = next_Z;
+            peck_count++;
+        }
+        if(peck_count >= peck_limit){
+            printf("[Parser] G73 啄钻次数超限 %d, 中止 (Q=%.3f 可能过小)\n",
+                   peck_limit, g_state.cycle_peck_depth);
+            return -1;
+        }
+    }
+    else if(g_state.active_cycle == 83){
         // G83: 啄钻循环 (Phase 2A++ 优化版)
         // 工业标准: 退回 R 排屑后, 快速降至 last_cut_Z + CLEARANCE_MM,
         //           再工进 peck_depth (减少空切削时间)

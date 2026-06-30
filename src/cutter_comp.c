@@ -389,12 +389,22 @@ void CutterComp_Enable(int mode, double radius)
 
     // 记录当前机器坐标作为 Start-up Block 起点 P0
     // 将 g_state.current_pos (逻辑坐标) + 工件偏移 → 机械绝对坐标
+    // 读 parser 模态 g_state.modal_wcs (与 gcode_parser.c 偏置查询同源),
+    // 不读 g_coord_mgr.current_coord (RT 线程滞后字段,会撕裂刀补起点)。
     {
-        int wcs_idx = (g_coord_mgr.current_coord >= COORD_G54 &&
-                       g_coord_mgr.current_coord <= COORD_G59)
-                      ? (g_coord_mgr.current_coord - 1) : -1;
+        int wcs_idx = (g_state.modal_wcs >= COORD_G54 &&
+                       g_state.modal_wcs <= COORD_G59)
+                      ? (g_state.modal_wcs - 1) : -1;
         for(int i = 0; i < AXIS_NUM; i++){
-            double w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+            // P2': 与 snapshot_wcs_offset 同步, G54-G59 路径叠加 G52 local_offset
+            // P5': 优先用 ext WCS (G54.1 Pn) 偏置, 否则 regular WCS
+            double w;
+            if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+                w = g_coord_mgr.work_offsets_ext[g_state.modal_ext_wcs_p - 1][i];
+            } else {
+                w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+            }
+            if(g_state.local_offset_active && wcs_idx >= 0) w += g_state.local_offset[i];
             g_comp.window[0][i] = g_state.current_pos[i] + w;
         }
     }

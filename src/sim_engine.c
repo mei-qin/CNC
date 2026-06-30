@@ -75,11 +75,19 @@ int sim_engine_init(const char *output_path, int use_binary)
         // 记录 record_count 字段在文件中的偏移 (关闭时回填)
         g_sim_logger.header_offset = (long)offsetof(sim_file_header_t, record_count);
     } else {
-        // CSV 表头 (新增 stage_id 列, 位于 cycle 与 time 之间)
+        // CSV 表头 (含 WCS + H-1 + P1' aux 状态机扩展列)
         fprintf(g_sim_logger.fp, "cycle,stage_id,virtual_time_ms");
         for (int i = 0; i < AXIS_NUM; i++)
             fprintf(g_sim_logger.fp, ",%s", g_axis[i].axis_name);
-        fprintf(g_sim_logger.fp, ",v_target\n");
+        fprintf(g_sim_logger.fp, ",v_target,coord_rt");
+        for (int i = 0; i < AXIS_NUM; i++)
+            fprintf(g_sim_logger.fp, ",log_%s", g_axis[i].axis_name);
+        for (int i = 0; i < 3; i++)
+            fprintf(g_sim_logger.fp, ",off_%s", g_axis[i].axis_name);
+        fprintf(g_sim_logger.fp, ",off_g54_X");
+        // ---- P1': 辅助状态机 CSV 列 ----
+        fprintf(g_sim_logger.fp, ",spindle_mode,spindle_rpm,coolant,tool_id");
+        fprintf(g_sim_logger.fp, "\n");
         fflush(g_sim_logger.fp);
     }
 
@@ -146,15 +154,26 @@ void *sim_flush_thread_func(void *arg)
                                         cnt, L->fp);
                 L->file_record_count += written;
             } else {
-                // CSV 落盘: 逐行格式化 (较慢但可读, 用于调试)
-                // 输出列序: cycle, stage_id, virtual_time_ms, x/y/z/b/c, v_target
+                // 输出列序: cycle, stage_id, virtual_time_ms, 5×pos, v_target,
+                //            coord_rt, 5×logical_pos, 3×active_offset, off_g54_X,
+                //            spindle_mode, spindle_rpm, coolant, tool_id
                 for (uint32_t j = 0; j < cnt; j++) {
                     sim_trace_record_t *r = &L->bufs[i][j];
                     fprintf(L->fp, "%" PRIu64 ",%d,%.3f",
                             r->cycle, r->stage_id, r->virtual_time_ms);
                     for (int a = 0; a < AXIS_NUM; a++)
                         fprintf(L->fp, ",%.6f", r->pos[a]);
-                    fprintf(L->fp, ",%.6f\n", r->v_target);
+                    fprintf(L->fp, ",%.6f,%d", r->v_target, r->current_coord);
+                    for (int a = 0; a < AXIS_NUM; a++)
+                        fprintf(L->fp, ",%.6f", r->current_logical_pos[a]);
+                    for (int a = 0; a < 3; a++)
+                        fprintf(L->fp, ",%.6f", r->active_offset[a]);
+                    fprintf(L->fp, ",%.6f", r->work_offsets_g54_x);
+                    // ---- P1': aux 状态机 4 列 ----
+                    fprintf(L->fp, ",%d,%.3f,%d,%d",
+                            r->spindle_mode, r->spindle_rpm,
+                            r->coolant_state, r->tool_id);
+                    fprintf(L->fp, "\n");
                 }
                 L->file_record_count += cnt;
             }
