@@ -147,9 +147,10 @@ typedef struct {
     double pulse_per_unit; // 脉冲/单位（如 脉冲/mm 或 脉冲/度），用于位置/速度换算
 
     // ⑤ 仿真存根字段 (仅 g_sim_mode == 1 时使用)
+    // sim_actual_pos 已迁移到 sim_drive.c 的 g_sim_axis[].motor[].pos
+    // (一阶低通推算, 不再等于 sim_target_pos, 可产生真实跟随误差)
     uint16_t sim_cmd_cw;       // 上周期 RT 线程发送的控制字
     int32_t sim_target_pos;    // 上周期 RT 线程发送的目标位置 (脉冲)
-    int32_t sim_actual_pos;    // 仿真编码器反馈 (= sim_target_pos, 0 跟随误差)
 
     // ④ 轴动力学参数（由 SMC_ConfigAxisDynamics 配置）
     int axis_type;        // 0: 线性轴 (Linear), 1: 旋转轴 (Rotary)
@@ -238,7 +239,7 @@ typedef struct{
     // RT 消费时拷到这里, 供 sim CSV trace / 未来 HMI RPC 读出。
     int    spindle_mode_rt;     // 0=off(M5), 1=CW(M3), 2=CCW(M4)
     double spindle_rpm_rt;      // S 代码最近值 (rpm)
-    int    coolant_state_rt;    // 0=off(M9), 1=flood(M8), 2=mist(M7)
+    int    coolant_state_rt;    // bit flags: bit0=flood(M8), bit1=mist(M7); 0/1/2/3 见 g_state 注释
     int    current_tool_id_rt;  // T 代码当前刀号 (M6 切换后)
 
 }Interpolator_t;
@@ -297,7 +298,7 @@ typedef struct{
     // RT 消费 M 代码段时同步到 g_interpolator 的 _rt 镜像字段。
     int    aux_spindle_mode;    // 0=off, 1=CW, 2=CCW
     double aux_spindle_rpm;     // rpm
-    int    aux_coolant;         // 0=off, 1=flood, 2=mist
+    int    aux_coolant;         // bit flags: bit0=flood, bit1=mist (与 g_state.coolant_state 同语义)
     int    aux_tool_id;         // 当前刀号
 
     double total_distance;

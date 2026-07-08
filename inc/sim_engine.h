@@ -42,7 +42,7 @@ typedef struct {
     // ---- P1': 辅助状态机 CSV 追踪 (从 g_interpolator._rt 镜像读) ----
     int      spindle_mode;                // 0=off, 1=CW(M3), 2=CCW(M4)
     double   spindle_rpm;                 // rpm
-    int      coolant_state;               // 0=off, 1=flood(M8), 2=mist(M7)
+    int      coolant_state;               // bit0=flood(M8), bit1=mist(M7); 0/1/2/3
     int      tool_id;                     // 当前刀号 (M6 切换后)
 } sim_trace_record_t;
 

@@ -6,6 +6,7 @@
 #include "kinematics.h"
 #include "bspline_engine.h"
 #include "trace_logger.h"
+#include "sim_drive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -26,6 +27,13 @@ static int axis_lookup(char axis_letter) {
 int SMC_InitAndStart(const char *netif_name)
 {
     printf("[SMC_API] 正在初始化运动控制内核...\n");
+
+    // sim 模式: sim_drive 必须在 RT 线程启动前初始化好
+    // 否则 RT 主循环进入 dorun==1 后立即调 sim_drive_get_sw 会读到 cia_state=0,
+    // 而 sim_cia_advance 对未初始化状态返回原值, 状态机永久卡死。
+    if (g_sim_mode) {
+        sim_drive_init_all();
+    }
 
     if (!osal_thread_create_rt(&thread_rt, 128000, &ecat_thread_rt, NULL)) {
         printf("[SMC_API] 实时控制线程创建失败！\n"); return -1;
@@ -72,9 +80,13 @@ int SMC_InitAndStart(const char *netif_name)
     if (g_sim_mode) {
         // ---- 仿真模式: 跳过 EtherCAT 硬件初始化 ----
         printf("[SMC_API] 仿真模式: 跳过 ecat_bringup\n");
+        // sim_drive 已在函数入口初始化好, 此处只设 mappingdone/dorun 让 RT 进入主循环
+        // 不设 g_all_axis_op_ready=1: 让下面的等待循环真正等 RT 状态机跑到 case 3
+        // (sim_drive 状态机已稳定, 150 周期约 1-10ms 即可达 case 3, 远小于 100ms 等待粒度)
+        // 旧实现设 1 会让等待循环首次读到 1 立即退出, 但 RT 此时还在 case 0/1/2,
+        // 期间 client 查询 spindle/coolant 会拿到 -1
         mappingdone = 1;
         dorun = 1;
-        g_all_axis_op_ready = 1;
     } else {
         ecat_bringup((char*)netif_name);
     }
@@ -146,33 +158,60 @@ void SMC_Close(void)
 
 // ================== 轴配置 ==================
 
-// @Context: Non-RealTime Background Thread（仅初始化阶段调用）
-// @Thread-Safety: 写入 g_axis[] 和 g_axis_map[]，仅允许初始化阶段调用
-// axis_name 首字母决定映射槽位，底层自动分配连续的数组房间号
+// @Context: Non-RealTime Background Thread（仅初始化阶段或停机重配置时调用）
+// @Thread-Safety: 写入 g_axis[] 和 g_axis_map[]；加工运行中（队列未空 / 插补器未静止）
+//                 禁止调用，否则会撕裂 RT 线程读取的 slave_ids[]，引发 PDO 映射错乱。
+//
+// 语义说明：
+//   - 字母尚未映射 → 分配新房间号（g_allocated_axis_count++）
+//   - 字母已映射   → 走重新配置路径，覆盖现有槽位的拓扑参数，不消耗新房间号
+//                    （生产场景：rpc_server 启动时硬编码 5 轴 fallback，CAM 启动后
+//                     通过 RPC 覆盖同一批轴的 master/slave 配置）
 int SMC_ConfigAxisTopology(const char* axis_name, int is_dual_drive, int master_id, int slave_id){
     if(axis_name == NULL || axis_name[0] == '\0') {
         printf("[SMC_API] 轴名不能为空！\n");
         return -1;
     }
 
-    // 检查房间号是否用尽
-    if(g_allocated_axis_count >= AXIS_NUM) {
-        printf("[SMC_API] 轴房间号已满(%d/%d)，无法继续分配 '%s'！\n",
-               g_allocated_axis_count, AXIS_NUM, axis_name);
-        return -1;
-    }
-
-    // 提取首字母并校验
+    // 首字母合法性校验前置（避免非法字母时被"房间号已满"误报掩盖真实错误）
     char letter = toupper((unsigned char)axis_name[0]);
     if(letter < 'A' || letter > 'Z') {
         printf("[SMC_API] 轴名首字母 '%c' 不在 A-Z 范围内！\n", axis_name[0]);
         return -1;
     }
 
-    // 检查该字母的映射槽是否已被占用
-    if(g_axis_map[letter - 'A'] >= 0) {
-        printf("[SMC_API] 字母 '%c' 已被轴 '%s' 占用，拒绝重复映射！\n",
-               letter, g_axis[g_axis_map[letter - 'A']].axis_name);
+    // ===== 重新配置分支：字母已映射，覆盖现有槽位的拓扑参数 =====
+    int existing_idx = g_axis_map[letter - 'A'];
+    if(existing_idx >= 0) {
+        // 安全闸门：加工运行中禁止修改拓扑（与 SMC_ConfigAxisDynamics 一致）
+        if(g_parser_ctrl.is_running || !is_trajectory_finished()) {
+            printf("[SMC_API ERROR] 系统运行中（队列未空或插补器未静止），"
+                   "禁止重新配置 '%s' 拓扑！\n", axis_name);
+            return -1;
+        }
+        if(is_dual_drive){
+            g_axis[existing_idx].slave_ids[0] = master_id;
+            g_axis[existing_idx].slave_ids[1] = slave_id;
+            g_axis[existing_idx].slave_count  = 2;
+            printf("[SMC_API] 重新配置 '%s' → 房间[%d], 字母 '%c', 双驱 主ID:%d 从ID:%d\n",
+                   axis_name, existing_idx, letter, master_id, slave_id);
+        } else {
+            g_axis[existing_idx].slave_ids[0] = master_id;
+            g_axis[existing_idx].slave_count  = 1;
+            printf("[SMC_API] 重新配置 '%s' → 房间[%d], 字母 '%c', 单驱 ID:%d\n",
+                   axis_name, existing_idx, letter, master_id);
+        }
+        // 同步刷新轴名（用户可能把 "X轴" 重命名为 "X1"）
+        strncpy(g_axis[existing_idx].axis_name, axis_name,
+                sizeof(g_axis[existing_idx].axis_name) - 1);
+        g_axis[existing_idx].axis_name[sizeof(g_axis[existing_idx].axis_name) - 1] = '\0';
+        return 0;
+    }
+
+    // ===== 新分配分支：检查房间号是否用尽 =====
+    if(g_allocated_axis_count >= AXIS_NUM) {
+        printf("[SMC_API] 轴房间号已满(%d/%d)，无法继续分配 '%s'！\n",
+               g_allocated_axis_count, AXIS_NUM, axis_name);
         return -1;
     }
 
@@ -416,4 +455,78 @@ void SMC_PauseProcessing(){
 void SMC_ResumeProcessing(){
     g_parser_ctrl.is_paused = 0;
     api_motion_resume();
+}
+
+// ================== 仿真驱动器 API (仅 sim 模式) ==================
+
+int SMC_InjectAxisFault(char axis_letter, int slave_subidx)
+{
+    if (!g_sim_mode) {
+        printf("[SMC_API] InjectAxisFault 仅 sim 模式有效\n");
+        return -2;
+    }
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) {
+        printf("[SMC_API] 轴 '%c' 未配置，无法注入故障\n",
+               toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    printf("[SMC_API] 注入故障: 轴 %c motor %d\n",
+           toupper((unsigned char)axis_letter), slave_subidx);
+    return sim_drive_inject_fault(idx, slave_subidx);
+}
+
+int SMC_ConfigSimDynamics(char axis_letter, double alpha)
+{
+    if (!g_sim_mode) {
+        printf("[SMC_API] ConfigSimDynamics 仅 sim 模式有效\n");
+        return -2;
+    }
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) {
+        printf("[SMC_API] 轴 '%c' 未配置\n", toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    if (!(alpha > 0.0) || !(alpha < 1.0)) {
+        printf("[SMC_API] alpha=%.3f 越界 (0,1)\n", alpha);
+        return -1;
+    }
+    return sim_drive_config_alpha(idx, alpha);
+}
+
+// ================== 辅助状态查询 API ==================
+// 数据源: g_interpolator.*_rt 镜像字段 (RT 单写者, 此处单读者)
+// 反映"RT 实际执行到的"模态, 而非 parser 解析到的"将来"模态
+// M 段等待期间 mcode_wait_timer 走完前, 镜像保持上一次的值, 这是正确语义
+
+// @Context: Non-RealTime (HMI/CAM 通过 RPC 调用)
+// @Thread-Safety: int/double 对齐天然原子; 加 acquire 显式 happens-before 标注
+int SMC_GetSpindleState(int *mode, double *rpm)
+{
+    if (!g_all_axis_op_ready) return -1;
+    if (mode) *mode = g_interpolator.spindle_mode_rt;
+    if (rpm)  *rpm  = g_interpolator.spindle_rpm_rt;
+    return 0;
+}
+
+int SMC_GetCoolantState(int *state)
+{
+    if (!g_all_axis_op_ready) return -1;
+    if (state) *state = g_interpolator.coolant_state_rt;
+    return 0;
+}
+
+int SMC_GetCurrentTool(int *tool_id)
+{
+    if (!g_all_axis_op_ready) return -1;
+    if (tool_id) *tool_id = g_interpolator.current_tool_id_rt;
+    return 0;
+}
+
+// @Thread-Safety: 单写者 (此 API), 单读者 (parser M1 分支)
+int SMC_SetOptionalStopEnable(int enable)
+{
+    g_optional_stop_enabled = enable ? 1 : 0;
+    printf("[SMC_API] M1 可选停开关 -> %d\n", g_optional_stop_enabled);
+    return 0;
 }

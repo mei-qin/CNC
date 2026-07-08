@@ -1,6 +1,7 @@
 #include "axis_ctrl.h"
 #include "global_def.h"
 #include "soem/soem.h"
+#include "sim_drive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -794,17 +795,14 @@ uint8_t axis_sdo_read_mode(int axis_idx)
 /************************ PDO写（控制字+目标位置） ************************/
 void axis_pdo_write(int slave_id, uint16 cw, int32 pos)
 {
-    // ---- 仿真模式: 拦截写入, 存入 sim 字段 ----
+    // ---- 仿真模式: 转发到 sim_drive 推进状态机 + 一阶伺服 ----
     if (g_sim_mode) {
-        for (int i = 0; i < AXIS_NUM; i++) {
-            for (int s = 0; s < g_axis[i].slave_count; s++) {
-                if (g_axis[i].slave_ids[s] == slave_id) {
-                    g_axis[i].sim_cmd_cw = cw;
-                    g_axis[i].sim_target_pos = pos;
-                    g_axis[i].sim_actual_pos = pos; // 完美电机: 反馈 = 指令
-                    return;
-                }
-            }
+        int axis_idx, subidx;
+        if (sim_drive_lookup_slave(slave_id, &axis_idx, &subidx) == 0) {
+            uint64_t cyc = atomic_load_explicit(&g_sim_rt_cycle, memory_order_relaxed);
+            sim_drive_step_axis(axis_idx, subidx, cw, pos, cyc);
+            g_axis[axis_idx].sim_cmd_cw    = cw;
+            g_axis[axis_idx].sim_target_pos = pos;
         }
         return;
     }
@@ -834,21 +832,13 @@ void axis_pdo_write(int slave_id, uint16 cw, int32 pos)
 /************************ 单轴PDO读（状态字） ************************/
 uint16 axis_pdo_read_sw(int slave_id)
 {
-    // ---- 仿真模式: 根据 CiA402 步骤伪造完美状态字 ----
+    // ---- 仿真模式: 查 sim_drive 内部 CiA402 状态 (含 SW_ERROR / SW_TARGET_REACH) ----
     if (g_sim_mode) {
-        for (int i = 0; i < AXIS_NUM; i++) {
-            for (int s = 0; s < g_axis[i].slave_count; s++) {
-                if (g_axis[i].slave_ids[s] == slave_id) {
-                    switch (g_axis[i].cia_step) {
-                        case 0: return 0x0021; // SW_SHUTDOWN_RDY
-                        case 1: return 0x0023; // SW_SWITCHED_ON
-                        case 2: return 0x0027; // SW_OP_ENABLED
-                        default: return 0x0237; // SW_OP_ENABLED + TARGET_REACH + 保留位
-                    }
-                }
-            }
+        int axis_idx, subidx;
+        if (sim_drive_lookup_slave(slave_id, &axis_idx, &subidx) == 0) {
+            return sim_drive_get_sw(axis_idx, subidx);
         }
-        return 0x0237;
+        return 0x0000;
     }
 
     // 1. 基础校验：索引越界/轴故障/从站ID无效
@@ -1201,14 +1191,11 @@ void diagnose_sync_failure(int axis_idx)
 /************************ 从PDO读取实际位置 ************************/
 int32 axis_pdo_read_pos(int slave_id)
 {
-    // ---- 仿真模式: 返回完美电机反馈 (0 跟随误差) ----
+    // ---- 仿真模式: 返回 sim_drive 一阶低通推算的实际位置 ----
     if (g_sim_mode) {
-        for (int i = 0; i < AXIS_NUM; i++) {
-            for (int s = 0; s < g_axis[i].slave_count; s++) {
-                if (g_axis[i].slave_ids[s] == slave_id) {
-                    return g_axis[i].sim_actual_pos;
-                }
-            }
+        int axis_idx, subidx;
+        if (sim_drive_lookup_slave(slave_id, &axis_idx, &subidx) == 0) {
+            return sim_drive_get_pos(axis_idx, subidx);
         }
         return 0;
     }
@@ -1232,8 +1219,14 @@ int32 axis_pdo_read_pos(int slave_id)
 /************************ 从PDO读取跟随误差 (0x60F4) ************************/
 int32_t axis_pdo_read_follow_err(int slave_id)
 {
-    // ---- 仿真模式: 完美电机, 跟随误差恒为 0 ----
-    if (g_sim_mode) return 0;
+    // ---- 仿真模式: 返回 sim_drive 的 (target - actual) ----
+    if (g_sim_mode) {
+        int axis_idx, subidx;
+        if (sim_drive_lookup_slave(slave_id, &axis_idx, &subidx) == 0) {
+            return sim_drive_get_follow_err(axis_idx, subidx);
+        }
+        return 0;
+    }
 
     if (slave_id <=0 || slave_id > ctx.slavecount) return 0;
 

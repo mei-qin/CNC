@@ -1,19 +1,17 @@
 /* =====================================================================
- *  rpc_server.c  ——  CNC Core 端 TCP RPC 服务端 (纯 C / Linux, 端口 9527)
+ *  rpc_server.c  ——  CNC Core 生产入口 (纯 C / Linux, 端口 9527)
  *
- *  运行位置: Ubuntu 实时主机的"非实时"用户态进程, 与 1ms 硬实时
- *            EtherCAT 线程 (ecat_thread_rt) 同机但不同线程, 互不阻塞。
+ *  定位: CNC 内核的唯一生产运行入口。取代 main.c 的 scanf 测试菜单,
+ *        启动时自主完成硬件初始化 + 轴配置 + 运动学配置,
+ *        随后进入 TCP RPC 监听循环, 接受 MoveControl 的远程控制。
  *
- *  @Context: Non-RealTime Network Service Thread (TCP RPC)
- *  @Safe:    Blocking I/O (recv/send/accept), malloc/free, printf 均允许。
- *            绝对禁止在本文件中调用任何 ecat_thread_rt 路径或持有实时锁;
- *            与底层 SMC_* API 的线程安全由 smc_api 内部保证。
+ *  运行: sudo ./rpc_server <eth_iface|sim>
+ *        - eth_iface: 真实 EtherCAT 网卡 (如 enp7s0)
+ *        - sim:       纯软件仿真 (无硬件)
  *
- *  编译提示:
- *    假设本文件位于 CNC/rpc/, smc_api.h 位于 CNC/inc/, smc_protocol.h 同目录:
- *      gcc -O2 -Wall -I../inc -I. rpc_server.c -o rpc_server -lpthread
- *    生产环境通常由 rpc_server 自己在 main() 起点调用 SMC_InitAndStart,
- *    本示例为聚焦 RPC 逻辑暂不包含该步骤, 改由 CAM 通过 RPC 触发。
+ *  线程安全: rpc_server 自身是非实时线程, 通过 smc_api.h 与
+ *            ecat_thread_rt (1ms SCHED_FIFO) 及 parser 线程交互,
+ *            smc_api 内部保证线程安全。
  * ===================================================================== */
 
 #include <stdio.h>
@@ -28,6 +26,11 @@
 
 #include "smc_protocol.h"
 #include "smc_api.h"
+
+/* kernel_init 所需的头文件 */
+#include "global_def.h"
+#include "kinematics.h"
+#include "macro_eval.h"
 
 #define SMC_RPC_PORT      9527
 #define SMC_RPC_BACKLOG   8
@@ -157,6 +160,8 @@ static int handle_client_request(int client_fd)
             req->axis_name, req->is_dual_drive, req->master_id, req->slave_id);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcConfigAxisTopologyRes);
+        printf("[rpc] 轴拓扑: %s dual=%d master=%d slave=%d ret=%d\n",
+               req->axis_name, req->is_dual_drive, req->master_id, req->slave_id, res->ret_code);
         break;
     }
     case SMC_CMD_CONFIG_SOFT_LIMIT: {
@@ -169,6 +174,8 @@ static int handle_client_request(int client_fd)
             req->axis_letter, req->enable, req->neg_limit_mm, req->pos_limit_mm);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcConfigSoftLimitRes);
+        printf("[rpc] 软限位: %c enable=%d neg=%.1f pos=%.1f ret=%d\n",
+               req->axis_letter, req->enable, req->neg_limit_mm, req->pos_limit_mm, res->ret_code);
         break;
     }
     case SMC_CMD_CONFIG_GANTRY_SYNC_ALARM: {
@@ -182,6 +189,9 @@ static int handle_client_request(int client_fd)
             req->tolerance_pulse, req->max_error_pulse, req->time_ms);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcConfigGantrySyncAlarmRes);
+        printf("[rpc] 龙门报警: %c enable=%d tol=%d max_err=%d ms=%d ret=%d\n",
+               req->axis_letter, req->enable,
+               req->tolerance_pulse, req->max_error_pulse, req->time_ms, res->ret_code);
         break;
     }
     case SMC_CMD_CONFIG_PULSE_PER_UNIT: {
@@ -192,6 +202,7 @@ static int handle_client_request(int client_fd)
         SMC_ConfigPulsePerUnit(req->axis_letter, req->pulse_per_unit);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
+        printf("[rpc] 脉冲当量: %c ppu=%.1f\n", req->axis_letter, req->pulse_per_unit);
         break;
     }
     case SMC_CMD_CONFIG_AXIS_DYNAMICS: {
@@ -205,6 +216,9 @@ static int handle_client_request(int client_fd)
             req->max_v, req->max_a, req->max_d, req->equivalent_radius);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcConfigAxisDynamicsRes);
+        printf("[rpc] 轴动力学: %c type=%d maxV=%.1f maxA=%.1f radius=%.1f ret=%d\n",
+               req->axis_letter, req->type,
+               req->max_v, req->max_a, req->equivalent_radius, res->ret_code);
         break;
     }
     case SMC_CMD_CONFIG_PLANNER_PARAMS: {
@@ -216,6 +230,8 @@ static int handle_client_request(int client_fd)
         res->ret_code = SMC_ConfigPlannerParams(req->tolerance, req->max_centripetal_acc);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcConfigPlannerParamsRes);
+        printf("[rpc] 规划器: tol=%.3f centrip=%.1f ret=%d\n",
+               req->tolerance, req->max_centripetal_acc, res->ret_code);
         break;
     }
     case SMC_CMD_CONFIG_KINEMATICS_OFFSET: {
@@ -241,6 +257,34 @@ static int handle_client_request(int client_fd)
                              req->tool_off, req->pivot_off);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
+        printf("[rpc] 运动学: type=%d r1=(%d,%d) r2=(%d,%d)\n",
+               req->type, req->r1_idx, req->r1_axis, req->r2_idx, req->r2_axis);
+        break;
+    }
+    case SMC_CMD_INJECT_AXIS_FAULT: {
+        if (req_hdr.data_len < sizeof(SmcInjectAxisFaultReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcInjectAxisFaultReq *req = (SmcInjectAxisFaultReq *)payload;
+        SmcInjectAxisFaultRes *res = (SmcInjectAxisFaultRes *)resp_buf;
+        res->ret_code = SMC_InjectAxisFault(req->axis_letter, req->slave_subidx);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcInjectAxisFaultRes);
+        printf("[rpc] 注入故障: %c motor=%d ret=%d\n",
+               req->axis_letter, req->slave_subidx, res->ret_code);
+        break;
+    }
+    case SMC_CMD_CONFIG_SIM_DYNAMICS: {
+        if (req_hdr.data_len < sizeof(SmcConfigSimDynamicsReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigSimDynamicsReq *req = (SmcConfigSimDynamicsReq *)payload;
+        SmcConfigSimDynamicsRes *res = (SmcConfigSimDynamicsRes *)resp_buf;
+        res->ret_code = SMC_ConfigSimDynamics(req->axis_letter, req->alpha);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigSimDynamicsRes);
+        printf("[rpc] sim 动力学: %c alpha=%.3f ret=%d\n",
+               req->axis_letter, req->alpha, res->ret_code);
         break;
     }
 
@@ -297,6 +341,42 @@ static int handle_client_request(int client_fd)
         resp_payload_len = sizeof(SmcGetSystemStatusRes);
         break;
     }
+    case SMC_CMD_GET_SPINDLE_STATE: {
+        SmcGetSpindleStateRes *res = (SmcGetSpindleStateRes *)resp_buf;
+        res->mode = 0; res->rpm = 0.0; res->ret_code = 0;
+        res->ret_code = SMC_GetSpindleState(&res->mode, &res->rpm);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetSpindleStateRes);
+        break;
+    }
+    case SMC_CMD_GET_COOLANT_STATE: {
+        SmcGetCoolantStateRes *res = (SmcGetCoolantStateRes *)resp_buf;
+        res->state = 0; res->ret_code = 0;
+        res->ret_code = SMC_GetCoolantState(&res->state);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetCoolantStateRes);
+        break;
+    }
+    case SMC_CMD_GET_CURRENT_TOOL: {
+        SmcGetCurrentToolRes *res = (SmcGetCurrentToolRes *)resp_buf;
+        res->tool_id = 0; res->ret_code = 0;
+        res->ret_code = SMC_GetCurrentTool(&res->tool_id);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetCurrentToolRes);
+        break;
+    }
+    case SMC_CMD_SET_OPTIONAL_STOP_ENABLE: {
+        if (req_hdr.data_len < sizeof(SmcSetOptionalStopEnableReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcSetOptionalStopEnableReq *req = (SmcSetOptionalStopEnableReq *)payload;
+        SmcSetOptionalStopEnableRes *res = (SmcSetOptionalStopEnableRes *)resp_buf;
+        res->ret_code = SMC_SetOptionalStopEnable(req->enable);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcSetOptionalStopEnableRes);
+        printf("[rpc] M1 可选停: enable=%d ret=%d\n", req->enable, res->ret_code);
+        break;
+    }
 
     /* ===== 运动控制 ===== */
     case SMC_CMD_SET_ZERO: {
@@ -307,6 +387,10 @@ static int handle_client_request(int client_fd)
         SMC_SetZero(req->axis_letter);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
+        if (req->axis_letter == '*')
+            printf("[rpc] 运动: 全轴归零\n");
+        else
+            printf("[rpc] 运动: %c轴 归零\n", req->axis_letter);
         break;
     }
     case SMC_CMD_MOVE_RELATIVE: {
@@ -314,6 +398,8 @@ static int handle_client_request(int client_fd)
             res_hdr.err_code = SMC_ERR_PARAM; break;
         }
         SmcMoveRelativeReq *req = (SmcMoveRelativeReq *)payload;
+        printf("[rpc] 运动: %c轴 相对移动 %.3f | 速度 %.1f\n",
+               req->axis_letter, req->distance, req->speed);
         SMC_MoveRelative(req->axis_letter, req->distance, req->speed);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
@@ -324,6 +410,8 @@ static int handle_client_request(int client_fd)
             res_hdr.err_code = SMC_ERR_PARAM; break;
         }
         SmcGoZeroReq *req = (SmcGoZeroReq *)payload;
+        printf("[rpc] 运动: %c轴 回零 | 速度 %.1f\n",
+               req->axis_letter, req->speed);
         SMC_GoZero(req->axis_letter, req->speed);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
@@ -337,25 +425,30 @@ static int handle_client_request(int client_fd)
         }
         SmcRunGCodeFileReq *req = (SmcRunGCodeFileReq *)payload;
         req->filepath[SMC_FILEPATH_MAX_LEN - 1] = '\0';
+        printf("[rpc] 加工: 运行 %s\n", req->filepath);
         SmcRunGCodeFileRes *res = (SmcRunGCodeFileRes *)resp_buf;
         res->ret_code = SMC_RunGCodeFile(req->filepath);
+        printf("[rpc] 加工: 返回码=%d\n", res->ret_code);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcRunGCodeFileRes);
         break;
     }
     case SMC_CMD_PAUSE_PROCESSING: {
+        printf("[rpc] 加工: 暂停\n");
         SMC_PauseProcessing();
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
         break;
     }
     case SMC_CMD_RESUME_PROCESSING: {
+        printf("[rpc] 加工: 继续\n");
         SMC_ResumeProcessing();
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
         break;
     }
     case SMC_CMD_ABORT_PROCESSING: {
+        printf("[rpc] 加工: 中止\n");
         SMC_AbortProcessing();
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
@@ -380,28 +473,115 @@ static int handle_client_request(int client_fd)
     return 0;
 }
 
-/* ---------------------------------------------------------------------
- * main: listen / accept / 同连接多请求循环
- *   说明: 这是最简同步模型, 单连接串行处理。
- *        生产环境多 CAM 并发时, 改为 epoll 或每连接一线程; 但需保证
- *        多线程对 SMC_* 的并发由 smc_api 内部串行化, 或在 RPC 层加锁。
- * ------------------------------------------------------------------ */
-int main(void)
+/* =====================================================================
+ * 内核初始化 — 与 main.c 硬编码配置等价 (生产环境用 RPC 覆盖)
+ * ================================================================== */
+
+extern int g_sim_mode;
+extern void axis_sys_init(void);
+
+static int kernel_init(const char *iface)
 {
-    /* 客户端异常断开时忽略 SIGPIPE, 让 recv/send 返回错误而非崩进程 */
+    /* 仿真模式检测 */
+    if (strcmp(iface, "sim") == 0) {
+        g_sim_mode = 1;
+        printf("[rpc] ### 纯软件仿真模式已激活 ###\n");
+    }
+
+    printf("\n==============================================\n");
+    printf("     SMC 五轴高端数控系统内核 (V2.0) \n");
+    if (g_sim_mode) printf("     [SIMULATION MODE - 无真实硬件]\n");
+    printf("==============================================\n");
+
+    /* 1. 系统底层内存与互斥锁初始化 */
+    axis_sys_init();
+    Macro_Init();
+
+    /* 2. 默认轴拓扑 — MoveControl 启动后通过 RPC 覆盖 */
+    SMC_ConfigAxisTopology("X", 0, 5, 0);
+    SMC_ConfigAxisTopology("Y", 1, 3, 4);
+    SMC_ConfigAxisTopology("Z", 0, 6, 0);
+    SMC_ConfigAxisTopology("C", 0, 1, 0);
+    SMC_ConfigAxisTopology("B", 0, 2, 0);
+
+    /* 3. 脉冲当量 */
+    SMC_ConfigPulsePerUnit('X', 10000.0);
+    SMC_ConfigPulsePerUnit('Y', 10000.0);
+    SMC_ConfigPulsePerUnit('Z', 1000.0);
+    SMC_ConfigPulsePerUnit('C', 2777.7778);
+    SMC_ConfigPulsePerUnit('B', 2777.7778);
+
+    /* 4. 动力学 */
+    SMC_ConfigAxisDynamics('X', 0, 50.0, 200.0, 200.0, 0.0);
+    SMC_ConfigAxisDynamics('Y', 0, 50.0, 200.0, 200.0, 0.0);
+    SMC_ConfigAxisDynamics('Z', 0, 30.0, 100.0, 100.0, 0.0);
+    SMC_ConfigAxisDynamics('C', 1, 18.0,  72.0,  72.0, 50.0);
+    SMC_ConfigAxisDynamics('B', 1, 18.0,  72.0,  72.0, 80.0);
+
+    /* 5. 五轴运动学 (Head-Head 构型) */
+    double tool_off[3]  = {0.0, 0.0, 150.0};
+    double pivot_off[3] = {0.0, 0.0, 200.0};
+    SMC_ConfigKinematicsOffset(150.0, 0.0, 0.0, 200.0);
+    SMC_ConfigKinematics(KIN_HEAD_HEAD,
+                         g_axis_map['B'-'A'], 1,
+                         g_axis_map['C'-'A'], 2,
+                         tool_off, pivot_off);
+
+    /* 6. 规划器与安全 */
+    SMC_ConfigPlannerParams(0.05, 500.0);
+    SMC_ConfigGantrySyncAlarm('Y', 1, 1000, 8000, 100);
+    SMC_ConfigSoftLimit('Z', 1, -500.0, 200.0);
+
+    /* 7. 启动 EtherCAT / 仿真内核 */
+    if (SMC_InitAndStart(iface) != 0) {
+        fprintf(stderr, "[rpc] 内核启动失败\n");
+        return -1;
+    }
+
+    /* 等待全轴就绪 */
+    while (!g_all_axis_op_ready) {
+        usleep(100000);
+    }
+
+    printf("[rpc] 物理原点锚定, 内核就绪\n");
+
+    SMC_SetZero(SMC_AXIS_ALL);
+    sleep(1);
+    printf("[rpc] G54 坐标系初始化完毕, 准备接受 MoveControl 连接\n");
+
+    return 0;
+}
+
+/* =====================================================================
+ * main — rpc_server 的唯一入口
+ *   $ sudo ./rpc_server enp7s0
+ *   $ sudo ./rpc_server sim
+ * ================================================================== */
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        printf("用法: sudo %s <EtherCAT网卡名|sim>\n", argv[0]);
+        printf("      sudo %s sim                 (纯软件仿真, 无硬件)\n", argv[0]);
+        return 1;
+    }
+
+    /* 客户端断开时忽略 SIGPIPE */
     signal(SIGPIPE, SIG_IGN);
 
+    /* 初始化内核 */
+    if (kernel_init(argv[1]) != 0) {
+        return 1;
+    }
+
+    /* 启动 RPC 监听 */
+    printf("[rpc] 启动 TCP 服务...\n");
+
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd < 0) { perror("socket"); return 1; }
+    if (listen_fd < 0) { perror("[rpc] socket"); return 1; }
 
     int opt = 1;
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    /* 绑定 INADDR_ANY (0.0.0.0) —— WSL2 跨 OS 联调关键点:
-     *   WSL2 的 localhostForwarding (默认开启) 会把 Windows 宿主机对
-     *   127.0.0.1:9527 的访问自动转发到 WSL2 内的同端口监听服务。
-     *   若只绑 127.0.0.1, 可能因 WSL2 网络命名空间隔离导致宿主机无法连通。
-     *   生产部署若启用了 mirrored 网络模式, 同样建议保持 0.0.0.0。*/
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin_family      = AF_INET;
@@ -409,25 +589,25 @@ int main(void)
     addr.sin_port        = htons(SMC_RPC_PORT);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("bind"); close(listen_fd); return 1;
+        perror("[rpc] bind"); close(listen_fd); return 1;
     }
     if (listen(listen_fd, SMC_RPC_BACKLOG) < 0) {
-        perror("listen"); close(listen_fd); return 1;
+        perror("[rpc] listen"); close(listen_fd); return 1;
     }
     printf("[rpc] listening on 0.0.0.0:%d ...\n", SMC_RPC_PORT);
 
+    /* 接受连接主循环 */
     for (;;) {
         int client_fd = accept(listen_fd, NULL, NULL);
         if (client_fd < 0) {
             if (errno == EINTR) continue;
-            perror("accept");
+            perror("[rpc] accept");
             continue;
         }
         printf("[rpc] client connected, fd=%d\n", client_fd);
 
-        /* 同一连接上循环处理多轮请求, 直到对端断开 */
         while (handle_client_request(client_fd) == 0) {
-            /* nothing */;
+            /* 处理请求直到对端断开 */;
         }
         close(client_fd);
         printf("[rpc] client disconnected, fd=%d\n", client_fd);
@@ -436,3 +616,8 @@ int main(void)
     close(listen_fd);
     return 0;
 }
+
+/* ---- 旧版线程 API (已废弃, 保留兼容) ---- */
+
+void rpc_server_start(void) {}
+void rpc_server_stop(void) {}

@@ -59,6 +59,29 @@ int SMC_IsAxisConfigured(char axis_letter);
 // out_str: 输出缓冲区, max_len: 缓冲区最大长度(含 '\0')
 void SMC_GetSystemStatusStr(char* out_str, int max_len);
 
+// =======================================================
+// 辅助状态查询 API (反映 RT 实际执行到的状态, 非parser 解析到的"将来")
+// =======================================================
+// 查询主轴模态与转速 (镜像 RT spindle_mode_rt/spindle_rpm_rt)
+// *mode: 0=off(M5), 1=CW(M3), 2=CCW(M4)
+// *rpm:  最近有效 S 值
+// 返回: 0=成功, -1=轴未就绪
+int SMC_GetSpindleState(int *mode, double *rpm);
+
+// 查询冷却液 bit flags (镜像 RT coolant_state_rt)
+// *state: bit0=flood(M8), bit1=mist(M7); 0=off/1=flood/2=mist/3=both
+// 返回: 0=成功, -1=轴未就绪
+int SMC_GetCoolantState(int *state);
+
+// 查询当前刀号 (镜像 RT current_tool_id_rt, 由最近一次 M6 切换)
+// 返回: 0=成功, -1=轴未就绪
+int SMC_GetCurrentTool(int *tool_id);
+
+// 控制 M1 可选停开关 (HMI 用)
+// enable: 0=禁用 M1 (默认, M1 no-op), 1=M1 等价 M0
+// 返回: 0=成功
+int SMC_SetOptionalStopEnable(int enable);
+
 
 // =======================================================
 // 运动控制 API
@@ -112,6 +135,20 @@ void SMC_ConfigKinematics(int type,
                           int r1_idx, int r1_axis,
                           int r2_idx, int r2_axis,
                           double tool_off[3], double pivot_off[3]);
+
+// =======================================================
+// 仿真驱动器 API (仅 g_sim_mode==1 时有效, 真实硬件模式返回错误)
+// =======================================================
+// 故障注入: 把指定轴指定 motor 推入 CiA402 FAULT 态 (SW_ERROR 置位)
+// axis_letter:   轴字母 ('X'/'Y'/'Z'/'B'/'C')
+// slave_subidx:  双驱轴的 motor 索引 (0=主, 1=从; 单驱轴只能 0)
+// 返回: 0=成功, -1=参数越界/轴未配置, -2=非 sim 模式
+int SMC_InjectAxisFault(char axis_letter, int slave_subidx);
+
+// 配置 sim 一阶伺服模型的滞后系数 alpha
+// alpha: (0, 1) 范围, 默认 0.2; 越小跟随误差越大 (alpha=0.05 时易触发硬停)
+// 返回: 0=成功, -1=参数越界/轴未配置, -2=非 sim 模式
+int SMC_ConfigSimDynamics(char axis_letter, double alpha);
 
 
 #ifdef __cplusplus

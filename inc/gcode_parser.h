@@ -49,7 +49,8 @@ typedef struct {
     // RT 消费时拷到 g_interpolator._rt 字段。
     int    spindle_mode;        // 0=off(M5), 1=CW(M3), 2=CCW(M4)
     double spindle_rpm;         // S 代码最近值 (rpm, >0)
-    int    coolant_state;       // 0=off(M9), 1=flood(M8), 2=mist(M7)
+    int    coolant_state;       // bit flags: bit0=flood(M8), bit1=mist(M7);
+                                // 0=off, 1=flood, 2=mist, 3=flood+mist; M9 清零
     int    current_tool_id;     // T 代码当前刀号 (M6 切换到此刀号)
 
     // ---- P2': G52 局部坐标系 ----
@@ -98,4 +99,9 @@ int  generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM],double end_pos[A
 int  generate_fixed_cycle(double target_pos[AXIS_NUM],
                           double start_pos[AXIS_NUM],
                           double feedrate_mm_min);
+
+// M1 可选停开关: 默认 0=禁用 (M1 no-op), 1=M1 等价 M0 (HMI 通过 SMC_SetOptionalStopEnable 切换)
+// 线程安全: 单写者 (SMC_SetOptionalStopEnable) + 单读者 (parser M1 分支), int 写天然原子
+extern int g_optional_stop_enabled;
+
 #endif // GCODE_PARSER_H

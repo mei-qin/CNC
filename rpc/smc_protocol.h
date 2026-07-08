@@ -58,6 +58,8 @@ typedef enum {
     SMC_CMD_CONFIG_PLANNER_PARAMS    = 0x0015,
     SMC_CMD_CONFIG_KINEMATICS_OFFSET = 0x0016,
     SMC_CMD_CONFIG_KINEMATICS        = 0x0017,
+    SMC_CMD_INJECT_AXIS_FAULT        = 0x0018,  /* sim 模式故障注入 */
+    SMC_CMD_CONFIG_SIM_DYNAMICS      = 0x0019,  /* sim 一阶伺服 alpha 配置 */
 
     /* --- 坐标与状态查询 0x0020 ~ 0x002F --- */
     SMC_CMD_GET_LOGICAL_POS          = 0x0020,
@@ -66,6 +68,10 @@ typedef enum {
     SMC_CMD_GET_QUEUE_COUNT          = 0x0023,
     SMC_CMD_IS_AXIS_CONFIGURED       = 0x0024,
     SMC_CMD_GET_SYSTEM_STATUS        = 0x0025,
+    SMC_CMD_GET_SPINDLE_STATE        = 0x0026,  /* 主轴模态 + 转速查询 */
+    SMC_CMD_GET_COOLANT_STATE        = 0x0027,  /* 冷却液 bit flags 查询 */
+    SMC_CMD_GET_CURRENT_TOOL         = 0x0028,  /* 当前刀号查询 */
+    SMC_CMD_SET_OPTIONAL_STOP_ENABLE = 0x0029,  /* M1 可选停开关 */
 
     /* --- 运动控制 0x0030 ~ 0x003F --- */
     SMC_CMD_SET_ZERO                 = 0x0030,
@@ -200,6 +206,23 @@ typedef struct {
 } SmcConfigKinematicsReq;
 /* SMC_CONFIG_KINEMATICS: void 返回, 无 Res */
 
+/* ----- 仿真驱动器 (sim 模式专用) ----- */
+typedef struct {
+    char    axis_letter;
+    uint8_t slave_subidx;   /* 0=主 motor, 1=从 motor (双驱轴) */
+} SmcInjectAxisFaultReq;
+typedef struct {
+    int32_t ret_code;       /* 0=成功, -1=参数越界, -2=非 sim 模式 */
+} SmcInjectAxisFaultRes;
+
+typedef struct {
+    char    axis_letter;
+    double  alpha;          /* 一阶伺服系数 (0,1), 默认 0.2 */
+} SmcConfigSimDynamicsReq;
+typedef struct {
+    int32_t ret_code;
+} SmcConfigSimDynamicsRes;
+
 /* ----- 坐标与状态查询 ----- */
 typedef struct {
     char axis_letter;
@@ -234,6 +257,32 @@ typedef struct {
 typedef struct {
     char status_str[SMC_STATUS_STR_MAX_LEN];  /* "ALARM"/"HOLD"/"RUN"/"IDLE" */
 } SmcGetSystemStatusRes;
+
+/* SMC_GET_SPINDLE_STATE: 无 Req */
+typedef struct {
+    int32_t mode;       /* 0=off(M5), 1=CW(M3), 2=CCW(M4) */
+    double  rpm;        /* 最近有效 S 值 */
+    int32_t ret_code;   /* 0=ok, -1=轴未就绪 */
+} SmcGetSpindleStateRes;
+
+/* SMC_GET_COOLANT_STATE: 无 Req */
+typedef struct {
+    int32_t state;      /* bit0=flood(M8), bit1=mist(M7); 0/1/2/3 */
+    int32_t ret_code;
+} SmcGetCoolantStateRes;
+
+/* SMC_GET_CURRENT_TOOL: 无 Req */
+typedef struct {
+    int32_t tool_id;    /* 当前刀号 (最近 M6 切换值) */
+    int32_t ret_code;
+} SmcGetCurrentToolRes;
+
+typedef struct {
+    int32_t enable;     /* 0=禁用 M1, 1=M1 等价 M0 */
+} SmcSetOptionalStopEnableReq;
+typedef struct {
+    int32_t ret_code;
+} SmcSetOptionalStopEnableRes;
 
 /* ----- 运动控制 ----- */
 typedef struct {
