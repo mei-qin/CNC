@@ -23,6 +23,7 @@
 
 #include <string>
 #include <cstdint>
+#include <mutex>
 
 #include "smc_protocol.h"   /* 共享协议定义 + SMC_AXIS_ALL 等常量 */
 
@@ -144,6 +145,7 @@ private:
 private:
     smc_socket_t sock_fd_;
     int          last_err_;
+    std::mutex   comm_mutex_;  /* TCP 收发原子锁 */
 };
 
 #endif /* SMC_CONTROLLER_SDK_H */

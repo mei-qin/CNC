@@ -299,6 +299,7 @@ std::string SmcController::TranslatePathForWSL(const std::string &win_path)
  * ================================================================== */
 bool SmcController::invokeNoRet(uint16_t cmd, const void *req, uint16_t req_len)
 {
+    std::lock_guard<std::mutex> lock(comm_mutex_);
     if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
     if (!sendRequest(cmd, req, req_len)) return false;
 
@@ -313,6 +314,7 @@ bool SmcController::invokeNoRet(uint16_t cmd, const void *req, uint16_t req_len)
 bool SmcController::invokeIntRet(uint16_t cmd, int &out,
                                  const void *req, uint16_t req_len)
 {
+    std::lock_guard<std::mutex> lock(comm_mutex_);
     if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
     if (!sendRequest(cmd, req, req_len)) return false;
 
@@ -329,6 +331,7 @@ bool SmcController::invokeIntRet(uint16_t cmd, int &out,
 bool SmcController::invokeDoubleRet(uint16_t cmd, double &out,
                                     const void *req, uint16_t req_len)
 {
+    std::lock_guard<std::mutex> lock(comm_mutex_);
     if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
     if (!sendRequest(cmd, req, req_len)) return false;
 
@@ -344,6 +347,7 @@ bool SmcController::invokeDoubleRet(uint16_t cmd, double &out,
 
 bool SmcController::invokeStrRet(uint16_t cmd, char *buf, uint32_t buf_cap)
 {
+    std::lock_guard<std::mutex> lock(comm_mutex_);
     if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
     if (buf == nullptr || buf_cap == 0) { last_err_ = SMC_ERR_PARAM; return false; }
     if (!sendRequest(cmd, nullptr, 0)) return false;
