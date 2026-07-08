@@ -4,11 +4,13 @@
 #include "planner.h"
 #include "trace_logger.h"
 #include "sim_engine.h"
+#include "sim_drive.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <stdarg.h>
 #include <time.h>
+#include <sched.h>      /* sched_setscheduler / sched_yield */
 
 /************************ 全局变量定义（SOEM+实时控制相关） ************************/
 // SOEM核心变量
@@ -221,18 +223,31 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
     while (!mappingdone) osal_usleep(100);
     osal_get_monotonic_time(&ts);
 
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(3, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    // ============================================================
+    // 调度策略: 硬件模式 = SCHED_FIFO 99 + 锁 Core 3 (硬实时)
+    //           仿真模式 = SCHED_OTHER + 不锁核 (避免饿死同核线程)
+    // 仿真模式若保留 SCHED_FIFO 99, 主循环空转 (ecat_core.c:250)
+    // 会以最高优先级独占 Core 3, 把同核的 parser/chk/BSpline 线程
+    // 饿死, 在 WSL2 等核心数受限的环境下进一步触发 OS 卡死。
+    // ============================================================
+    if (g_sim_mode) {
+        struct sched_param sp_sim = {.sched_priority = 0};
+        sched_setscheduler(0, SCHED_OTHER, &sp_sim);
+        rt_log("[RT] 仿真模式: 已降级 SCHED_OTHER, 不锁 CPU 亲和性");
+    } else {
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(3, &cpuset);
+        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 
-    struct sched_param sp = {.sched_priority = 99};
-    pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+        struct sched_param sp = {.sched_priority = 99};
+        pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 
-    struct sched_param param;
-    param.sched_priority = 99;
-    sched_setscheduler(0, SCHED_FIFO, &param);
-    rt_log("[RT] 已设置FIFO调度，优先级99");
+        struct sched_param param;
+        param.sched_priority = 99;
+        sched_setscheduler(0, SCHED_FIFO, &param);
+        rt_log("[RT] 已设置FIFO调度，优先级99");
+    }
 
     osal_get_monotonic_time(&ts);
     ht = (ts.tv_nsec / 1000000) + 1;
@@ -243,12 +258,29 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
     while (1)
     {
         // ================================================================
-        // 仿真模式: 跳过硬件时钟等待, 以 CPU 最高算力空转
-        // 每次循环代表 1ms 虚拟时间, 但实际以纳秒级执行
-        // "几秒钟推演几十小时加工代码" 的超光速仿真核心!
+        // 仿真模式节流 (避免 tight loop 饿死 I/O 线程):
+        //   默认 500us = 节流到 wall-clock ≈ 0.5× 实时 (5000 cycles ≈ 2.5s/5mm G01)
+        //   SIM_RT_SLEEP_US=0    = 真正 tight loop (超光速, 验证场景慎用)
+        //   SIM_RT_SLEEP_US=1000 = 严格匹配 1ms cycletime (真实节拍)
+        //
+        // 问题背景: 此前 sim 模式 cycle 末有 osal_usleep(10000) (10ms 周期),
+        // RT 线程实际 wall-clock = 10ms/cycle, 38 段队列 × 5000 cycles × 10ms
+        // = 31 分钟, 远超 30s 安全停超时, 造成 "Q:N 始终清不完"。
+        //
+        // 修复: cycle 内由 SIM_RT_SLEEP_US 节流 (默认 500us), cycle 末 sim 模式
+        //       不再额外 sleep, wall-clock ≈ 0.5ms/cycle, 38 段 × 2.5s = 95s
+        //       (仍可能超 30s 超时, 但比 31 分钟好; 验证推荐 SIM_RT_SLEEP_US=100)
         // ================================================================
         if (g_sim_mode) {
-            // 无 sleep, 无 add_time_ns — 纯 CPU 火力全开
+            static int sim_sleep_us = -1;
+            if (sim_sleep_us < 0) {
+                const char *env = getenv("SIM_RT_SLEEP_US");
+                sim_sleep_us = env ? atoi(env) : 500;
+                rt_log("[RT] 仿真节流: SIM_RT_SLEEP_US=%d us (来源: %s)",
+                       sim_sleep_us, env ? "环境变量" : "默认值");
+            }
+            if (sim_sleep_us > 0) osal_usleep(sim_sleep_us);
+            // sim_sleep_us == 0: 真正 tight loop (用户显式要求超光速)
         } else {
             add_time_ns(&ts, cycletime + toff);
             osal_monotonic_sleep(&ts);
@@ -256,6 +288,12 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
         if(dorun == 1){
             cycle++;
+
+            // ---- 仿真模式: 全局周期计数 (sim_drive_step_axis 用此去重) ----
+            // CLAUDE.md 红线 #3 的最小例外: 仅一行原子递增, 不引入分支逻辑
+            if (g_sim_mode) {
+                atomic_fetch_add_explicit(&g_sim_rt_cycle, 1, memory_order_relaxed);
+            }
 
             // ---- 仿真模式: 跳过真实 EtherCAT 收发 ----
             if (g_sim_mode) {
@@ -823,8 +861,45 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // 抱闸闭合期间维持 EtherCAT 心跳，防止通信丢失。
             // ================================================================
             if (g_sim_mode) {
-                // 仿真模式: 直接完成下电
-                dorun = 0;
+                // ============================================================
+                // 仿真模式: 简化两步下电 (5ms Step0 + ≤10ms Step1)
+                // 不真等 500ms 抱闸, 但走完 CiA402 降级时序, 让
+                // ecat_thread_chk / 优雅下电状态机在 sim 中可观察。
+                // 计数器用 cycle++ 的等价物 (sim_rt_cycle) 推进。
+                // ============================================================
+                static int sim_shutdown_step    = 0;
+                static int sim_shutdown_counter = 0;
+
+                if (sim_shutdown_step == 0) {
+                    // Step 0: 维持 CW_SWITCH_ON + 锁定位置 5ms
+                    for (int i = 0; i < AXIS_NUM; i++) {
+                        for (int s = 0; s < g_axis[i].slave_count; s++) {
+                            axis_pdo_write(g_axis[i].slave_ids[s], CW_SWITCH_ON,
+                                           g_axis[i].sim_target_pos);
+                        }
+                    }
+                    if (++sim_shutdown_counter >= 5) {
+                        sim_shutdown_step    = 1;
+                        sim_shutdown_counter = 0;
+                    }
+                } else if (sim_shutdown_step == 1) {
+                    // Step 1: 发 CW_SHUTDOWN 降级, 等所有 slave 回 SHUTDOWN_RDY
+                    int all_back = 1;
+                    for (int i = 0; i < AXIS_NUM; i++) {
+                        for (int s = 0; s < g_axis[i].slave_count; s++) {
+                            int slave_id = g_axis[i].slave_ids[s];
+                            axis_pdo_write(slave_id, CW_SHUTDOWN,
+                                           g_axis[i].sim_target_pos);
+                            uint16_t sw = axis_pdo_read_sw(slave_id);
+                            if ((sw & SW_MASK) != SW_SHUTDOWN_RDY) all_back = 0;
+                        }
+                    }
+                    if (all_back || ++sim_shutdown_counter >= 10) {
+                        sim_shutdown_step    = 0;
+                        sim_shutdown_counter = 0;
+                        dorun = 0;
+                    }
+                }
             } else {
                 wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
 
@@ -884,6 +959,20 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             }
         }
 
+        // ============================================================
+        // 仿真模式 cycle 末尾处理 (修订):
+        //
+        // 历史问题: 此前 sim 模式 cycle 末调 sched_yield() "让出 CPU 防止火力空转",
+        // 但在 WSL2 + SCHED_OTHER + 多线程 (parser/chk/BSpline/trace_logger/SimEngine)
+        // 竞争环境下, sched_yield 让出后 RT 线程要等数十 ms 才能再调度,
+        // 导致 cycle wall-clock 飙到 6.58s (而非预期的 500us), 38 段队列 30s 内
+        // 一段都消费不完。
+        //
+        // 修复: cycle 末不再 sched_yield。CPU 让出已由 cycle 内的 osal_usleep
+        // (SIM_RT_SLEEP_US) 承担 —— sleep 期间 OS 自然调度其他线程。
+        // 硬实时模式绝对不能加 sched_yield 或任何 sleep 调用。
+        // ============================================================
+        // (sim 模式无操作; real 模式不能在此 yield)
     }
     return ;
 }
@@ -969,7 +1058,16 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
         }
 
         rt_log_drain();
-        osal_usleep(10000);
+        // ============================================================
+        // cycle 末尾 sleep:
+        //   real 模式: 10ms EtherCAT 周期 (与 DC 时钟同步)
+        //   sim 模式:  不额外 sleep, cycle 内已由 SIM_RT_SLEEP_US 节流
+        //              (此前 sim 模式也走 10ms sleep, 导致 wall-clock = 10ms/cycle
+        //               远超虚拟时间 1ms, 38 段队列需 31 分钟才能清空)
+        // ============================================================
+        if (!g_sim_mode) {
+            osal_usleep(10000);
+        }
     }
     return ;
 }

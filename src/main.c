@@ -3,11 +3,13 @@
 #include <string.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <stdatomic.h>
 #include "global_def.h"
 #include "axis_ctrl.h"
 #include "kinematics.h"
 #include "smc_api.h"
 #include "macro_eval.h"   // 宏变量环境初始化
+#include "sim_drive.h"    // g_sim_rt_cycle (RT cycle 诊断)
 
 // ============================================================================
 // 动态轴坐标信息构建（安全 snprintf 拼接，防溢出）
@@ -35,21 +37,79 @@ static void build_axis_info_str(char* buf, int buf_size) {
 // ============================================================================
 // 辅助函数：阻塞等待运动完成，并实时刷新动态状态栏
 // ============================================================================
+
+// 诊断: cycle 速率计算 (每次 print_status_line 调用时计算增量)
+// 显示格式: cyc_rt=N (delta_cycles / delta_ms ≈ kHz)
+static uint64_t g_last_cycle = 0;
+static double   g_last_ts_sec = 0.0;
+static int      g_sim_debug = -1;   // -1=未初始化, 0=简洁, 1=详细诊断
+
+extern _Atomic int g_sys_alarm_state;
+
+static double monotonic_ts_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + ts.tv_nsec / 1e9;
+}
+
 static void print_status_line(void) {
     char status_str[16];
     char axis_info[256];
     SMC_GetSystemStatusStr(status_str, sizeof(status_str));
     build_axis_info_str(axis_info, sizeof(axis_info));
     int q_cnt = SMC_GetQueueCount();
-    printf("\r\033[K[%-5s] Q:%3d | %s", status_str, q_cnt, axis_info);
+
+    // 首次调用时读 env (默认简洁模式)
+    if (g_sim_debug < 0) {
+        const char *env = getenv("SIM_RT_DEBUG");
+        g_sim_debug = env ? atoi(env) : 0;
+    }
+
+    // RT cycle 速率 (轻量监控, 默认显示)
+    uint64_t cur_cycle = atomic_load(&g_sim_rt_cycle);
+    double   cur_ts    = monotonic_ts_sec();
+    double   dt        = cur_ts - g_last_ts_sec;
+    double   cyc_khz   = (dt > 1e-6) ? (cur_cycle - g_last_cycle) / dt / 1000.0 : 0.0;
+    g_last_cycle = cur_cycle;
+    g_last_ts_sec = cur_ts;
+
+    int alarm = atomic_load(&g_sys_alarm_state);
+
+    if (g_sim_debug) {
+        // 详细诊断模式 (SIM_RT_DEBUG=1): 显示 S 曲线 phase + feedhold 状态机
+        int    ph     = g_interpolator.current_phase;
+        double vt     = g_interpolator.virtual_time_ms;
+        double T7     = g_interpolator.T7;
+        int    is_mv  = g_interpolator.is_moving;
+        double tscal  = g_interpolator.time_scale;
+        int    hstate = g_interpolator.hold_state;     // 0=NORMAL 1=BRAKING 2=PAUSED 3=RESUMING
+        int    pausereq = g_interpolator.pause_request;
+        int    op_ready = g_all_axis_op_ready;
+
+        printf("\r\033[K[%-5s] Q:%3d | cyc=%llu (%.2fkHz) ALM=%d | "
+               "ph=%d vt=%.1f/%.1f mv=%d ts=%.2f hs=%d pr=%d op=%d | %s",
+               status_str, q_cnt,
+               (unsigned long long)cur_cycle, cyc_khz, alarm,
+               ph, vt, T7, is_mv, tscal, hstate, pausereq, op_ready, axis_info);
+    } else {
+        // 简洁模式 (默认): Q + cycle 速率 + 报警 + 坐标
+        printf("\r\033[K[%-5s] Q:%3d | cyc=%llu (%.2fkHz) ALM=%d | %s",
+               status_str, q_cnt,
+               (unsigned long long)cur_cycle, cyc_khz, alarm, axis_info);
+    }
     fflush(stdout);
 }
 
 void wait_and_print_status() {
     usleep(100000);
+    int timeout_s = 0;
     while(SMC_IsParserRunning() || !SMC_IsMotionDone()) {
         print_status_line();
         usleep(50000);
+        if (++timeout_s > 1200) {  /* 50ms * 1200 = 60s */
+            printf("\n[警告] 等待运动完成超时 (60s), 强制返回菜单\n");
+            break;
+        }
     }
     print_status_line();
     printf("\n");

@@ -6,6 +6,7 @@
 #include "macro_eval.h"   // 宏变量与表达式引擎
 #include "program_loader.h"  // Phase 2B M1: 文件加载器 + N 标签 + GOTO
 #include <math.h>
+#include <stdatomic.h>    // atomic_store_explicit (M3 S 值保护报警)
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
 #define RTCP_LINEAR_SEGMENT_MM 0.5 // RTCP直线微段打碎步长，单位mm
@@ -20,6 +21,10 @@ GCodeState_t g_state = {
     .modal_wcs         = COORD_G54,
     .feed_mode         = FEED_MODE_G94,
 };
+
+// M1 可选停全局开关 (HMI 通过 SMC_SetOptionalStopEnable 写, parser M1 分支读)
+// @Thread-Safety: 单写者 + 单读者, int 写天然原子, 无需锁
+int g_optional_stop_enabled = 0;
 
 // ---- Phase 2B M1: PC 寄存器与跳转信号 ----
 // 仅 parser_thread_func 修改 PC; parse_gcode_line 通过 g_pc_jump_pending 信号触发跳转
@@ -931,33 +936,114 @@ int parse_gcode_line(const char *gcode_line)
                 // M0/M1/M2/M30 = parser 级拦截 (不入队, 不入 RT 等待)
                 // M3/M4/M5/M6/M7/M8/M9/M19 = 物理 M 代码, 仅更新 g_state modal,
                 //   后续 api_push_mcode 快照到 seg, RT 消费时同步 g_interpolator._rt 镜像
+                // P0-2: M0 真暂停
+                // 旧行为: 只设 is_paused=1, RT 队列里残留运动继续走完
+                // 新行为: 加 api_motion_pause() 让 RT 用 time_scale 平滑减速到 0
+                // 红线 #4: Feedhold 用 time_scale, 禁止直接置 is_moving=0 或清队列
+                // 恢复路径: HMI 发 SMC_ResumeProcessing → api_motion_resume() + is_paused=0
                 else if(m_code == 0){
+                    int src_line = g_current_program ?
+                                   g_current_program->lines[g_pc].line_no : -1;
                     g_parser_ctrl.is_paused = 1;
-                    printf("[Parser] M0 程序暂停 (源行 %d)\n",
-                           g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                    api_motion_pause();
+                    printf("[Parser] M0 程序暂停 (源行 %d, 已发 motion_pause)\n", src_line);
                     m_code = -1;  // 不入队
                 }
+                // P0-2: M1 可选停 — 受 g_optional_stop_enabled 开关控制
+                // 开关关 (默认): M1 视为 no-op (兼容现有 NC 程序)
+                // 开关开 (HMI 显式启用): M1 等价 M0, 走真暂停路径
                 else if(m_code == 1){
-                    // M1 可选停: P1' 阶段视为 no-op (默认禁用, 未来加 optional_stop_enabled 开关)
-                    printf("[Parser] M1 optional stop (当前禁用, no-op, 源行 %d)\n",
-                           g_current_program ? g_current_program->lines[g_pc].line_no : -1);
+                    int src_line = g_current_program ?
+                                   g_current_program->lines[g_pc].line_no : -1;
+                    if (g_optional_stop_enabled) {
+                        g_parser_ctrl.is_paused = 1;
+                        api_motion_pause();
+                        printf("[Parser] M1 可选停生效 (源行 %d, 已发 motion_pause)\n", src_line);
+                    } else {
+                        printf("[Parser] M1 optional stop 跳过 (开关关, 源行 %d)\n", src_line);
+                    }
                     m_code = -1;
                 }
+                // P0-1: M2/M30 安全停 5 步流程
+                // 旧行为: 直接 is_running=0, 后果 RT 队列里残留运动继续走、spindle/coolant 不关
+                // 新行为: 平滑减速 -> 等队列空 -> 模态复位 -> 抢写 RT 镜像 -> 关 parser
+                // 抢写 RT 镜像是 RT 单写者例外: 此时队列已空, RT 不会再消费任何 M 段,
+                // 写者已 quiescent, parser 安全抢写一次 (与 api_motion_resume 同级别操作)
                 else if(m_code == 2 || m_code == 30){
+                    int src_line = g_current_program ?
+                                   g_current_program->lines[g_pc].line_no : -1;
+                    printf("[Parser] M%d 程序结束 → 安全停流程启动 (源行 %d)\n",
+                           m_code, src_line);
+
+                    // Step 1 (修订): 不调 api_motion_pause
+                    //
+                    // 原设计: api_motion_pause() → time_scale 减到 0 → RT 平滑减速
+                    // 致命 bug: time_scale=0 → ms_budget=0 → RT 不消费队列
+                    //   → is_trajectory_finished() 永远 false
+                    //   → Step 2 等 Q 空永远等不到, 30s 超时强制收尾
+                    //   → CSV 轨迹严重截断, 后续段全部丢失
+                    //
+                    // 新设计: 信任 planner 的 S 曲线, 每段 v_end 已含减速到 0
+                    //   (除非连接段, 但连接段也被下一段的 S 曲线消费掉)
+                    //   RT 自然消费完所有段, is_moving=0, is_trajectory_finished=真
+                    //
+                    // 适用场景: M30/M2 是程序末尾, 所有段已 push 完
+                    //   不需要"平滑减速"(planner 已经做了)
+
+                    // Step 2: 等队列排空 + RT 自然停下 (100ms 轮询, 30s 超时)
+                    int wait_ms = 0;
+                    while (!is_trajectory_finished() && wait_ms < 30000) {
+                        if (g_parser_ctrl.abort_request) break;
+                        osal_usleep(100000);
+                        wait_ms += 100;
+                    }
+                    if (wait_ms >= 30000) {
+                        printf("[Parser][WARN] M%d 安全停超时 (队列 30s 未空), 强制收尾\n",
+                               m_code);
+                    }
+
+                    // Step 3: parser 模态复位 (spindle/coolant 全关)
+                    g_state.spindle_mode   = 0;
+                    g_state.spindle_rpm    = 0.0;
+                    g_state.coolant_state  = 0;
+
+                    // Step 4: 抢写 RT 镜像, HMI 立即可见 spindle/coolant 已停
+                    g_interpolator.spindle_mode_rt  = 0;
+                    g_interpolator.spindle_rpm_rt   = 0.0;
+                    g_interpolator.coolant_state_rt = 0;
+
+                    // Step 5: 关 parser 主循环
                     g_parser_ctrl.is_running = 0;
-                    printf("[Parser] M%d 程序结束 (源行 %d)\n",
-                           m_code, g_current_program ? g_current_program->lines[g_pc].line_no : -1);
-                    m_code = -1;
+                    printf("[Parser] M%d 安全停完成 (耗时 %.1fs)\n",
+                           m_code, wait_ms / 1000.0);
+                    m_code = -1;   // 不入队
                 }
-                else if(m_code == 3){ g_state.spindle_mode = 1; }   // CW
-                else if(m_code == 4){ g_state.spindle_mode = 2; }   // CCW
+                // P0-3: M3/M4 S 值保护 — 拒绝 spindle_rpm<=0 的主轴启动
+                // 后果场景: 操作员忘写 S, M3 入队后 RT 等 2 秒主轴"启动"(实际没转),
+                //           后续 G1 加工撞刀。修复: 拒绝入队 + 报警 + 不翻模态
+                // 行为: 不返回 -1 中止文件, 让操作员改 S 值后 cycle start 继续
+                //       (alarm_state=1 会让后续 api_push_trajectory 也被拒, 自然 stall)
+                else if(m_code == 3 || m_code == 4){
+                    if (g_state.spindle_rpm <= 0.0) {
+                        int src_line = g_current_program ?
+                                       g_current_program->lines[g_pc].line_no : -1;
+                        printf("[Parser][ALARM] M%d 拒绝入队: spindle_rpm=%.2f <= 0 "
+                               "(源行 %d, 请先 S<rpm>)\n",
+                               m_code, g_state.spindle_rpm, src_line);
+                        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                        // 不更新 spindle_mode, 不入队
+                        m_code = -1;
+                    } else {
+                        g_state.spindle_mode = (m_code == 3) ? 1 : 2;   // CW / CCW
+                    }
+                }
                 else if(m_code == 5){
                     g_state.spindle_mode = 0;
                     g_state.spindle_rpm  = 0.0;
                 }
-                else if(m_code == 7){ g_state.coolant_state = 2; }  // mist
-                else if(m_code == 8){ g_state.coolant_state = 1; }  // flood
-                else if(m_code == 9){ g_state.coolant_state = 0; }
+                else if(m_code == 7){ g_state.coolant_state |= 0x2; }  // 置 mist 位 (bit1)
+                else if(m_code == 8){ g_state.coolant_state |= 0x1; }  // 置 flood 位 (bit0)
+                else if(m_code == 9){ g_state.coolant_state  = 0x0; }  // M9 全清
                 else if(m_code == 6){
                     // M6 换刀: T 字母已通过 case 'T' 写入 g_state.current_tool_id
                     // 实际 ATC 物理动作留硬件阶段; sim 中仅入队触发 RT 等待 + 状态同步
@@ -1370,7 +1456,62 @@ int parse_gcode_line(const char *gcode_line)
                 case 19: off_1st=offset_j; off_2nd=offset_k; break;
                 default: off_1st=offset_i; off_2nd=offset_j; break;
             }
-            if(generate_arc_trajectory(machine_start_pos,
+
+            // ---- 阶段 3: 刀补激活时 G02/G03 走 CutterComp_PushArc ----
+            // 圆弧偏置由 cutter_comp.c 内部完成 (offset_arc + 离散化)
+            // 与 G01 直线一样, 引擎内部计算偏置后通过回调下发
+            // 注: 圆心 (ax1, ax2) 由 I/J (G17) / K/I (G18) / J/K (G19) 解析得到
+            if(CutterComp_GetMode() != COMP_OFF){
+                int ax1_idx, ax2_idx;
+                double center[2];
+                // 复用 cutter_comp.c 的 get_plane_axes 逻辑 (此处直接重算避免 extern)
+                switch(g_state.active_plane){
+                    case 18: ax1_idx = g_axis_map['Z'-'A']; ax2_idx = g_axis_map['X'-'A']; break;
+                    case 19: ax1_idx = g_axis_map['Y'-'A']; ax2_idx = g_axis_map['Z'-'A']; break;
+                    default: ax1_idx = g_axis_map['X'-'A']; ax2_idx = g_axis_map['Y'-'A']; break;
+                }
+                center[0] = machine_start_pos[ax1_idx] + off_1st;
+                center[1] = machine_start_pos[ax2_idx] + off_2nd;
+                double radius = hypot(off_1st, off_2nd);
+                if(radius < 1e-6){
+                    printf("[Parser] G02/G03 圆弧半径为 0 (I/J/K 未指定?), 中止\n");
+                    return -1;
+                }
+                // sweep: 从 start 到 end 的扫角 (atan2 跨象限)
+                double start_ang = atan2(machine_start_pos[ax2_idx] - center[1],
+                                          machine_start_pos[ax1_idx] - center[0]);
+                double end_ang   = atan2(machine_target_pos[ax2_idx] - center[1],
+                                          machine_target_pos[ax1_idx] - center[0]);
+                double sweep = end_ang - start_ang;
+                // G02 (CW): sweep 归一化到 [-2π, 0]; G03 (CCW): 归一化到 [0, 2π]
+                int is_CW = (g_state.motion_mode == 2);
+                if(is_CW){
+                    while(sweep > 0)  sweep -= 2.0 * 3.14159265358979323846;
+                    while(sweep < -2.0 * 3.14159265358979323846) sweep += 2.0 * 3.14159265358979323846;
+                } else {
+                    while(sweep < 0)  sweep += 2.0 * 3.14159265358979323846;
+                    while(sweep >  2.0 * 3.14159265358979323846) sweep -= 2.0 * 3.14159265358979323846;
+                }
+
+                CompSegment_t arc_seg;
+                memset(&arc_seg, 0, sizeof(arc_seg));
+                arc_seg.type = COMP_SEG_ARC;
+                memcpy(arc_seg.start_pos, machine_start_pos, sizeof(double) * AXIS_NUM);
+                memcpy(arc_seg.end_pos,   machine_target_pos, sizeof(double) * AXIS_NUM);
+                arc_seg.center[0] = center[0];
+                arc_seg.center[1] = center[1];
+                arc_seg.radius = radius;
+                arc_seg.sweep = sweep;
+                arc_seg.is_CW = is_CW;
+                arc_seg.speed = run_speed_mm / 60.0;
+                arc_seg.acc = DEFAULT_ACC;
+                arc_seg.dec = DEFAULT_DEC;
+
+                if(CutterComp_PushArc(&arc_seg) < 0){
+                    printf("[Parser] 刀补圆弧入队失败(报警)，中止当前文件！\n");
+                    return -1;
+                }
+            } else if(generate_arc_trajectory(machine_start_pos,
                                     machine_target_pos,
                                     off_1st, off_2nd,
                                     g_state.motion_mode==2, run_speed_mm, g93_T_sec) < 0){
@@ -1390,10 +1531,11 @@ int parse_gcode_line(const char *gcode_line)
         } else {
             double speed_mm_sec=run_speed_mm/60.0;
 
-            // ---- 刀具半径补偿路由 ----
+            // ---- 刀具半径补偿路由 (直线段) ----
             // 补偿激活时，G01/G00 直线段通过 CutterComp_PushPoint 走偏置引擎，
             // 引擎内部计算偏置后通过回调下发到 B-Spline 或 Planner。
-            // G02/G03 圆弧和 RTCP 直通，不经过刀补引擎。
+            // 阶段 3: G02/G03 圆弧在上方 motion_mode==2||3 分支内独立走 CutterComp_PushArc;
+            //         RTCP 路径仍直通 (旋转轴参与偏置复杂度超出 2D 范围)
             if(CutterComp_GetMode() != COMP_OFF && g_state.motion_mode <= 1){
                 // 刀补模式: 通过补偿引擎入队 (引擎内部已设置输出回调)
                 if(CutterComp_PushPoint(machine_target_pos, speed_mm_sec,
