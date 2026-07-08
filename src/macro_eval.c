@@ -1,10 +1,12 @@
 #include "macro_eval.h"
 #include "global_def.h"   // g_coord_mgr, g_axis_map, g_sys_alarm_state, AXIS_NUM
+#include "axis_ctrl.h"    // api_flush_planner / is_trajectory_finished
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
 #include <math.h>
+#include <unistd.h>       // usleep
 
 #define PI 3.14159265358979323846
 
@@ -36,6 +38,30 @@ static char sysvar_letter(int offset)
     return letters[offset];
 }
 
+// ---- Parser/RT 时序同步屏障 ----
+// 问题: parser 线程跑得远比 RT 线程快 (队列深度 1024)。读到 #5021-#5025 (机床坐标)
+// 或 #5031-#5035 (逻辑坐标) 等反映"物理当前状态"的系统变量时, 直接读
+// g_coord_mgr.current_g53_pos[] 拿到的是"现在"的位置, 而不是"该 G 代码行
+// 在 RT 执行到那一刻"的位置。后果示例:
+//   G01 X100 F1000
+//   #1 = #5021     (期望 100, 实际可能接近 0)
+//   G01 X[#1 + 50] (期望走到 150, 实际走到 ~50, 撞机/走错)
+//
+// 修复: 读物理状态宏变量前, 把 parser 已下发的运动全部 flush 到 RT,
+// 阻塞等插补器静止, 再读位置 — 把"未来状态"读法变成"现在状态"读法。
+// 代价: 队列断流一次, 后续 parser 重新填充。仅 #5021-#5025/#5031-#5035 触发,
+// 不影响普通 G 代码的流水线性能。
+//
+// @Context: Non-RealTime Background Thread (parser 求值路径调用)
+// @Side-Effect: 触发 planner flush + 阻塞等待, 不能在 RT 线程调用
+static void sync_to_physical_state(void)
+{
+    api_flush_planner();
+    while (!is_trajectory_finished()) {
+        usleep(1000);   // 1ms 轮询, 不阻塞 RT
+    }
+}
+
 double Macro_GetValue(int index)
 {
     // ---- 局部/公共变量: 直接索引 ----
@@ -45,6 +71,7 @@ double Macro_GetValue(int index)
 
     // ---- 系统变量: 机床坐标 (G53) ----
     if(index >= SYSVAR_MACHINE_POS_BASE && index < SYSVAR_MACHINE_POS_BASE + AXIS_NUM){
+        sync_to_physical_state();   // 等队列空, 再读物理位置
         int phys = g_axis_map[sysvar_letter(index - SYSVAR_MACHINE_POS_BASE) - 'A'];
         if(phys < 0) return 0.0;
         return g_coord_mgr.current_g53_pos[phys];
@@ -52,6 +79,7 @@ double Macro_GetValue(int index)
 
     // ---- 系统变量: 逻辑坐标 (当前 WCS) ----
     if(index >= SYSVAR_LOGICAL_POS_BASE && index < SYSVAR_LOGICAL_POS_BASE + AXIS_NUM){
+        sync_to_physical_state();   // 等队列空, 再读逻辑位置
         int phys = g_axis_map[sysvar_letter(index - SYSVAR_LOGICAL_POS_BASE) - 'A'];
         if(phys < 0) return 0.0;
         return g_coord_mgr.current_logical_pos[phys];
