@@ -44,6 +44,19 @@ typedef struct {
     double   spindle_rpm;                 // rpm
     int      coolant_state;               // bit0=flood(M8), bit1=mist(M7); 0/1/2/3
     int      tool_id;                     // 当前刀号 (M6 切换后)
+    // ---- P0-Laser: 激光器状态 CSV 追踪 (从 g_laser_rt 读) ----
+    // 用于验证 M62/M63 与运动段边界 1ms 对齐, 以及 alarm 触发时 emergency_kill 锁存路径
+    int      laser_enable;                // 0/1 (M3/M5 联动)
+    int      laser_shutter;               // 0/1 (M62/M63 同步)
+    double   laser_power_w;               // M67 设置 (W) - 耦合 update 后的实际输出
+    double   laser_freq_hz;               // M68 设置 (Hz)
+    int      gas_select;                  // 0=off, 1=N2, 2=O2, 3=Air
+    int      laser_emergency_kill;        // 急停锁存 (1=激光已关, 需复位)
+    uint16_t laser_interlock;             // 互锁位图 (bit0=door...bit15=system_alarm)
+    // ---- Phase B1: 功率-速度耦合 CSV 追踪 ----
+    // laser_v_actual_mm_s: 当前周期瞬时速度 (mm/s), 验证 P-v 耦合曲线
+    //                       对比 v_target 列可看 S 曲线 phase + 耦合比
+    double   laser_v_actual_mm_s;         // RT 写, g_laser_rt.v_actual_mm_s
 } sim_trace_record_t;
 
 // 二进制文件头 (固定 512 bytes, record_count 在关闭时回填)
@@ -95,6 +108,13 @@ typedef struct {
 
 extern sim_logger_t g_sim_logger;
 
+// P0-Laser: 强制下次 cycle 记录一条 sim_engine 采样
+// 用途: M30 安全停 Step 4 抢写 g_laser_rt 后, RT 已静止 (is_moving=0 ∧ just_loaded_seg=0),
+//       should_log_this_cycle=0 → sim_engine_push 不调 → CSV 末尾保留旧值.
+//       parser 抢写后 set 此标志, RT 下个 cycle 强制记录一次新状态, 然后自动清 0.
+// 线程安全: 单写者 (parser M30 路径), 单读者 (RT 线程 sim_engine_push 路径), atomic int.
+extern _Atomic int g_sim_force_log;
+
 // ================== API ==================
 
 // @Context: Non-RealTime Background Thread (初始化阶段)
@@ -109,6 +129,9 @@ int  sim_engine_start(void);
 // 刷新残余数据, 等待落盘线程退出, 回填文件头, 关闭文件
 void sim_engine_finish(void);
 
+// 落盘线程入口 (由 sim_engine_start 创建)
+void *sim_flush_thread_func(void *arg);
+
 // @Context: 1ms Hard-RT Thread (ecat_thread_rt 内调用)
 // @Danger: 无锁, 无阻塞, 无 printf, 无 malloc。
 // RT 线程每周期调用: 写入插补器坐标到活跃缓冲;
@@ -120,10 +143,13 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      const double active_offset[3],
                                      double work_offsets_g54_x,
                                      int spindle_mode, double spindle_rpm,
-                                     int coolant_state, int tool_id);
-
-// 落盘线程入口
-void *sim_flush_thread_func(void *arg);
+                                     int coolant_state, int tool_id,
+                                     int laser_enable, int laser_shutter,
+                                     double laser_power_w, double laser_freq_hz,
+                                     int gas_select,
+                                     int laser_emergency_kill,
+                                     uint16_t laser_interlock,
+                                     double laser_v_actual_mm_s);
 
 // ================== inline 实现 ==================
 
@@ -138,7 +164,13 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      const double active_offset[3],
                                      double work_offsets_g54_x,
                                      int spindle_mode, double spindle_rpm,
-                                     int coolant_state, int tool_id)
+                                     int coolant_state, int tool_id,
+                                     int laser_enable, int laser_shutter,
+                                     double laser_power_w, double laser_freq_hz,
+                                     int gas_select,
+                                     int laser_emergency_kill,
+                                     uint16_t laser_interlock,
+                                     double laser_v_actual_mm_s)
 {
     sim_logger_t *L = &g_sim_logger;
     int idx = atomic_load_explicit(&L->active_idx, memory_order_relaxed);
@@ -172,6 +204,15 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
     r->spindle_rpm    = spindle_rpm;
     r->coolant_state  = coolant_state;
     r->tool_id        = tool_id;
+    // P0-Laser: 激光状态镜像 (sim CSV 用于验证段边界 1ms 对齐 + 急停锁存)
+    r->laser_enable         = laser_enable;
+    r->laser_shutter        = laser_shutter;
+    r->laser_power_w        = laser_power_w;
+    r->laser_freq_hz        = laser_freq_hz;
+    r->gas_select           = gas_select;
+    r->laser_emergency_kill = laser_emergency_kill;
+    r->laser_interlock      = laser_interlock;
+    r->laser_v_actual_mm_s  = laser_v_actual_mm_s;
 
     atomic_store_explicit(&L->counts[idx], count + 1, memory_order_release);
     atomic_fetch_add_explicit(&L->total_records, 1, memory_order_relaxed);

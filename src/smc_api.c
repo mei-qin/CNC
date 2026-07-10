@@ -494,6 +494,116 @@ int SMC_ConfigSimDynamics(char axis_letter, double alpha)
     return sim_drive_config_alpha(idx, alpha);
 }
 
+// ================== 激光切割子系统 API (Phase A) ==================
+// @Thread-Safety: 主线程 init 阶段单写者; 必须在 SMC_InitAndStart 之前调
+// RT 线程只读 g_laser_cfg, 所以 init 后再修改无效 (但不报错)
+// sim 模式与硬件模式都允许配置 — sim 下 RT 路径会安全跳过 PDO 输出
+
+int SMC_ConfigLaserIO(int do_slave_id, int ao_slave_id, int di_slave_id)
+{
+    if (do_slave_id < -1 || ao_slave_id < -1 || di_slave_id < -1) return -1;
+    g_laser_cfg.do_slave_id = do_slave_id;
+    g_laser_cfg.ao_slave_id = ao_slave_id;
+    g_laser_cfg.di_slave_id = di_slave_id;
+    return 0;
+}
+
+static uint8_t laser_validate_bit(uint8_t b)
+{
+    return (b > 15) ? 0 : b;  // 越界钳到 0
+}
+
+int SMC_ConfigLaserDOBits(uint8_t b_enable, uint8_t b_shutter,
+                          uint8_t b_gas_n2, uint8_t b_gas_o2, uint8_t b_gas_air,
+                          uint8_t b_alarm_lamp)
+{
+    g_laser_cfg.bit_laser_enable = laser_validate_bit(b_enable);
+    g_laser_cfg.bit_laser_shutter= laser_validate_bit(b_shutter);
+    g_laser_cfg.bit_gas_n2       = laser_validate_bit(b_gas_n2);
+    g_laser_cfg.bit_gas_o2       = laser_validate_bit(b_gas_o2);
+    g_laser_cfg.bit_gas_air      = laser_validate_bit(b_gas_air);
+    g_laser_cfg.bit_alarm_lamp   = laser_validate_bit(b_alarm_lamp);
+    return 0;
+}
+
+int SMC_ConfigLaserDIBits(uint8_t b_door, uint8_t b_estop, uint8_t b_laser_alm,
+                          uint8_t b_water_t, uint8_t b_water_f, uint8_t b_gas_p)
+{
+    g_laser_cfg.bit_di_door       = laser_validate_bit(b_door);
+    g_laser_cfg.bit_di_estop_soft = laser_validate_bit(b_estop);
+    g_laser_cfg.bit_di_laser_alm  = laser_validate_bit(b_laser_alm);
+    g_laser_cfg.bit_di_water_temp = laser_validate_bit(b_water_t);
+    g_laser_cfg.bit_di_water_flow = laser_validate_bit(b_water_f);
+    g_laser_cfg.bit_di_gas_press  = laser_validate_bit(b_gas_p);
+    return 0;
+}
+
+int SMC_ConfigLaserAOChannels(uint8_t ch_power, uint8_t ch_freq)
+{
+    g_laser_cfg.ch_ao_power = ch_power;
+    g_laser_cfg.ch_ao_freq  = ch_freq;
+    return 0;
+}
+
+int SMC_ConfigLaserRange(double power_max_w, double freq_max_hz, double power_min_w)
+{
+    if (power_max_w <= 0.0 || freq_max_hz <= 0.0 || power_min_w < 0.0) {
+        printf("[SMC_API] ConfigLaserRange 量程越界 (power_max=%.1f freq_max=%.1f min=%.1f)\n",
+               power_max_w, freq_max_hz, power_min_w);
+        return -1;
+    }
+    g_laser_cfg.power_max_w = power_max_w;
+    g_laser_cfg.freq_max_hz = freq_max_hz;
+    g_laser_cfg.power_min_w = power_min_w;
+    return 0;
+}
+
+// Phase B1: 功率-速度耦合配置
+// @Thread-Safety: 主线程 init 阶段单写者; RT 线程只读 g_laser_cfg.coupling_mode/v_thresh
+int SMC_ConfigLaserCoupling(int mode, double v_thresh_mm_s)
+{
+    if (mode != 0 && mode != 1) {
+        printf("[SMC_API] ConfigLaserCoupling mode=%d 越界 (0 或 1)\n", mode);
+        return -1;
+    }
+    if (v_thresh_mm_s < 0.0) {
+        printf("[SMC_API] ConfigLaserCoupling v_thresh=%.2f 不能为负\n", v_thresh_mm_s);
+        return -1;
+    }
+    atomic_store_explicit(&g_laser_cfg.coupling_mode, mode, memory_order_release);
+    atomic_store_explicit(&g_laser_cfg.v_thresh_mm_s, v_thresh_mm_s, memory_order_release);
+    return 0;
+}
+
+// Phase B1: 配置功率-速度耦合表
+// 约束: count ∈ [1, LASER_COUPLE_TABLE_MAX], v_mm_s 单调不减, ratio ∈ [0,1]
+int SMC_ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count)
+{
+    if (points == NULL || count < 1 || count > LASER_COUPLE_TABLE_MAX) {
+        printf("[SMC_API] ConfigLaserCoupleTable 参数越界 (count=%d, max=%d)\n",
+               count, LASER_COUPLE_TABLE_MAX);
+        return -1;
+    }
+    // 校验单调不减 + ratio 范围
+    for (int i = 0; i < count; i++) {
+        if (points[i].ratio < 0.0 || points[i].ratio > 1.0) {
+            printf("[SMC_API] ConfigLaserCoupleTable 点 %d ratio=%.3f 越界 [0,1]\n",
+                   i, points[i].ratio);
+            return -1;
+        }
+        if (i > 0 && points[i].v_mm_s < points[i-1].v_mm_s - 1e-6) {
+            printf("[SMC_API] ConfigLaserCoupleTable v_mm_s 必须单调不减 (点 %d %.2f < 点 %d %.2f)\n",
+                   i, points[i].v_mm_s, i-1, points[i-1].v_mm_s);
+            return -1;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        g_laser_cfg.couple_table[i] = points[i];
+    }
+    g_laser_cfg.couple_table_len = count;
+    return 0;
+}
+
 // ================== 辅助状态查询 API ==================
 // 数据源: g_interpolator.*_rt 镜像字段 (RT 单写者, 此处单读者)
 // 反映"RT 实际执行到的"模态, 而非 parser 解析到的"将来"模态
@@ -520,6 +630,23 @@ int SMC_GetCurrentTool(int *tool_id)
 {
     if (!g_all_axis_op_ready) return -1;
     if (tool_id) *tool_id = g_interpolator.current_tool_id_rt;
+    return 0;
+}
+
+// 激光器实际状态查询 (镜像 RT 单写者字段 g_laser_rt)
+// @Thread-Safety: g_laser_rt 由 RT 线程单写者推进, 此处 acquire 读
+//   int/double 字段对齐天然原子, 但 emergency_kill 与 enable 可能瞬间撕裂
+//   HMI 容忍 1ms 级滞后
+int SMC_GetLaserState(int *enable, int *shutter, double *power_w,
+                      double *freq_hz, int *gas_select, uint16_t *interlock)
+{
+    if (g_laser_cfg.do_slave_id < 0) return -1;  // 未配置激光
+    if (enable)     *enable     = g_laser_rt.enable;
+    if (shutter)    *shutter    = g_laser_rt.shutter;
+    if (power_w)    *power_w    = g_laser_rt.power_w;
+    if (freq_hz)    *freq_hz    = g_laser_rt.freq_hz;
+    if (gas_select) *gas_select = g_laser_rt.gas_select;
+    if (interlock)  *interlock  = g_laser_rt.interlock_status;
     return 0;
 }
 

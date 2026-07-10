@@ -7,6 +7,7 @@
 
 // ================== 全局实例 ==================
 sim_logger_t g_sim_logger;
+_Atomic int  g_sim_force_log = 0;  // P0-Laser: parser M30 抢写 g_laser_rt 后置 1, RT 下个 cycle 强制记录一次
 
 // ================== 初始化 ==================
 // @Context: Non-RealTime Background Thread (初始化阶段)
@@ -87,6 +88,12 @@ int sim_engine_init(const char *output_path, int use_binary)
         fprintf(g_sim_logger.fp, ",off_g54_X");
         // ---- P1': 辅助状态机 CSV 列 ----
         fprintf(g_sim_logger.fp, ",spindle_mode,spindle_rpm,coolant,tool_id");
+        // ---- P0-Laser: 激光器状态 CSV 列 ----
+        fprintf(g_sim_logger.fp,
+                ",laser_enable,laser_shutter,laser_power_w,laser_freq_hz,"
+                "gas_select,laser_emergency_kill,laser_interlock");
+        // Phase B1: 功率-速度耦合速度列
+        fprintf(g_sim_logger.fp, ",laser_v_actual_mm_s");
         fprintf(g_sim_logger.fp, "\n");
         fflush(g_sim_logger.fp);
     }
@@ -173,6 +180,14 @@ void *sim_flush_thread_func(void *arg)
                     fprintf(L->fp, ",%d,%.3f,%d,%d",
                             r->spindle_mode, r->spindle_rpm,
                             r->coolant_state, r->tool_id);
+                    // ---- P0-Laser: 激光状态 7 列 ----
+                    fprintf(L->fp, ",%d,%d,%.3f,%.3f,%d,%d,%u",
+                            r->laser_enable, r->laser_shutter,
+                            r->laser_power_w, r->laser_freq_hz,
+                            r->gas_select, r->laser_emergency_kill,
+                            (unsigned)r->laser_interlock);
+                    // Phase B1: 速度列 (1 列)
+                    fprintf(L->fp, ",%.3f", r->laser_v_actual_mm_s);
                     fprintf(L->fp, "\n");
                 }
                 L->file_record_count += cnt;

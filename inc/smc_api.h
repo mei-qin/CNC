@@ -2,6 +2,7 @@
 #define SMC_API_H
 
 #include <stdint.h>
+#include "laser_ctrl.h"   // LaserCouplePoint_t (SMC_ConfigLaserCoupleTable 参数)
 
 #ifdef __cplusplus
 extern "C" {
@@ -149,6 +150,62 @@ int SMC_InjectAxisFault(char axis_letter, int slave_subidx);
 // alpha: (0, 1) 范围, 默认 0.2; 越小跟随误差越大 (alpha=0.05 时易触发硬停)
 // 返回: 0=成功, -1=参数越界/轴未配置, -2=非 sim 模式
 int SMC_ConfigSimDynamics(char axis_letter, double alpha);
+
+
+// =======================================================
+// 激光切割子系统 API (Phase A 安全地基)
+// =======================================================
+// 配置时序: 必须在 SMC_InitAndStart 之前调, 否则 RT 线程已启动后修改无效
+// 默认状态 (laser_ctrl_init): 所有 slave_id = -1, 即"未配置激光"
+// RT 线程在 slave_id < 0 时安全跳过 PDO 输出, 不影响主轴/伺服逻辑
+
+// 1.配置激光 I/O 拓扑 (3 个 EtherCAT 从站, 任一可传 -1 表示未配置)
+// do_slave_id: 数字输出从站 (16-bit: enable/shutter/gas×3/alarm_lamp)
+// ao_slave_id: 模拟输出从站 (2-ch 16-bit: 功率/频率)
+// di_slave_id: 安全互锁输入从站 (16-bit: door/estop/laser_alm/water×2/gas_press)
+// 返回: 0=成功, -1=参数越界
+int SMC_ConfigLaserIO(int do_slave_id, int ao_slave_id, int di_slave_id);
+
+// 2.配置 DO bit 偏移 (0-15)
+int SMC_ConfigLaserDOBits(uint8_t b_enable, uint8_t b_shutter,
+                          uint8_t b_gas_n2, uint8_t b_gas_o2, uint8_t b_gas_air,
+                          uint8_t b_alarm_lamp);
+
+// 3.配置 DI bit 偏移 (0-15)
+int SMC_ConfigLaserDIBits(uint8_t b_door, uint8_t b_estop, uint8_t b_laser_alm,
+                          uint8_t b_water_t, uint8_t b_water_f, uint8_t b_gas_p);
+
+// 4.配置 AO 通道偏移
+int SMC_ConfigLaserAOChannels(uint8_t ch_power, uint8_t ch_freq);
+
+// 5.配置激光器物理量程
+// power_max_w: 满量程功率 (W), 默认 3000
+// freq_max_hz: 满量程频率 (Hz), 默认 5000
+// power_min_w: 起辉功率下限 (W), 默认 50 (Phase A 暂未在 RT 强制)
+int SMC_ConfigLaserRange(double power_max_w, double freq_max_hz, double power_min_w);
+
+// 6.配置功率-速度耦合 (Phase B1)
+// mode: 0=off (默认, 直接输出 P_base), 1=查表耦合
+// v_thresh_mm_s: 低速阈值, v_current 低于此值时强制 P=0 (默认 5.0)
+int SMC_ConfigLaserCoupling(int mode, double v_thresh_mm_s);
+
+// 7.配置功率-速度耦合表 (Phase B1)
+// points: 采样点数组 (按 v_mm_s 单调不减排序)
+// count:  采样点数 (1..16)
+// 默认表 (laser_ctrl_init): 线性 v=0→0, v=50 mm/s→1.0
+// 用户自定义示例 (起弧/切割/饱和 三段):
+//   LaserCouplePoint_t t[3] = {{0,0}, {5,0.3}, {20,1.0}};
+//   SMC_ConfigLaserCoupleTable(t, 3);
+int SMC_ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count);
+
+// 6.查询激光器实际状态 (HMI 用, 镜像 RT 单写者字段)
+// *enable / *shutter: 0/1
+// *power_w / *freq_hz: 当前 W / Hz
+// *gas_select: 0=off, 1=N2, 2=O2, 3=Air
+// *interlock: 互锁位图 (bit0=door ... bit15=system_alarm); 0=正常
+// 返回: 0=成功, -1=激光未配置
+int SMC_GetLaserState(int *enable, int *shutter, double *power_w,
+                      double *freq_hz, int *gas_select, uint16_t *interlock);
 
 
 #ifdef __cplusplus

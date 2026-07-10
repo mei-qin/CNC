@@ -456,12 +456,15 @@ int parse_gcode_line(const char *gcode_line)
     double s_value=0.0;
     double t_value=0.0;  // P1': T 代码 (刀号)
     double p_value=0.0, q_value=0.0, r_value=0.0; // M代码扩展参数
+    double e_value=0.0;  // P0-Laser: E 代码 (M67 激光功率 / M68 频率)
     int l_value=1;       // Phase 2B M5: M98 L<重复次数>, 默认 1
     int is_non_motion_g=0; // 非运动组拦截锁：G04/G10/G28/G92 等
     int has_f=0;           // F 值存在标志（G93 非模态校验）
     int has_r=0;           // R 值存在标志（G91 固定循环 R/Z 顺序处理）
     int is_G53_this_block=0;  // G53 非模态机械坐标：仅影响本行
     int is_g52_block=0;       // P2': G52 局部坐标系设定块, 字母循环后捕获
+    int is_g04_block=0;       // Phase B2: G04 dwell 块, 字母循环后捕获并 push M64 段
+    double g04_dwell_ms=0.0;  // Phase B2: G04 P<ms> 捕获值
     int is_g65_block=0;       // P4': G65 用户宏调用, 字母循环后处理
     int is_g66_block=0;       // P4' Phase 2: G66 模态宏调用激活
     int is_g541_block=0;      // P5': G54.1 Pn 扩展 WCS, 字母循环后处理
@@ -786,7 +789,7 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==1.0) g_state.motion_mode=1; // G01 直线
                 else if(value==2.0) g_state.motion_mode=2; // G02 顺弧
                 else if(value==3.0) g_state.motion_mode=3; // G03 逆弧
-                else if(value==4.0)  is_non_motion_g=1;    // G04 暂停
+                else if(value==4.0) { is_non_motion_g=1; is_g04_block=1; }    // G04 暂停
                 else if(value==10.0) is_non_motion_g=1;    // G10 数据设定
                 else if(value==17.0) g_state.active_plane=17;
                 else if(value==18.0) g_state.active_plane=18;
@@ -1002,15 +1005,51 @@ int parse_gcode_line(const char *gcode_line)
                                m_code);
                     }
 
-                    // Step 3: parser 模态复位 (spindle/coolant 全关)
+                    // Step 3: parser 模态复位 (spindle/coolant 全关 + 修复 P1 跨程序泄漏)
+                    // 历史 BUG: M30 仅清 spindle/coolant, 导致 modal_macro_active /
+                    //   active_cycle / bspline_enabled 等模态字段泄漏到下个程序.
+                    //   Phase A 顺便修复, 严格遵循 Fanuc M30=程序复位语义.
                     g_state.spindle_mode   = 0;
                     g_state.spindle_rpm    = 0.0;
                     g_state.coolant_state  = 0;
+                    g_state.modal_macro_active = 0;          // G66 模态宏泄漏
+                    g_state.modal_macro_O_num = 0;
+                    g_state.active_cycle       = 0;          // G81/G82/G83 固定循环泄漏
+                    g_state.cycle_retract_mode = 0;          // G98/G99
+                    g_state.bspline_enabled    = 0;          // M50 P1
+                    g_state.rtcp_enabled       = 0;          // G43.4
+                    g_state.pending_comp_mode  = COMP_OFF;   // G41/G42
+                    g_state.local_offset_active= 0;          // G52
+                    g_state.modal_ext_wcs_p    = 0;          // G54.1 Pn
+                    // P0-Laser: M30 强制关激光 (与 spindle 一同复位)
+                    g_state.laser_shutter_pending = 0;
+                    g_state.laser_power_pending   = 0.0;
+                    g_state.laser_freq_pending    = 0.0;
+                    g_state.gas_select            = 0;
 
-                    // Step 4: 抢写 RT 镜像, HMI 立即可见 spindle/coolant 已停
+                    // Step 4: 抢写 RT 镜像, HMI 立即可见 spindle/coolant/laser 已停
                     g_interpolator.spindle_mode_rt  = 0;
                     g_interpolator.spindle_rpm_rt   = 0.0;
                     g_interpolator.coolant_state_rt = 0;
+                    // P0-Laser RT 镜像抢停 (RT 段消费链路自然刷新, 此处只做"立即生效")
+                    g_interpolator.laser_enable_rt  = 0;
+                    g_interpolator.laser_shutter_rt = 0;
+                    g_interpolator.laser_power_w_rt = 0.0;
+                    g_interpolator.laser_freq_hz_rt = 0.0;
+                    g_interpolator.gas_select_rt    = 0;
+                    // P0-Laser: 同步抢写 g_laser_rt (sim_engine_push 直接读 g_laser_rt,
+                    // 不读 g_interpolator.laser_*_rt — 仅抢写后者会导致 CSV 末尾保留旧值).
+                    // 安全性: M30 Step 2 已等队列空, RT 不会再消费任何段调 apply_aux,
+                    // 此时 g_laser_rt 写者已 quiescent, parser 抢写无竞争 (与抢写
+                    // g_interpolator 同级别操作).
+                    g_laser_rt.enable     = 0;
+                    g_laser_rt.shutter    = 0;
+                    g_laser_rt.power_w    = 0.0;
+                    g_laser_rt.freq_hz    = 0.0;
+                    g_laser_rt.gas_select = 0;
+                    // P0-Laser: 触发 RT 下个 cycle 强制记录一条 sim_engine 采样,
+                    // 让 CSV 末尾出现归零状态 (否则 should_log=0 → sim_engine_push 不调).
+                    atomic_store_explicit(&g_sim_force_log, 1, memory_order_release);
 
                     // Step 5: 关 parser 主循环
                     g_parser_ctrl.is_running = 0;
@@ -1035,11 +1074,24 @@ int parse_gcode_line(const char *gcode_line)
                         m_code = -1;
                     } else {
                         g_state.spindle_mode = (m_code == 3) ? 1 : 2;   // CW / CCW
+                        // P0-Laser: 激光模式 (do_slave_id >= 0) 下 M3 联动激光闸 ON
+                        // 复用 spindle_mode 作为激光使能镜像 (aux_laser_enable 派生自此)
+                        if (g_laser_cfg.do_slave_id >= 0) {
+                            g_state.laser_shutter_pending = 1;
+                            // M67 未显式设置功率时, 用 S 值做默认功率 (激光器常见写法)
+                            if (g_state.laser_power_pending <= 0.0) {
+                                g_state.laser_power_pending = g_state.spindle_rpm;
+                            }
+                        }
                     }
                 }
                 else if(m_code == 5){
                     g_state.spindle_mode = 0;
                     g_state.spindle_rpm  = 0.0;
+                    // P0-Laser: M5 联动关激光闸 (主轴/激光模式都关, 安全兜底)
+                    if (g_laser_cfg.do_slave_id >= 0) {
+                        g_state.laser_shutter_pending = 0;
+                    }
                 }
                 else if(m_code == 7){ g_state.coolant_state |= 0x2; }  // 置 mist 位 (bit1)
                 else if(m_code == 8){ g_state.coolant_state |= 0x1; }  // 置 flood 位 (bit0)
@@ -1055,6 +1107,45 @@ int parse_gcode_line(const char *gcode_line)
                     // M19 主轴定向: sim 中视为 M5 等价 (无实际角度控制硬件)
                     g_state.spindle_mode = 0;
                 }
+                // ============ P0-Laser: 激光器同步 M 代码 ============
+                // M62 P0:  激光闸同步 ON  (与下一段运动段边界 1ms 对齐)
+                // M63 P0:  激光闸同步 OFF
+                // M67 E<W>: 同步激光功率模拟量 (0..g_laser_cfg.power_max_w)
+                //           — 注: E 值检查在 case 'E' 内处理 (字母循环顺序)
+                // M68 E<Hz>: 同步激光频率模拟量 — 同上, case 'E' 内处理
+                // M10/M11/M12: 切换 N2/O2/Air 气体阀 (互斥)
+                // 设计: 这些 M 代码在激光模式 (do_slave_id >= 0) 下生效, 否则静默忽略
+                //       (CAM 常输出 M62/M63 作通用同步输出, 无硬件时安全 no-op)
+                // 入队: 默认走 M 段路径 (CMD_TYPE_MCODE), RT 消费时 freeze 插补,
+                //       保证 M62/M63 与后续运动段边界严格对齐.
+                //
+                // ============ Phase B1: 功率-速度耦合 M 代码 ============
+                // M70 P<0/1>: 切换耦合模式 (0=off, 1=查表耦合)
+                // M71 P<v_thresh>: 设置低速阈值 (mm/s)
+                // 注: P 值处理在字母循环之后 (line 1406+ if(m_code>=0) 块内) —
+                //     字母循环顺序保证 P 在 M 之后解析, 此处只识别 m_code 不读 p_value
+                //     (避免字母顺序 BUG: case 'M' 内读 p_value 时 P 字母尚未解析)
+                else if(m_code == 70 || m_code == 71){
+                    // 模态 M 代码, m_code 保持原值, 处理延迟到字母循环后 (与 M50 同模式)
+                }
+                else if(m_code == 62 || m_code == 63 || m_code == 67 ||
+                        m_code == 68 || m_code == 10 || m_code == 11 || m_code == 12){
+                    if(g_laser_cfg.do_slave_id < 0){
+                        // 未配置激光: 静默忽略 (不入队, 不报警)
+                        m_code = -1;
+                    } else if(m_code == 62){
+                        g_state.laser_shutter_pending = 1;
+                    } else if(m_code == 63){
+                        g_state.laser_shutter_pending = 0;
+                    } else if(m_code == 67 || m_code == 68){
+                        // M67/M68 的 e_value 检查延迟到 case 'E' (字母循环内 E 在 M 后解析).
+                        // 这里不做事, m_code 保持原值, 等待字母循环到 E 时设置 pending.
+                        // 若本行无 E 字母 (单独 M67), pending 保持上一次值 (Fanuc 模态语义).
+                    } else if(m_code == 10){ g_state.gas_select = 1; }  // N2
+                    else if(m_code == 11){ g_state.gas_select = 2; }    // O2
+                    else if(m_code == 12){ g_state.gas_select = 3; }    // Air
+                }
+                // ============ P0-Laser 结束 ============
                 break;
             case 'D':
                 // D 代码: 刀具半径补偿值 (mm)
@@ -1069,6 +1160,8 @@ int parse_gcode_line(const char *gcode_line)
             case 'P':
                 p_value=value;
                 if(g_state.active_cycle == 82) g_state.cycle_dwell_ms = value;
+                // Phase B2: G04 P<ms> 捕获 (与 G82 dwell 字段独立, 避免模态污染)
+                if(is_g04_block) g04_dwell_ms = value;
                 break;
             case 'Q':
                 q_value=value;
@@ -1085,6 +1178,38 @@ int parse_gcode_line(const char *gcode_line)
             case 'S':
                 s_value=value;
                 g_state.spindle_rpm = value;  // P1': 立即更新 modal, M3/M4 时 RT 镜像同步生效
+                break;
+            case 'E':
+                // P0-Laser: E 字母值 (M67 功率 W / M68 频率 Hz)
+                // 字母循环顺序保证 E 在 M 之后解析 (例如 "M67 E1500"), 此处 e_value
+                // 已被设置, 可以安全检查越界并更新 pending 字段. case 'M' 内的 M67/M68
+                // 分支已删除 (那里访问 e_value 会拿到 0.0 — 字母顺序 BUG).
+                e_value = value;
+                if (m_code == 67) {
+                    if (e_value < 0.0 || e_value > g_laser_cfg.power_max_w) {
+                        int src_line = g_current_program ?
+                                       g_current_program->lines[g_pc].line_no : -1;
+                        printf("[Parser][ALARM] M67 E=%.2f 越界 (0-%.0f W), 源行 %d\n",
+                               e_value, g_laser_cfg.power_max_w, src_line);
+                        atomic_store_explicit(&g_sys_alarm_state, 1,
+                                              memory_order_release);
+                        m_code = -1;
+                    } else {
+                        g_state.laser_power_pending = e_value;
+                    }
+                } else if (m_code == 68) {
+                    if (e_value < 0.0 || e_value > g_laser_cfg.freq_max_hz) {
+                        int src_line = g_current_program ?
+                                       g_current_program->lines[g_pc].line_no : -1;
+                        printf("[Parser][ALARM] M68 E=%.2f 越界 (0-%.0f Hz), 源行 %d\n",
+                               e_value, g_laser_cfg.freq_max_hz, src_line);
+                        atomic_store_explicit(&g_sys_alarm_state, 1,
+                                              memory_order_release);
+                        m_code = -1;
+                    } else {
+                        g_state.laser_freq_pending = e_value;
+                    }
+                }
                 break;
             case 'T':
                 // P1': T 代码 — 立即更新 modal 刀号; M6 时 RT 镜像同步
@@ -1241,6 +1366,29 @@ int parse_gcode_line(const char *gcode_line)
                g_current_program ? g_current_program->lines[g_pc].line_no : -1);
     }
 
+    // ---- Phase B2: G04 P<ms> dwell 处理 (push M64 段, RT 消费时 freeze N ms) ----
+    // 设计: G04 是非模态非运动指令, 字母循环后处理. push 一个 M64 段入队 (p_value=dwell_ms),
+    //       RT 消费 M64 时进 is_waiting_mcode=1, ecat_core.c switch case 64 等待 dwell_ms.
+    // 用 M64: 不与 M3/M4/M5/M6/M7/M8/M9/M19 冲突, M60-M77 是 RS274 用户定义区.
+    // dwell 期间 is_moving=0, coupling_update 直接 return → 保持 P_base (穿孔需要全功率).
+    if(is_g04_block){
+        if(g04_dwell_ms < 0.0){
+            int src_line = g_current_program ?
+                           g_current_program->lines[g_pc].line_no : -1;
+            printf("[Parser][ALARM] G04 P=%.2f 不能为负, 源行 %d\n",
+                   g04_dwell_ms, src_line);
+            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            return -1;
+        }
+        // 用 p_value 字段传 dwell_ms 给 api_push_mcode (无需新参数)
+        if(api_push_mcode(64, 0.0, g04_dwell_ms, 0.0, 0.0) < 0){
+            printf("[Parser] G04 dwell 入队失败\n");
+            return -1;
+        }
+        printf("[Parser] G04 dwell: %.0f ms (M64 段)\n", g04_dwell_ms);
+        // G04 本行不入运动段, 后续 has_move 门控会跳过
+    }
+
     // 处理M代码：压入队列作为同步屏障
     if (m_code >= 0) {
         // B-Spline 缓冲区排空：M 代码前必须强制刷新，保证指令顺序
@@ -1253,6 +1401,47 @@ int parse_gcode_line(const char *gcode_line)
             g_state.bspline_enabled = (p_value > 0.5) ? 1 : 0;
             printf("[Parser] B-Spline平滑模式: %s\n", g_state.bspline_enabled ? "开启" : "关闭");
             // M50 不入队，仅切换模式
+        }
+        // Phase B1: M70 P<0/1> 切换耦合模式 (字母循环后 p_value 已就绪, 避免字母顺序 BUG)
+        else if (m_code == 70) {
+            if (g_laser_cfg.do_slave_id < 0) {
+                // 未配置激光: 静默忽略
+            } else if (p_value != 0.0 && p_value != 1.0) {
+                int src_line = g_current_program ?
+                               g_current_program->lines[g_pc].line_no : -1;
+                printf("[Parser][ALARM] M70 P=%.2f 越界 (0 或 1), 源行 %d\n",
+                       p_value, src_line);
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            } else {
+                atomic_store_explicit(&g_laser_cfg.coupling_mode, (int)p_value,
+                                      memory_order_release);
+                // B1 诊断: 写入后立即 verify 读回 (排查跨线程可见性)
+                int verify = atomic_load_explicit(&g_laser_cfg.coupling_mode,
+                                                  memory_order_acquire);
+                printf("[Parser] M70 写入: p_value=%.2f → coupling_mode=%d (verify=%d, addr=%p)\n",
+                       p_value, verify, verify,
+                       (void*)&g_laser_cfg.coupling_mode);
+                printf("[Parser] 激光 P-v 耦合: %s\n",
+                       verify ? "启用 (查表)" : "关闭 (直接 P_base)");
+            }
+            // M70 不入队 (模态切换, 与 M50 同模式)
+        }
+        // Phase B1: M71 P<v_thresh> 设置低速阈值
+        else if (m_code == 71) {
+            if (g_laser_cfg.do_slave_id < 0) {
+                // 未配置激光: 静默忽略
+            } else if (p_value < 0.0) {
+                int src_line = g_current_program ?
+                               g_current_program->lines[g_pc].line_no : -1;
+                printf("[Parser][ALARM] M71 P=%.2f 不能为负, 源行 %d\n",
+                       p_value, src_line);
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            } else {
+                atomic_store_explicit(&g_laser_cfg.v_thresh_mm_s, p_value,
+                                      memory_order_release);
+                printf("[Parser] 激光 v_thresh = %.2f mm/s\n", p_value);
+            }
+            // M71 不入队
         } else {
             if(api_push_mcode(m_code, s_value, p_value, q_value, r_value) < 0){
                 printf("[Parser] M代码入队失败(报警)，中止当前文件！\n");

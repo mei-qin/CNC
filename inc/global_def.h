@@ -7,6 +7,7 @@
 #include "cutter_comp.h"
 #include "trace_logger.h"
 #include "sim_engine.h"
+#include "laser_ctrl.h"
 #include <pthread.h>
 /************************ SOEM全局核心变量（b3_drive原有） ************************/
 extern ecx_contextt ctx;                // SOEM主站上下文
@@ -49,5 +50,7 @@ extern sim_logger_t g_sim_logger;  // 仿真模式双缓冲轨迹采集器
 extern PlannerConfig_t g_planner_config; // 规划器全局参数
 extern _Atomic int g_sys_alarm_state;    // 系统报警状态: 0=正常, 1=软停机报警中
 extern int g_sim_mode;                   // 仿真模式: 1=纯软件仿真, 0=真实硬件
+extern LaserConfig_t  g_laser_cfg;       // 激光器配置 (主线程 init 阶段单写者)
+extern LaserRTState_t g_laser_rt;        // 激光器 RT 镜像状态 (RT 线程单写者)
 
 #endif // GLOBAL_DEF_H

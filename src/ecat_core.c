@@ -311,11 +311,29 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_axis[i].home_offset[s]=axis_pdo_read_pos(slave_id);
                     }
                 }
+                // P0 修复: is_first_run=0 必须在 if 块内, 只有 wkc>0 锚定成功才置 0.
+                // 原 BUG: is_first_run=0 在 if 块外, 首周期 wkc=0 (EtherCAT 刚启动 PDO 未交换)
+                //         时 home_offset[] 保持 0 但 is_first_run 已置 0, 下次永不锚定.
+                //         后果: 下游 axis_pdo_read_pos(slave_id) - home_offset[0] 持续错位,
+                //               机械坐标系整体偏移, 撞机风险.
+                // 修复后: 首周期 wkc=0 时 is_first_run 保持 1, 下个周期重试直到锚定成功.
+                // sim 模式: wkc stub 始终>0, 首周期立即锚定, 行为不变.
+                is_first_run=0;
+                rt_log("[RT] home_offset 锚定完成 (cycle=%d wkc=%d)", cycle, wkc);
             }
-            is_first_run=0;
 
             if (!g_sim_mode && ctx.slavelist[0].hasdc && (wkc > 0))
                 ec_sync(ctx.DCtime, cycletime, &toff);
+
+            // ---- P0-Laser: cycle 头安全门 (alarm_reset 之前, 段消费之前) ----
+            // 检查 DI 互锁 + g_sys_alarm_state, 异常时立即关激光 + 锁存 emergency_kill.
+            // 必须早于段消费环: 段消费时会调 laser_rt_apply_aux, 如果 emergency_kill=1
+            // 则 apply_aux 屏蔽 seg 推进, 保证段消费不会重新打开激光.
+            if (laser_rt_safety_gate()) {
+                // DI 互锁异常触发系统软停机 (与跟随误差超差同等级别)
+                // safety_gate 内部已 set g_laser_rt, 这里只需保证运动也停车
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            }
 
             // === 报警复位安全点：必须在 g_all_axis_op_ready 门控之外 ===
             // 若复位逻辑在门控内，op_ready=0 时请求永远无法被消费 → 死锁。
@@ -328,6 +346,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.time_scale = 1.0;
                     g_interpolator.hold_state = HOLD_NORMAL;
                     g_interpolator.alarm_reset_request = 0;
+                    // P0-Laser: 报警复位时清激光急停锁存 (不自动重开激光, 需 M3 重发)
+                    laser_rt_reset();
                     // Lock-Free 队列报警复位: 把 read_tail 推到 write_head,
                     // 丢弃所有未消费段。RT 线程是 read_tail 的唯一写者,这里
                     // release 写保证后续 ecx_send_processdata 看到的 read_tail
@@ -463,6 +483,13 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_coord_mgr.active_offset[j] = seg.wcs_offset_snap[j];
                     }
 
+                    // ---- Phase B1: 段级耦合配置同步 (cmd_type 分支前, M 段 + 运动段共用) ----
+                    // 把入队时快照的 coupling_mode/v_thresh 同步到 g_laser_rt.*_rt 镜像.
+                    // 段执行期间 coupling_update 读 *_rt 镜像, 不再读全局 g_laser_cfg.
+                    // 修复架构 BUG: parser 单线程解析快, M70 P1 → M70 P0 顺序覆盖会在 RT 第一次读
+                    //   之前完成, RT 全程看到 mode=0. 段级快照让 mode 在段执行期间稳定.
+                    laser_rt_sync_config(&seg);
+
                     // M 代码段: 进入等待屏障
                     if (seg.cmd_type == CMD_TYPE_MCODE) {
                         g_interpolator.is_waiting_mcode = 1;
@@ -475,6 +502,20 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_interpolator.spindle_rpm_rt     = seg.aux_spindle_rpm;
                         g_interpolator.coolant_state_rt   = seg.aux_coolant;
                         g_interpolator.current_tool_id_rt = seg.aux_tool_id;
+                        // Phase B2: G04 dwell P 值传递 (M64 段, switch case 64 读)
+                        g_interpolator.mcode_p_value_ms = seg.p_value;
+                        // ---- P0-Laser: 同步激光镜像 (仅 M 段, 运动段保持模态) ----
+                        // 设计原因: 运动段的 aux_laser_* 未填 (api_push_trajectory_impl
+                        // 不写这些字段, 与 P1' spindle/coolant 同模式). 若运动段也同步,
+                        // memset=0 的 aux_laser_* 会清零 g_laser_rt, 破坏激光模态.
+                        // 正确语义: 激光开/关由 M62/M63/M67/M68/M10/M3/M5 等 M 段触发,
+                        //           运动段沿用上次模态状态 (Fanuc 标准).
+                        g_interpolator.laser_enable_rt  = seg.aux_laser_enable;
+                        g_interpolator.laser_shutter_rt = seg.aux_laser_shutter;
+                        g_interpolator.laser_power_w_rt = seg.aux_laser_power_w;
+                        g_interpolator.laser_freq_hz_rt = seg.aux_laser_freq_hz;
+                        g_interpolator.gas_select_rt    = seg.aux_gas_select;
+                        laser_rt_apply_aux(&seg);
                         break;
                     }
 
@@ -575,7 +616,19 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             //   Snap 微段 (T_total ≤ 0.5) 的 v_current 无物理意义,log_velocity 置零。
             int current_is_moving = atomic_load_explicit(&g_interpolator.is_moving,
                                                           memory_order_acquire);
-            int should_log_this_cycle = current_is_moving || just_loaded_seg;
+            // P0-Laser: 检查强制日志标志 (parser M30 抢写 g_laser_rt 后置 1)
+            // 用途: M30 Step 4 抢写后 RT 静止 (is_moving=0 ∧ just_loaded_seg=0),
+            //       should_log=0 → sim_engine_push 不调 → CSV 末尾保留旧值.
+            //       force_log=1 时下个 cycle 强制记录一次新状态, 然后自动清 0.
+            int force_log = atomic_load_explicit(&g_sim_force_log, memory_order_acquire);
+            // Phase B2: M 段等待期间也记录 (dwell/M3/M5 等 freeze 期 is_moving=0 但状态机在变)
+            // 不加此项: G04 P1000 dwell 期间 CSV 0 行, 无法验证 dwell power_w=P_base
+            int in_mcode_wait = (g_interpolator.is_waiting_mcode != 0);
+            int should_log_this_cycle = current_is_moving || just_loaded_seg
+                                     || force_log || in_mcode_wait;
+            if (force_log) {
+                atomic_store_explicit(&g_sim_force_log, 0, memory_order_release);
+            }
 
             // 探针速度基准: 物理瞬时速度 v_current
             int is_snap_segment = just_loaded_seg && (g_interpolator.T7 <= 0.5);
@@ -629,7 +682,17 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_interpolator.spindle_mode_rt,
                                 g_interpolator.spindle_rpm_rt,
                                 g_interpolator.coolant_state_rt,
-                                g_interpolator.current_tool_id_rt);
+                                g_interpolator.current_tool_id_rt,
+                                // P0-Laser: 7 个激光状态镜像 (从 g_laser_rt 读)
+                                g_laser_rt.enable,
+                                g_laser_rt.shutter,
+                                g_laser_rt.power_w,
+                                g_laser_rt.freq_hz,
+                                g_laser_rt.gas_select,
+                                g_laser_rt.emergency_kill,
+                                g_laser_rt.interlock_status,
+                                // Phase B1: 当前周期瞬时速度 (供验证 P-v 耦合曲线)
+                                g_laser_rt.v_actual_mm_s);
             }
 
             if(g_all_axis_op_ready){
@@ -678,6 +741,12 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     case 8:  wait_target_ms=500;  break;  // M8 flood coolant
                     case 9:  wait_target_ms=500;  break;  // M9 coolant off
                     case 19: wait_target_ms=1000; break;  // M19 spindle orient
+                    // ---- Phase B2: G04 dwell (M64 段携带 dwell_ms 在 p_value) ----
+                    case 64: wait_target_ms = (int)(g_interpolator.mcode_p_value_ms + 0.5);
+                             if(wait_target_ms < 1) wait_target_ms = 1;
+                             if(wait_target_ms > MCODE_WAIT_TIMEOUT_MS)
+                                 wait_target_ms = MCODE_WAIT_TIMEOUT_MS;
+                             break;
                     default: wait_target_ms=500;  break;
                 }
                 if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
@@ -849,6 +918,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             }
 
             g_all_axis_op_ready=all_ready_flag;
+
+            // ---- P0-Laser Phase B1: 功率-速度耦合 (在 flush_pdos 前重算 power_w) ----
+            // 读 g_interpolator.v_current + 耦合表, 重算 g_laser_rt.power_w.
+            // coupling_mode=0 时内部直接 return, 不影响性能 (单次 int 比较).
+            laser_rt_coupling_update();
+
+            // ---- P0-Laser: cycle 末刷新激光 PDO ----
+            // 必须在 ecx_send_processdata 之前, 保证 DO/AO 在本周期 PDO 帧中生效.
+            // sim 模式或 do_slave_id<0 时内部安全跳过, 仅保留 g_laser_rt 供 trace.
+            laser_rt_flush_pdos();
 
             if (!g_sim_mode) ecx_mbxhandler(&ctx, 0, 4);
             if (!g_sim_mode) ecx_send_processdata(&ctx);

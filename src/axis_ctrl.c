@@ -423,6 +423,14 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->s_value = 0.0;
     seg->total_distance = dist;
 
+    // Phase B1: 段级耦合配置快照 (运动段也需快照, RT sync_config 每段都调)
+    // 注: 运动段的 aux_laser_enable/shutter/power_w/freq/gas 不填 (Phase A 设计, apply_aux
+    //     只在 M 段调, 保持 g_laser_rt 模态). 但 coupling_mode 是配置同步, 必须填.
+    seg->aux_laser_coupling_mode = atomic_load_explicit(&g_laser_cfg.coupling_mode,
+                                                        memory_order_acquire);
+    seg->aux_laser_v_thresh      = atomic_load_explicit(&g_laser_cfg.v_thresh_mm_s,
+                                                        memory_order_acquire);
+
     for(int i=0;i<AXIS_NUM;i++){
         seg->target_pos[i]=target_pos[i];
         seg->dir_vec[i] = dir_vec[i];
@@ -561,6 +569,21 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->aux_spindle_rpm  = g_state.spindle_rpm;
     seg->aux_coolant      = g_state.coolant_state;
     seg->aux_tool_id      = g_state.current_tool_id;
+
+    // ---- P0-Laser: 激光辅助状态机快照 (与 P1' 同链路) ----
+    // M3/M5 联动 laser_enable (复用 spindle_mode); M62/M63 同步激光闸;
+    // M67/M68 设置功率/频率; M10/M11/M12 选气体. 每段都拷 (含运动段),
+    // 保证激光开/关与运动段 1ms 边界严格对齐.
+    seg->aux_laser_enable  = (g_state.spindle_mode != 0) ? 1 : 0;
+    seg->aux_laser_shutter = g_state.laser_shutter_pending;
+    seg->aux_laser_power_w = g_state.laser_power_pending;
+    seg->aux_laser_freq_hz = g_state.laser_freq_pending;
+    seg->aux_gas_select    = g_state.gas_select;
+    // Phase B1: 段级耦合配置快照 (修复架构 BUG — 不再让 RT 读全局 g_laser_cfg)
+    seg->aux_laser_coupling_mode = atomic_load_explicit(&g_laser_cfg.coupling_mode,
+                                                        memory_order_acquire);
+    seg->aux_laser_v_thresh      = atomic_load_explicit(&g_laser_cfg.v_thresh_mm_s,
+                                                        memory_order_acquire);
 
     // relaxed 推进 write_head: 由 spinlock release 建立可见性。
     atomic_store_explicit(&g_cmd_queue.write_head, next_head, memory_order_relaxed);

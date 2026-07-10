@@ -242,6 +242,18 @@ typedef struct{
     int    coolant_state_rt;    // bit flags: bit0=flood(M8), bit1=mist(M7); 0/1/2/3 见 g_state 注释
     int    current_tool_id_rt;  // T 代码当前刀号 (M6 切换后)
 
+    // ---- P0-Laser: RT 镜像 (RT 单写者, 消费 seg 时同步) ----
+    // 与 spindle_*_rt / coolant_state_rt 同语义, 供 sim CSV trace / 未来 HMI 读出.
+    // 写入点: ecat_thread_rt 段消费环 seg 拷出后, 由 laser_rt_apply_aux() 推进.
+    // Phase B2: G04 dwell 等 M 段携带参数 (M64 段 p_value=dwell_ms)
+    double mcode_p_value_ms;   // 段消费时从 seg.p_value 同步, switch case 64 读
+
+    int    laser_enable_rt;
+    int    laser_shutter_rt;
+    double laser_power_w_rt;
+    double laser_freq_hz_rt;
+    int    gas_select_rt;
+
 }Interpolator_t;
 
 /*
@@ -300,6 +312,23 @@ typedef struct{
     double aux_spindle_rpm;     // rpm
     int    aux_coolant;         // bit flags: bit0=flood, bit1=mist (与 g_state.coolant_state 同语义)
     int    aux_tool_id;         // 当前刀号
+
+    // ---- P0-Laser: 激光辅助状态机快照 (parser → seg → RT 同步链路) ----
+    // parser 入队时从 g_state 拷贝; RT 消费 seg 时同步到 laser_*_rt + g_laser_rt.
+    // 每段都拷 (含运动段), 保证激光开/关与运动段 1ms 边界严格对齐.
+    int    aux_laser_enable;       // 0=off, 1=on (与 M3/M5 联动)
+    int    aux_laser_shutter;      // 0=off, 1=on (M62/M63 同步)
+    double aux_laser_power_w;      // M67 E<n> 设置 (W)
+    double aux_laser_freq_hz;      // M68 E<n> 设置 (Hz)
+    int    aux_gas_select;         // 0=off, 1=N2, 2=O2, 3=Air (M10/M11/M12)
+    // ---- Phase B1: 段级耦合配置快照 (修复架构 BUG) ----
+    // 历史设计错误: 把 coupling_mode 作为全局运行时状态, RT 每 cycle 读 g_laser_cfg.
+    //   后果: parser 在 RT 第一次读之前就把 mode 改回 (M70 P1 → M70 P0 顺序覆盖),
+    //         RT 全程看到 mode=0.
+    // 正确设计: 段级快照, parser 入队时把当时的 mode 冻结到 seg, RT 消费段时同步.
+    //   保证段执行期间用入队时的 mode, 不受后续 M70 写入影响.
+    int    aux_laser_coupling_mode;   // 入队时 g_laser_cfg.coupling_mode 快照
+    double aux_laser_v_thresh;        // 入队时 g_laser_cfg.v_thresh_mm_s 快照
 
     double total_distance;
     double dir_vec[AXIS_NUM];

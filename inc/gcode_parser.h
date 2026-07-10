@@ -53,6 +53,15 @@ typedef struct {
                                 // 0=off, 1=flood, 2=mist, 3=flood+mist; M9 清零
     int    current_tool_id;     // T 代码当前刀号 (M6 切换到此刀号)
 
+    // ---- P0-Laser: 激光器模态字段 (parser 端) ----
+    // M62/M63/M67/M68/M10/M11/M12 写入; M3/M5 联动 laser_shutter_pending;
+    // 入队时快照到 seg.aux_laser_*; RT 消费时同步到 g_laser_rt.
+    // 注意: 这些字段在 M30 应当与 spindle/coolant 一同复位 (Phase A 顺便修 P1 BUG).
+    int    laser_shutter_pending;   // M62/M63 同步激光闸 (0/1)
+    double laser_power_pending;     // M67 E<n> 激光功率 (W)
+    double laser_freq_pending;      // M68 E<n> 激光频率 (Hz)
+    int    gas_select;              // 0=off, 1=N2, 2=O2, 3=Air (M10/M11/M12)
+
     // ---- P2': G52 局部坐标系 ----
     // local_offset[i] 叠加在 work_offsets[modal_wcs] 之上 (Fanuc 标准):
     //   effective_offset[i] = work_offsets[modal_wcs][i] + local_offset[i]
