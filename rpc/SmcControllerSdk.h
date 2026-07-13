@@ -116,6 +116,27 @@ public:
     bool ResumeProcessing();
     bool AbortProcessing();
 
+    /* =============================================================
+     * P0-b v2: LoadProgram / RunLoadedProgram / GetProgramStructure
+     *
+     * 典型流程: LoadProgram (preview) → GetProgramStructure → 操作员检查 → RunLoadedProgram
+     * ============================================================= */
+    /* 加载程序到 preview cache (parser 跑但不执行, 段流推送给 UI 画轨迹)
+     * 返回码: 0=ok, -1=parser 忙, -2=filepath 无效 */
+    bool LoadProgram(const std::string &filepath, int &out_ret_code);
+    /* 执行已加载程序 (LoadProgram 必须先完成, 内部重新解析同一 filepath)
+     * 返回码: 0=ok, -1=LoadProgram 未完成, -2=parser 忙 */
+    bool RunLoadedProgram(int &out_ret_code);
+    /* 查询程序结构元数据 (~390B 响应, 含 filepath/段数/bbox/估算工时) */
+    bool GetProgramStructure(SmcGetProgramStructureRes &out);
+
+    /* =============================================================
+     * P1-b: ClearAlarm
+     * ============================================================= */
+    /* 清除系统报警 (异步: 调用立即返回, RT 清完通过 event stream 通知)。
+     * 返回码: 0=请求已提交, -1=parser 正在跑 (先 AbortProcessing), -2=轴未就绪 */
+    bool ClearAlarm(int &out_ret_code);
+
 private:
     /* ---------- 内部收发原语 ---------- */
     int  send_all(const void *buf, size_t n);

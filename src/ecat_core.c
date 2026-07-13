@@ -5,6 +5,8 @@
 #include "trace_logger.h"
 #include "sim_engine.h"
 #include "sim_drive.h"
+#include "snapshot_hub.h"
+#include "event_logger.h"   /* P1-b: EventLogger_Push (RT 安全, 无锁无 malloc) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -333,6 +335,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 // DI 互锁异常触发系统软停机 (与跟随误差超差同等级别)
                 // safety_gate 内部已 set g_laser_rt, 这里只需保证运动也停车
                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                /* P1-b: laser safety 互锁报警事件 (rt_log 风格, 常量 message) */
+                EventLogger_Push(SEVERITY_ALARM, SOURCE_LASER, 0x0010,
+                                 (int32_t)g_laser_rt.interlock_status,
+                             "laser safety interlock triggered (door/estop/alm/water/gas)");
             }
 
             // === 报警复位安全点：必须在 g_all_axis_op_ready 门控之外 ===
@@ -370,6 +376,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     api_sync_planner_cursor();
                     atomic_store_explicit(&g_sys_alarm_state, 0, memory_order_release);
                     rt_log("[RT] 报警复位已执行，队列已清空，位置已同步");
+                    /* P1-b: 通知 UI alarm 已清 (异步 ClearAlarm 的最终确认) */
+                    EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0041, 0,
+                                     "alarm cleared by RT (queue flushed, pos synced)");
                 }
             }
 
@@ -548,6 +557,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.v_start=seg.v_start;
                     g_interpolator.v_end=seg.v_end;
                     g_interpolator.virtual_time_ms = 0.0;
+                    g_interpolator.current_seg_id_rt = seg.seg_id;  // P0-c: 记录当前段 ID
                     g_interpolator.current_phase = 1;
                     g_interpolator.phase_T_curr = 0.0;
                     g_interpolator.phase_T_next = seg.T1;
@@ -695,6 +705,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_laser_rt.v_actual_mm_s);
             }
 
+            // ---- P0-a: 状态快照推送 (所有模式, 无条件) ----
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: SnapshotHub_Publish 仅 atomic store + memcpy, 无锁无阻塞.
+            //         不受 should_log_this_cycle / g_sim_mode 约束:
+            //         静止时也要推, 让 HMI 看到 alarm/feedhold 状态变化.
+            //         g_state / g_parser_ctrl 字段 best-effort 读, 撕裂容忍.
+            SnapshotHub_Publish((uint32_t)cycle);
+
             if(g_all_axis_op_ready){
                 for(int i=0;i<AXIS_NUM;i++){
                     if(g_axis[i].slave_count>=2&&g_axis[i].enable_sync_alarm){
@@ -708,6 +726,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         if(diff>g_axis[i].sync_max_err_pulse){
                            rt_log("同步异常！轴%d 从站%d与%d位置差%d超过最大误差%d", i, slave_1, slave_2, diff, g_axis[i].sync_max_err_pulse);
                            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                           EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0001, diff,
+                                            "gantry sync err: position diff exceeds max");
                            continue;
                         }
 
@@ -716,6 +736,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             if(g_axis[i]._current_sync_timer>g_axis[i].sync_err_time_ms){
                                 rt_log("同步报警！轴%d 从站%d与%d差%d持续%dms超限%d", i, slave_1, slave_2, diff, g_axis[i]._current_sync_timer, g_axis[i].sync_err_time_ms);
                                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                                EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0001, diff,
+                                                 "gantry sync err: persistent tolerance breach");
                             }
                         }else{
                             g_axis[i]._current_sync_timer=0;
@@ -844,6 +866,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         all_ready_flag = 0;
                         output_cw = CW_FAULT_RESET;
                         atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
+                                         "drive SW_ERROR detected, FAULT_RESET sent");
                         break;
                     }
 
@@ -874,11 +898,15 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             g_interpolator.is_moving = 0;
                             g_interpolator.is_waiting_mcode = 0;
                             atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                            EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0003, abs_err,
+                                             "follow err hard limit exceeded");
                         }else if(abs_err>FOLLOW_ERR_WARN_PULSE){
                             g_axis[i]._follow_err_timer++;
                             if(g_axis[i]._follow_err_timer>=FOLLOW_ERR_WARN_TIME_MS){
                                 rt_log("[跟随误差] %s 警告持续 %dms",g_axis[i].axis_name,g_axis[i]._follow_err_timer);
                                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                                EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0004, abs_err,
+                                                 "follow err warn persistent");
                             }
                         }else{
                             g_axis[i]._follow_err_timer=0;

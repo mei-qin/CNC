@@ -7,6 +7,7 @@
 #include <math.h>
 #include "planner.h"
 #include "gcode_parser.h"
+#include "preview_streamer.h"   /* P0-b v1: PreviewStreamer_Push */
 /************************ 全局变量定义（仅轴相关，其余在ecat_core.c） ************************/
 AxisCtrl_t g_axis[AXIS_NUM];            // 五轴核心数组，全局唯一定义
 int g_axis_map[26];                     // 动态轴映射表：'A'-'Z' → 轴索引，-1=未映射
@@ -17,6 +18,32 @@ CommandQueue_t g_cmd_queue={0};
 static double plan_cursor[AXIS_NUM]={0};
 CoordManager_t g_coord_mgr={COORD_G54,{0},{0},{0}};
 PlannerConfig_t g_planner_config={0.05, 500.0};
+
+/* ---- P0-b v1: parser → axis_ctrl 段元数据传递 (定义在此, extern 在 global_def.h) ----
+ * g_seg_id_counter: 段 ID 单调递增, atomic_fetch_add 在 api_push_trajectory_impl
+ *                  内调用 (跨 parser/bspline 多线程入队, 必须 atomic)
+ * g_current_line_no: parser 入口设 (= g_current_program->lines[g_pc].line_no)
+ * g_current_motion_type: parser case 'G' 设 (G00/G01/G02/G03)
+ *                       默认 MOTION_TYPE_OTHER (0xFF), parser 线程单写者
+ */
+_Atomic uint64_t g_seg_id_counter = 0;
+int32_t          g_current_line_no = 0;
+uint8_t          g_current_motion_type = MOTION_TYPE_OTHER;
+
+/* ---- P0-b v2: 程序级统计 (定义在此, extern 在 global_def.h) ----
+ * parser_thread_func 启动时清零 (filepath 设置后), 入队时累加/比较,
+ * SMC_GetProgramStructure 读出。
+ * g_program_bbox 初值用 ±1e18 哨兵, 首段必然更新; 程序无运动段时哨兵保留 (UI 自查)。
+ */
+double           g_program_total_time_ms = 0.0;
+double           g_program_bbox_min[AXIS_NUM] = {0};
+double           g_program_bbox_max[AXIS_NUM] = {0};
+_Atomic int      g_program_load_done = 0;
+uint64_t         g_program_first_seg_id = 0;
+uint64_t         g_program_last_seg_id = 0;
+int32_t          g_program_total_lines = 0;
+int32_t          g_program_num_o_labels = 0;
+int32_t          g_program_num_n_labels = 0;
 /************************ 五轴系统初始化（核心配置，修改此函数即可调整轴参数） ************************/
 static int check_soft_limits(double target_pos[AXIS_NUM]){
     for(int i=0;i<AXIS_NUM;i++){
@@ -272,6 +299,65 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
         return -1;
     }
 
+    // ---- P0-b v2: LoadProgram preview 模式 ----
+    // 不入 motion queue (RT 不消费, current_seg_id 保持), 仅推 PreviewStreamer + 更新统计。
+    // 安全检查 (alarm/soft_limit/speed) 仍走完, 防止 preview 时把错误数据塞给 UI。
+    // 跨线程读 program_mode: x86 int 读原子, 此处 plain read 与 is_running/is_paused 同模式。
+    if (g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW) {
+        // 1. 计算粗略总距离 (UI 显示用, 不做 S 曲线完整规划)
+        double pv_dist = 0.0;
+        for (int i = 0; i < AXIS_NUM; i++) {
+            double d = target_pos[i] - plan_cursor[i];
+            pv_dist += d * d;
+        }
+        pv_dist = sqrt(pv_dist);   // parser 线程非 RT, sqrt OK
+
+        // 2. 构造最小 preview_seg (仅 UI 可见字段, S 曲线参数全 0)
+        TrajectorySegment_t pv_seg;
+        memset(&pv_seg, 0, sizeof(pv_seg));
+        pv_seg.cmd_type = CMD_TYPE_MOTION;
+        for (int i = 0; i < AXIS_NUM; i++) {
+            pv_seg.target_pos[i] = target_pos[i];
+            pv_seg.dir_vec[i] = (pv_dist > 1e-9) ?
+                                (target_pos[i] - plan_cursor[i]) / pv_dist : 0.0;
+        }
+        pv_seg.total_distance = pv_dist;
+        pv_seg.v_max = speed_sec_mm;
+        pv_seg.v_target = speed_sec_mm / 1000.0;   // mm/s → mm/ms (与正常路径一致)
+        pv_seg.is_rtcp_active = is_rtcp_active ? 1 : 0;
+        pv_seg.is_fillet = is_fillet ? 1 : 0;
+        pv_seg.active_wcs = wcs;
+        for (int i = 0; i < AXIS_NUM; i++) {
+            pv_seg.wcs_offset_snap[i] = wcs_offset_snap[i];
+        }
+        pv_seg.seg_id = atomic_fetch_add_explicit(&g_seg_id_counter, 1,
+                                                   memory_order_relaxed);
+        pv_seg.line_no = g_current_line_no;
+        pv_seg.motion_type = g_current_motion_type;
+
+        // 3. 推 PreviewStreamer (9529 client 收)
+        PreviewStreamer_Push(&pv_seg);
+
+        // 4. 更新 bbox (parser_thread_func 启动时 init ±1e18 哨兵, 首段必更新)
+        for (int i = 0; i < AXIS_NUM; i++) {
+            if (target_pos[i] < g_program_bbox_min[i]) g_program_bbox_min[i] = target_pos[i];
+            if (target_pos[i] > g_program_bbox_max[i]) g_program_bbox_max[i] = target_pos[i];
+        }
+
+        // 5. 记录首/末段 seg_id (parser_thread_func 启动时 init UINT64_MAX 哨兵)
+        if (g_program_first_seg_id == (uint64_t)-1) {
+            g_program_first_seg_id = pv_seg.seg_id;
+        }
+        g_program_last_seg_id = pv_seg.seg_id;
+
+        // 6. 更新 plan_cursor (parser 下一段 dist 计算依赖, 必须更新)
+        for (int i = 0; i < AXIS_NUM; i++) {
+            plan_cursor[i] = target_pos[i];
+        }
+
+        return 0;   // 不入 motion queue
+    }
+
     // ---- 第一步：计算原始偏差（mm 或 deg）----
     double delta_raw[AXIS_NUM];
     for(int i=0;i<AXIS_NUM;i++){
@@ -485,6 +571,16 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     for(int i=0;i<AXIS_NUM;i++){
         plan_cursor[i]=target_pos[i];
     }
+
+    // ---- P0-b v1: 段元数据填充 + fork 副本到 PreviewStreamer ----
+    // 必须在 write_head 推进之前完成, 保证 RT 消费者看到的 seg 字段完整
+    // (RT 通过 is_ready + read_tail acquire 看到 seg_id/line_no/motion_type).
+    // PreviewStreamer_Push 内部仅 memcpy + atomic store, 无锁, 不显著延长 spinlock 持有时间.
+    // 设计上 PreviewStreamer 是只读 fork 副本, 不影响 motion queue 行为.
+    seg->seg_id = atomic_fetch_add_explicit(&g_seg_id_counter, 1, memory_order_relaxed);
+    seg->line_no = g_current_line_no;
+    seg->motion_type = g_current_motion_type;
+    PreviewStreamer_Push(seg);
 
     // relaxed 推进 write_head: 由 spinlock release 统一建立可见性。
     atomic_store_explicit(&g_cmd_queue.write_head, next_head, memory_order_relaxed);

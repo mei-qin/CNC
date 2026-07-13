@@ -23,6 +23,7 @@
 *.so
 /cnc_core
 /cnc_test
+/rpc_server
 
 # ==== 临时调试脚本 (Ad-hoc Debug Scripts) ====
 # 一次性验证用, 不入团队仓库 (按需保留个人正式脚本)

@@ -53,4 +53,29 @@ extern int g_sim_mode;                   // 仿真模式: 1=纯软件仿真, 0=�
 extern LaserConfig_t  g_laser_cfg;       // 激光器配置 (主线程 init 阶段单写者)
 extern LaserRTState_t g_laser_rt;        // 激光器 RT 镜像状态 (RT 线程单写者)
 
+// ---- P0-b v1: parser → axis_ctrl 段元数据传递 (UI 预览/光标用) ----
+// parser_thread 写 (g_current_line_no/motion_type), axis_ctrl 读 (api_push_trajectory_impl).
+// 单写者单读者 (parser_thread 是唯一生产者, axis_ctrl 入队路径也是单线程后台调用),
+// 用 plain int/uint8_t 即可, 写频率 ~10Hz (每行 G 代码一次)。
+// g_seg_id_counter 用 _Atomic 因 api_push_trajectory_impl 跨多线程调用 (parser + bspline).
+extern _Atomic uint64_t g_seg_id_counter;        // 全局段 ID 计数器 (单调递增)
+extern int32_t          g_current_line_no;       // parser 当前解析的源 G 代码行号 (1-based)
+extern uint8_t          g_current_motion_type;   // parser 当前运动模式 (MOTION_TYPE_* 宏)
+
+// ---- P0-b v2: 程序级统计 (parser 入队时累加, GetProgramStructure 读出) ----
+// parser_thread 是唯一写者, SMC_GetProgramStructure 是读者。
+// g_program_load_done 用 _Atomic 因 LoadProgram/RunLoadedProgram API 跨线程读。
+// g_program_total_lines / num_o_labels / num_n_labels 在 Program_Load 后立即 cache,
+// 因为 parser_thread_func 退出时 Program_Free(prog) + g_current_program=NULL,
+// GetProgramStructure 时已无法直接读 g_current_program。
+extern double           g_program_total_time_ms;       // 累加 seg.T_total (run 模式有效)
+extern double           g_program_bbox_min[AXIS_NUM];  // 边界框 min (load + run 都更新)
+extern double           g_program_bbox_max[AXIS_NUM];  // 边界框 max
+extern _Atomic int      g_program_load_done;           // 1=LoadProgram 完成, 0=未加载或running
+extern uint64_t         g_program_first_seg_id;        // 程序首段 seg_id (load 阶段第一段时记)
+extern uint64_t         g_program_last_seg_id;         // 程序末段 seg_id (load 阶段每段更新)
+extern int32_t          g_program_total_lines;         // cache: g_current_program->num_lines
+extern int32_t          g_program_num_o_labels;        // cache: g_current_program->num_o_labels
+extern int32_t          g_program_num_n_labels;        // cache: g_current_program->num_n_labels
+
 #endif // GLOBAL_DEF_H

@@ -23,6 +23,12 @@
 
 #include <stdint.h>
 
+/* AXIS_NUM 兼容 (P0-b v2): SMC_ProgramStructure_t.bbox_min/max 用。
+ * CNC Core 端 axis_cfg.h 已定义, 此处允许外部预定义 (Windows SDK 包含本头时 fallback 5)。 */
+#ifndef AXIS_NUM
+#define AXIS_NUM 5
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -72,6 +78,13 @@ typedef enum {
     SMC_CMD_GET_COOLANT_STATE        = 0x0027,  /* 冷却液 bit flags 查询 */
     SMC_CMD_GET_CURRENT_TOOL         = 0x0028,  /* 当前刀号查询 */
     SMC_CMD_SET_OPTIONAL_STOP_ENABLE = 0x0029,  /* M1 可选停开关 */
+    SMC_CMD_SUBSCRIBE                = 0x002A,  /* P0-a: 订阅状态推送通道 (9528 端口握手用) */
+    SMC_CMD_PREVIEW_SUBSCRIBE        = 0x002B,  /* P0-b v1: 订阅段流推送通道 (9529 端口握手用) */
+    SMC_CMD_LOAD_PROGRAM             = 0x002C,  /* P0-b v2: 加载程序 (仅 preview, 不执行) */
+    SMC_CMD_RUN_LOADED_PROGRAM       = 0x002D,  /* P0-b v2: 执行已加载程序 */
+    SMC_CMD_GET_PROGRAM_STRUCTURE    = 0x002E,  /* P0-b v2: 查询程序结构元数据 */
+    SMC_CMD_CLEAR_ALARM              = 0x002F,  /* P1-b: 清除系统报警 (触发 RT alarm_reset_request) */
+    SMC_CMD_EVENT_SUBSCRIBE          = 0x0030,  /* P1-b: 订阅事件流推送通道 (9530 端口握手用) */
 
     /* --- 运动控制 0x0030 ~ 0x003F --- */
     SMC_CMD_SET_ZERO                 = 0x0030,
@@ -312,6 +325,59 @@ typedef struct {
 } SmcRunGCodeFileRes;
 
 /* SMC_PAUSE_PROCESSING / RESUME_PROCESSING / ABORT_PROCESSING: 无 Req, 无 Res */
+
+/* ----- P0-b v2: LoadProgram / RunLoadedProgram / GetProgramStructure ----- */
+typedef struct {
+    char filepath[SMC_FILEPATH_MAX_LEN];
+} SmcLoadProgramReq;
+typedef struct {
+    int32_t ret_code;   /* 0=ok, -1=is_running (parser 忙), -2=Program_Load 失败 */
+} SmcLoadProgramRes;
+
+/* SMC_RUN_LOADED_PROGRAM: 无 Req */
+typedef struct {
+    int32_t ret_code;   /* 0=ok, -1=load_done!=1 (LoadProgram 未完成), -2=is_running */
+} SmcRunLoadedProgramRes;
+
+/* SMC_GET_PROGRAM_STRUCTURE: 无 Req, payload 直接是 SMC_ProgramStructure_t */
+typedef struct {
+    int32_t  ret_code;            /* 0=ok, -1=未加载 */
+    char     filepath[SMC_FILEPATH_MAX_LEN];
+    int32_t  is_loaded;           /* 0=未加载, 1=loaded(preview done 待 run), 2=running, 3=done */
+    int32_t  total_lines;         /* g_current_program->num_lines (源码行数) */
+    int32_t  total_segments;      /* PreviewStreamer_GetWriteSeq() (本程序段数, 累计跨程序) */
+    int32_t  num_o_labels;        /* g_current_program->num_o_labels */
+    int32_t  num_n_labels;        /* g_current_program->num_n_labels */
+    uint64_t first_seg_id;        /* 本程序 load 阶段首段 seg_id */
+    uint64_t last_seg_id;         /* 本程序 load 阶段末段 seg_id */
+    double   estimated_time_ms;   /* sum T_total (run 模式有效, preview=0) */
+    double   bbox_min[AXIS_NUM];  /* 边界框 min (load + run 都更新, 哨兵 ±1e18) */
+    double   bbox_max[AXIS_NUM];
+} SmcGetProgramStructureRes;
+
+/* ----- P1-b: ClearAlarm + Event stream ----- */
+/* SMC_CLEAR_ALARM: 无 Req */
+typedef struct {
+    int32_t ret_code;   /* 0=请求已提交 (实际清在 RT 异步), -1=轴未就绪 */
+} SmcClearAlarmRes;
+
+/* SMC_EVENT_SUBSCRIBE: SmcReqHeader + payload{int32 freq_hz, uint64 from_seq} */
+/* SubscribeAck 与 SmcEventFrameHeader 同尺寸 16B, 便于 client 复用读缓冲 */
+typedef struct {
+    uint32_t magic;            /* SMC_EVENT_ACK_MAGIC = 0x45564E4B ("EVNK") */
+    uint32_t version;          /* SMC_EVENT_VERSION */
+    uint32_t max_per_tick;     /* server 单帧最多事件数 (= EVENT_READ_MAX=32) */
+    uint32_t event_size_bytes; /* sizeof(SmcEvent_t) = 88, client 据此分配缓冲 */
+} SmcEventAck;
+
+/* 事件帧头 (16B) + N × SmcEvent_t (88B each)
+ * CRC32 覆盖: event_count 字段 + events payload (与 preview 帧同模式) */
+typedef struct {
+    uint32_t magic;            /* SMC_EVENT_MAGIC = 0x45564E54 ("EVNT") */
+    uint32_t version;          /* SMC_EVENT_VERSION */
+    uint32_t event_count;      /* 本帧事件数 (1..EVENT_READ_MAX) */
+    uint32_t crc32;            /* CRC32(event_count + events) */
+} SmcEventFrameHeader;
 
 #pragma pack(pop)
 

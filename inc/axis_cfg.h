@@ -98,6 +98,15 @@ typedef uint16_t uint16;
 #define CMD_TYPE_MOTION  0   // 运动段（G00/G01/G02/G03）
 #define CMD_TYPE_MCODE   1   // M代码段（辅助功能）
 
+// ---- P0-b v1: TrajectorySegment_t.motion_type 字段枚举 ----
+// parser case 'G' 设置, 用于 UI 轨迹上色 + 段类型识别
+#define MOTION_TYPE_RAPID    0   // G00 快速移动
+#define MOTION_TYPE_LINEAR   1   // G01 直线插补
+#define MOTION_TYPE_ARC_CW   2   // G02 顺时针圆弧
+#define MOTION_TYPE_ARC_CCW  3   // G03 逆时针圆弧
+#define MOTION_TYPE_NURBS    4   // NURBS/B-Spline 平滑段
+#define MOTION_TYPE_OTHER    0xFF // 其他 (固定循环展开段/未知)
+
 #define MCODE_WAIT_TIMEOUT_MS  5000  // M代码等待绝对超时（ms），防止队列死锁
 
 /************************ 跟随误差监控参数 ************************/
@@ -254,6 +263,12 @@ typedef struct{
     double laser_freq_hz_rt;
     int    gas_select_rt;
 
+    // ---- P0-c: 实时光标 (RT 消费段时记录, snapshot 镜像, UI 高亮当前段) ----
+    // current_seg_id_rt: 段加载时从 seg.seg_id 拷贝 (ecat_thread_rt 段消费环).
+    //                    UI 据此在 G 代码编辑器高亮当前行 + 在轨迹上标记当前段。
+    //                    静止时 (is_moving=0) 保留上一段 id, UI 可显示"刚执行完"。
+    uint64_t current_seg_id_rt;
+
 }Interpolator_t;
 
 /*
@@ -286,6 +301,16 @@ typedef struct{
     int32_t speed;
 
     int cmd_type;       // CMD_TYPE_MOTION 或 CMD_TYPE_MCODE
+    // ---- P0-b v1: 段元数据 (UI 预览/光标用, 不参与 RT 插补决策) ----
+    // seg_id:    axis_ctrl.c 入队时 atomic fetch_add g_seg_id_counter, 全局唯一单调递增.
+    //            UI 用此 ID 做丢帧检测 (相邻段 +1) + 实时光标定位 (P0-c 用).
+    // line_no:   parser 入口设 = g_current_program->lines[g_pc].line_no (1-based 源行号).
+    //            UI G 代码编辑器据此高亮当前执行行.
+    // motion_type: parser case 'G' 设 (0=G00/1=G01/2=G02/3=G03/4=NURBS/0xFF=OTHER).
+    //              UI 用此字段给轨迹上色 (G00 灰/G01 蓝/G02-G03 绿/NURBS 紫).
+    uint64_t seg_id;
+    int32_t  line_no;
+    uint8_t  motion_type;
     int is_fillet;      // 几何锁定标识(0/1)：1=圆弧子段、G93微段、B-样条透传段。标记为1时，禁止 Planner 对其进行 G64 拐角二次抹圆篡改。
     int is_g93_strict;  // 1=G93 强一致性段: 纯匀速,planner 不得 S 曲线限幅
     int is_rtcp_active; // 1=RTCP 路径产生段(经 Kinematics_Inverse 物理逆解);

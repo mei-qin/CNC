@@ -93,7 +93,17 @@ typedef struct{
     int is_running;
     int is_paused;
     int abort_request;
+    // ---- P0-b v2: LoadProgram / RunLoadedProgram 模式 ----
+    // program_mode = PROGRAM_MODE_RUN (0): 正常执行, parser 入队 motion queue, RT 消费
+    // program_mode = PROGRAM_MODE_PREVIEW (1): LoadProgram 模式, parser 解析填 PreviewStreamer,
+    //                                          但 api_push_trajectory_impl 早返回不入 motion queue。
+    //                                          RunLoadedProgram 时切回 RUN, 同 filepath 再跑一遍。
+    // 跨线程: SMC_API 写, parser_thread 读。x86 int 写原子, 用 atomic_load(acquire) 防缓存。
+    int program_mode;
 }ParserControl_t;
+
+#define PROGRAM_MODE_RUN     0   // SMC_RunGCodeFile / SMC_RunLoadedProgram 路径
+#define PROGRAM_MODE_PREVIEW 1   // SMC_LoadProgram 路径
 
 // Function declarations for G-code parsing
 int parse_gcode_line(const char *gcode_line);

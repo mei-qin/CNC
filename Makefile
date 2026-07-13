@@ -32,9 +32,11 @@ KERNEL_SRC = $(filter-out $(SRC_PATH)/main.c, $(wildcard $(SRC_PATH)/*.c))
 KERNEL_OBJ = $(patsubst $(SRC_PATH)/%.c, $(SRC_PATH)/%.o, $(KERNEL_SRC))
 
 # ---- rpc_server (生产入口) ----
+# P0-a: 改用 wildcard 自动收集 rpc/*.c (rpc_server.c + rpc_push_server.c)
+# .cpp 文件 (SmcControllerSdk / snapshot_subscriber) 是 Windows 客户端 SDK, 不进 Linux 服务端
 RPC_TARGET = $(BIN_PATH)/rpc_server
-RPC_SRC    = $(RPC_PATH)/rpc_server.c
-RPC_OBJ    = $(RPC_PATH)/rpc_server.o
+RPC_SRC    = $(wildcard $(RPC_PATH)/*.c)
+RPC_OBJ    = $(patsubst $(RPC_PATH)/%.c, $(RPC_PATH)/%.o, $(RPC_SRC))
 
 # ---- cnc_test (测试工具) ----
 TEST_TARGET = $(BIN_PATH)/cnc_test

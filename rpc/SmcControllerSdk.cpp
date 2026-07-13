@@ -593,3 +593,49 @@ bool SmcController::RunGCodeFile(const std::string &filepath, int &out_ret_code)
 bool SmcController::PauseProcessing()  { return invokeNoRet(SMC_CMD_PAUSE_PROCESSING); }
 bool SmcController::ResumeProcessing() { return invokeNoRet(SMC_CMD_RESUME_PROCESSING); }
 bool SmcController::AbortProcessing()  { return invokeNoRet(SMC_CMD_ABORT_PROCESSING); }
+
+/* ============================================================
+ * P0-b v2: LoadProgram / RunLoadedProgram / GetProgramStructure
+ * ============================================================ */
+bool SmcController::LoadProgram(const std::string &filepath, int &out_ret_code)
+{
+    /* 与 RunGCodeFile 同套 WSL2 路径转换 */
+    std::string linux_path = TranslatePathForWSL(filepath);
+    if (linux_path.size() >= SMC_FILEPATH_MAX_LEN) {
+        last_err_ = SMC_ERR_PARAM;
+        return false;
+    }
+    SmcLoadProgramReq req;
+    std::memset(&req, 0, sizeof(req));
+    std::strncpy(req.filepath, linux_path.c_str(), SMC_FILEPATH_MAX_LEN - 1);
+    return invokeIntRet(SMC_CMD_LOAD_PROGRAM, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::RunLoadedProgram(int &out_ret_code)
+{
+    return invokeIntRet(SMC_CMD_RUN_LOADED_PROGRAM, out_ret_code);
+}
+
+bool SmcController::GetProgramStructure(SmcGetProgramStructureRes &out)
+{
+    /* 无 Req, Res 直接拷到 out (~390B)。先 send 再 recv, 与 invokeIntRet 同模式。 */
+    std::lock_guard<std::mutex> lock(comm_mutex_);
+    if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
+    if (!sendRequest(SMC_CMD_GET_PROGRAM_STRUCTURE, nullptr, 0)) return false;
+
+    int32_t  err = 0;
+    uint32_t len = 0;
+    if (!recvResponse(err, &out, sizeof(out), len)) return false;
+    if (err != SMC_OK) { last_err_ = err; return false; }
+    if (len < sizeof(out)) { last_err_ = SMC_ERR_INTERNAL; return false; }
+    return true;
+}
+
+/* ============================================================
+ * P1-b: ClearAlarm
+ * ============================================================ */
+bool SmcController::ClearAlarm(int &out_ret_code)
+{
+    /* 无 Req, Res = SmcClearAlarmRes (仅 int32_t ret_code) */
+    return invokeIntRet(SMC_CMD_CLEAR_ALARM, out_ret_code);
+}

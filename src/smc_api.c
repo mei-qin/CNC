@@ -7,10 +7,13 @@
 #include "bspline_engine.h"
 #include "trace_logger.h"
 #include "sim_drive.h"
+#include "preview_streamer.h"   /* P0-b v2: PreviewStreamer_GetWriteSeq */
+#include "event_logger.h"       /* P1-b: EventLogger_Push */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <ctype.h>
+#include <string.h>
 
 // 底层轴房间号自动分配计数器
 static int g_allocated_axis_count = 0;
@@ -445,7 +448,11 @@ int SMC_RunGCodeFile(const char *filepath) {
     return 0;
 }
 
-void SMC_AbortProcessing() { g_parser_ctrl.abort_request = 1; }
+void SMC_AbortProcessing() {
+    g_parser_ctrl.abort_request = 1;
+    EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x0034, 0,
+                     "program abort requested by UI");
+}
 
 void SMC_PauseProcessing(){
     g_parser_ctrl.is_paused = 1;
@@ -455,6 +462,95 @@ void SMC_PauseProcessing(){
 void SMC_ResumeProcessing(){
     g_parser_ctrl.is_paused = 0;
     api_motion_resume();
+}
+
+// ================== P0-b v2: LoadProgram / RunLoadedProgram ==================
+int SMC_LoadProgram(const char *filepath) {
+    if (filepath == NULL || filepath[0] == '\0') return -2;
+    if (g_parser_ctrl.is_running) return -1;
+
+    strncpy(g_parser_ctrl.filepath, filepath, sizeof(g_parser_ctrl.filepath) - 1);
+    g_parser_ctrl.filepath[sizeof(g_parser_ctrl.filepath) - 1] = '\0';
+    g_parser_ctrl.abort_request = 0;
+    g_parser_ctrl.is_paused = 0;
+    g_parser_ctrl.program_mode = PROGRAM_MODE_PREVIEW;   // P0-b v2: preview 模式
+    g_parser_ctrl.is_running = 1;                         // 触发 parser_thread
+    return 0;
+}
+
+int SMC_RunLoadedProgram(void) {
+    if (g_parser_ctrl.is_running) return -2;
+    if (!atomic_load_explicit(&g_program_load_done, memory_order_acquire)) return -1;
+    if (g_parser_ctrl.filepath[0] == '\0') return -2;
+
+    // 切回 RUN 模式, 同 filepath 再跑一遍
+    g_parser_ctrl.program_mode = PROGRAM_MODE_RUN;
+    atomic_store_explicit(&g_program_load_done, 0, memory_order_release);
+    g_parser_ctrl.abort_request = 0;
+    g_parser_ctrl.is_paused = 0;
+    g_parser_ctrl.is_running = 1;
+    return 0;
+}
+
+int SMC_GetProgramStructure(SmcGetProgramStructureRes *out) {
+    if (out == NULL) return -1;
+    memset(out, 0, sizeof(*out));
+
+    int is_running = g_parser_ctrl.is_running;
+    int load_done = atomic_load_explicit(&g_program_load_done, memory_order_acquire);
+    uint64_t total_segs = PreviewStreamer_GetWriteSeq();
+
+    // 状态判定 (UI 据此显示 "未加载/loading/loaded/running/done")
+    if (is_running && g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW) {
+        out->is_loaded = 4;   // loading preview
+    } else if (is_running && g_parser_ctrl.program_mode == PROGRAM_MODE_RUN) {
+        out->is_loaded = 2;   // running
+    } else if (load_done) {
+        out->is_loaded = 1;   // loaded (待 run)
+    } else if (total_segs > 0) {
+        out->is_loaded = 3;   // done (run 完成)
+    } else {
+        out->is_loaded = 0;   // 未加载
+    }
+
+    // 文件路径
+    strncpy(out->filepath, g_parser_ctrl.filepath, SMC_FILEPATH_MAX_LEN - 1);
+
+    // 元数据 (parser 完成时 g_current_program 已 free, 从 cache 全局读)
+    out->total_lines   = g_program_total_lines;
+    out->num_o_labels   = g_program_num_o_labels;
+    out->num_n_labels   = g_program_num_n_labels;
+    out->total_segments = (int32_t)total_segs;
+    out->first_seg_id   = g_program_first_seg_id;
+    out->last_seg_id    = g_program_last_seg_id;
+    out->estimated_time_ms = g_program_total_time_ms;
+    for (int i = 0; i < AXIS_NUM; i++) {
+        out->bbox_min[i] = g_program_bbox_min[i];
+        out->bbox_max[i] = g_program_bbox_max[i];
+    }
+
+    out->ret_code = (total_segs > 0 || load_done) ? 0 : -1;
+    return 0;
+}
+
+// ================== P1-b: ClearAlarm ==================
+int SMC_ClearAlarm(void) {
+    /* 安全闸: parser 正在跑时拒绝清 alarm, 防 RT 清队列时撞刀。
+     * 用户应先 AbortProcessing 停程序, 再 ClearAlarm。 */
+    if (g_parser_ctrl.is_running) {
+        EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0040, -1,
+                         "ClearAlarm rejected: parser running, AbortProcessing first");
+        return -1;
+    }
+    if (!g_all_axis_op_ready) {
+        EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0040, -2,
+                         "ClearAlarm rejected: axes not op-ready");
+        return -2;
+    }
+    EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0040, 0,
+                     "ClearAlarm requested by UI");
+    api_alarm_reset();   /* axis_ctrl.c:756, 设 alarm_reset_request 让 RT 异步清 */
+    return 0;
 }
 
 // ================== 仿真驱动器 API (仅 sim 模式) ==================

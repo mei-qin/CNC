@@ -5,6 +5,7 @@
 #include "bspline_engine.h"
 #include "macro_eval.h"   // 宏变量与表达式引擎
 #include "program_loader.h"  // Phase 2B M1: 文件加载器 + N 标签 + GOTO
+#include "event_logger.h"    // P1-b: 参数校验报警 + 程序生命周期
 #include <math.h>
 #include <stdatomic.h>    // atomic_store_explicit (M3 S 值保护报警)
 #define PI 3.14159265358979323846
@@ -474,6 +475,11 @@ int parse_gcode_line(const char *gcode_line)
     double g65_args[27]     = {0};
     int    g65_args_set[27] = {0};
 
+    // P0-b v1: 设置当前源行号 (axis_ctrl api_push_trajectory_impl 读此填 seg->line_no)
+    // parser_thread 单写者, 无竞争。g_pc 可能因跳转指令变化, 每行入口刷新。
+    g_current_line_no = g_current_program ?
+                        g_current_program->lines[g_pc].line_no : -1;
+
     char *p=buffer;
     while(*p!='\0'){
         p=(char*)skip_spaces(p);
@@ -785,10 +791,10 @@ int parse_gcode_line(const char *gcode_line)
 
         switch(letter){
             case 'G':
-                if(value==0.0)      g_state.motion_mode=0; // G00 快速
-                else if(value==1.0) g_state.motion_mode=1; // G01 直线
-                else if(value==2.0) g_state.motion_mode=2; // G02 顺弧
-                else if(value==3.0) g_state.motion_mode=3; // G03 逆弧
+                if(value==0.0)      { g_state.motion_mode=0; g_current_motion_type = MOTION_TYPE_RAPID; }   // G00 快速
+                else if(value==1.0) { g_state.motion_mode=1; g_current_motion_type = MOTION_TYPE_LINEAR; } // G01 直线
+                else if(value==2.0) { g_state.motion_mode=2; g_current_motion_type = MOTION_TYPE_ARC_CW; }  // G02 顺弧
+                else if(value==3.0) { g_state.motion_mode=3; g_current_motion_type = MOTION_TYPE_ARC_CCW; } // G03 逆弧
                 else if(value==4.0) { is_non_motion_g=1; is_g04_block=1; }    // G04 暂停
                 else if(value==10.0) is_non_motion_g=1;    // G10 数据设定
                 else if(value==17.0) g_state.active_plane=17;
@@ -1059,31 +1065,14 @@ int parse_gcode_line(const char *gcode_line)
                 }
                 // P0-3: M3/M4 S 值保护 — 拒绝 spindle_rpm<=0 的主轴启动
                 // 后果场景: 操作员忘写 S, M3 入队后 RT 等 2 秒主轴"启动"(实际没转),
-                //           后续 G1 加工撞刀。修复: 拒绝入队 + 报警 + 不翻模态
-                // 行为: 不返回 -1 中止文件, 让操作员改 S 值后 cycle start 继续
-                //       (alarm_state=1 会让后续 api_push_trajectory 也被拒, 自然 stall)
+                //           后续 G1 加工撞刀。
+                // ⚠ 本分支原在此处立即检查 rpm, 但 "M3 S1000" 同行时 case 'S' 在
+                //   case 'M' 之后解析, g_state.spindle_rpm 还是旧值 (0), 误报 ALARM.
+                //   修复: 实际 rpm 检查 + modal 更新延迟到字母循环结束后统一处理
+                //   (见本函数末尾 "M3/M4 deferred" 块). 此处仅保留 else-if 占位
+                //   保证链完整, m_code 保持 3/4 不变.
                 else if(m_code == 3 || m_code == 4){
-                    if (g_state.spindle_rpm <= 0.0) {
-                        int src_line = g_current_program ?
-                                       g_current_program->lines[g_pc].line_no : -1;
-                        printf("[Parser][ALARM] M%d 拒绝入队: spindle_rpm=%.2f <= 0 "
-                               "(源行 %d, 请先 S<rpm>)\n",
-                               m_code, g_state.spindle_rpm, src_line);
-                        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
-                        // 不更新 spindle_mode, 不入队
-                        m_code = -1;
-                    } else {
-                        g_state.spindle_mode = (m_code == 3) ? 1 : 2;   // CW / CCW
-                        // P0-Laser: 激光模式 (do_slave_id >= 0) 下 M3 联动激光闸 ON
-                        // 复用 spindle_mode 作为激光使能镜像 (aux_laser_enable 派生自此)
-                        if (g_laser_cfg.do_slave_id >= 0) {
-                            g_state.laser_shutter_pending = 1;
-                            // M67 未显式设置功率时, 用 S 值做默认功率 (激光器常见写法)
-                            if (g_state.laser_power_pending <= 0.0) {
-                                g_state.laser_power_pending = g_state.spindle_rpm;
-                            }
-                        }
-                    }
+                    // deferred — 见 post-letter-loop 处理
                 }
                 else if(m_code == 5){
                     g_state.spindle_mode = 0;
@@ -1193,6 +1182,9 @@ int parse_gcode_line(const char *gcode_line)
                                e_value, g_laser_cfg.power_max_w, src_line);
                         atomic_store_explicit(&g_sys_alarm_state, 1,
                                               memory_order_release);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0021,
+                                         (int32_t)(e_value * 1000),
+                                         "M67 laser power out of range");
                         m_code = -1;
                     } else {
                         g_state.laser_power_pending = e_value;
@@ -1205,6 +1197,9 @@ int parse_gcode_line(const char *gcode_line)
                                e_value, g_laser_cfg.freq_max_hz, src_line);
                         atomic_store_explicit(&g_sys_alarm_state, 1,
                                               memory_order_release);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0021,
+                                         (int32_t)(e_value),
+                                         "M68 laser freq out of range");
                         m_code = -1;
                     } else {
                         g_state.laser_freq_pending = e_value;
@@ -1378,6 +1373,8 @@ int parse_gcode_line(const char *gcode_line)
             printf("[Parser][ALARM] G04 P=%.2f 不能为负, 源行 %d\n",
                    g04_dwell_ms, src_line);
             atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0022,
+                             (int32_t)(g04_dwell_ms * 1000), "G04 dwell P value negative");
             return -1;
         }
         // 用 p_value 字段传 dwell_ms 给 api_push_mcode (无需新参数)
@@ -1387,6 +1384,37 @@ int parse_gcode_line(const char *gcode_line)
         }
         printf("[Parser] G04 dwell: %.0f ms (M64 段)\n", g04_dwell_ms);
         // G04 本行不入运动段, 后续 has_move 门控会跳过
+    }
+
+    // ---- M3/M4 spindle 启动延迟处理 (修复 "M3 S1000" 同行时序 bug) ----
+    // 原 case 'M' 内的 rpm 检查在此刻执行: 字母循环已结束, S 字母 (如有) 必然
+    // 已写入 g_state.spindle_rpm. 修复"M3 S1000"同行场景 (M 在前 S 在后).
+    // 行为对齐原 case 'M' 逻辑:
+    //   rpm<=0 → ALARM + m_code=-1 (阻止下方默认 api_push_mcode 入队)
+    //   rpm>0  → 更新 spindle_mode + P0-Laser 联动, m_code 保持 3/4 由下方默认 else 入队
+    if (m_code == 3 || m_code == 4) {
+        if (g_state.spindle_rpm <= 0.0) {
+            int src_line = g_current_program ?
+                           g_current_program->lines[g_pc].line_no : -1;
+            printf("[Parser][ALARM] M%d 拒绝入队: spindle_rpm=%.2f <= 0 "
+                   "(源行 %d, 请先 S<rpm>)\n",
+                   m_code, g_state.spindle_rpm, src_line);
+            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0020, m_code,
+                             "M3/M4 spindle_rpm<=0 (no S specified)");
+            m_code = -1;   // 阻止下方默认 api_push_mcode 入队
+        } else {
+            g_state.spindle_mode = (m_code == 3) ? 1 : 2;   // CW / CCW
+            // P0-Laser: 激光模式 (do_slave_id >= 0) 下 M3 联动激光闸 ON
+            // 复用 spindle_mode 作为激光使能镜像 (aux_laser_enable 派生自此)
+            if (g_laser_cfg.do_slave_id >= 0) {
+                g_state.laser_shutter_pending = 1;
+                // M67 未显式设置功率时, 用 S 值做默认功率 (激光器常见写法)
+                if (g_state.laser_power_pending <= 0.0) {
+                    g_state.laser_power_pending = g_state.spindle_rpm;
+                }
+            }
+        }
     }
 
     // 处理M代码：压入队列作为同步屏障
@@ -1412,6 +1440,8 @@ int parse_gcode_line(const char *gcode_line)
                 printf("[Parser][ALARM] M70 P=%.2f 越界 (0 或 1), 源行 %d\n",
                        p_value, src_line);
                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0023,
+                                 (int32_t)(p_value * 1000), "M70 coupling mode P oob");
             } else {
                 atomic_store_explicit(&g_laser_cfg.coupling_mode, (int)p_value,
                                       memory_order_release);
@@ -1436,6 +1466,8 @@ int parse_gcode_line(const char *gcode_line)
                 printf("[Parser][ALARM] M71 P=%.2f 不能为负, 源行 %d\n",
                        p_value, src_line);
                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0023,
+                                 (int32_t)(p_value * 1000), "M71 v_thresh P negative");
             } else {
                 atomic_store_explicit(&g_laser_cfg.v_thresh_mm_s, p_value,
                                       memory_order_release);
@@ -1795,7 +1827,29 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 osal_usleep(100000); // 等待所有轴准备就绪
             }
 
-            printf("[Parser] Processing file: %s\n", g_parser_ctrl.filepath);
+            printf("[Parser] Processing file: %s (mode=%s)\n", g_parser_ctrl.filepath,
+                   g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? "PREVIEW" : "RUN");
+
+            /* P1-b: 程序生命周期事件 - 解析启动 */
+            EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER,
+                             g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? 0x0030 : 0x0032,
+                             0, g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ?
+                                "LoadProgram start (preview)" : "RunLoadedProgram start");
+
+            // ---- P0-b v2: 程序级统计清零 (每次启动 parser 都清, 不论 RUN/PREVIEW) ----
+            // bbox 用 ±1e18 哨兵, 首段必然更新; 无运动段的程序保留哨兵, UI 自查。
+            // first_seg_id 用 (uint64_t)-1 哨兵, axis_ctrl preview 早返回时设实际值。
+            g_program_total_time_ms = 0.0;
+            for (int i = 0; i < AXIS_NUM; i++) {
+                g_program_bbox_min[i] = 1e18;
+                g_program_bbox_max[i] = -1e18;
+            }
+            g_program_first_seg_id = (uint64_t)-1;
+            g_program_last_seg_id = 0;
+            g_program_total_lines = 0;
+            g_program_num_o_labels = 0;
+            g_program_num_n_labels = 0;
+            atomic_store_explicit(&g_program_load_done, 0, memory_order_release);
 
             // ---- Phase 2B M1: 全文加载替代 fgets 流 ----
             // 一次性把文件读入内存, 建立 N 标签表, 供 PC 游标遍历 + GOTO 跳转
@@ -1806,6 +1860,11 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 continue;
             }
             g_current_program = prog;
+
+            // P0-b v2: cache 程序元数据 (parser 结束时 Program_Free, 这里读完就丢)
+            g_program_total_lines  = (int32_t)prog->num_lines;
+            g_program_num_o_labels = (int32_t)prog->num_o_labels;
+            g_program_num_n_labels = (int32_t)prog->num_n_labels;
 
             while(!is_trajectory_finished()){
                 osal_usleep(100000); // 等待当前轨迹执行完成，检查频率为100ms
@@ -1879,7 +1938,24 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             if(!abort_file){
                 printf("[Parser] 文件处理完成: %s (PC 步进 %d)\n",
                        g_parser_ctrl.filepath, g_pc_step_counter);
+                /* P1-b: 程序生命周期事件 - 解析完成 (M30 自然结束) */
+                EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0033, g_pc_step_counter,
+                                 "program done (M30 or EOF reached)");
             }
+
+            // ---- P0-b v2: LoadProgram (PREVIEW 模式) 完成信号 ----
+            // 设 g_program_load_done=1, UI 据此知道可调 RunLoadedProgram。
+            // program_mode 不清, 由 SMC_RunLoadedProgram 切回 RUN。
+            // RUN 模式完成时 load_done 保持 0 (它只跟踪 LoadProgram 状态)。
+            if (g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW) {
+                atomic_store_explicit(&g_program_load_done, 1, memory_order_release);
+                printf("[Parser] LoadProgram 完成: first_seg=%llu last_seg=%llu bbox_min=(%.2f,%.2f,%.2f) bbox_max=(%.2f,%.2f,%.2f)\n",
+                       (unsigned long long)g_program_first_seg_id,
+                       (unsigned long long)g_program_last_seg_id,
+                       g_program_bbox_min[0], g_program_bbox_min[1], g_program_bbox_min[2],
+                       g_program_bbox_max[0], g_program_bbox_max[1], g_program_bbox_max[2]);
+            }
+
             g_parser_ctrl.is_running=0; // 处理完成后重置状态
             g_parser_ctrl.abort_request=0; // 重置中止请求
         }

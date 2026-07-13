@@ -2,7 +2,8 @@
 #define SMC_API_H
 
 #include <stdint.h>
-#include "laser_ctrl.h"   // LaserCouplePoint_t (SMC_ConfigLaserCoupleTable 参数)
+#include "laser_ctrl.h"      // LaserCouplePoint_t (SMC_ConfigLaserCoupleTable 参数)
+#include "smc_protocol.h"    // SmcGetProgramStructureRes (P0-b v2)
 
 #ifdef __cplusplus
 extern "C" {
@@ -110,6 +111,38 @@ void SMC_ResumeProcessing(void);
 
 // 紧急中止 (Abort)
 void SMC_AbortProcessing(void);
+
+// =======================================================
+// P0-b v2: LoadProgram / RunLoadedProgram 分离 API
+// =======================================================
+// 典型流程: LoadProgram (preview) → GetProgramStructure → 操作员检查 → RunLoadedProgram
+//
+// 加载程序到 preview cache (parser 跑完但不进 motion queue, RT 不消费)
+// 调用后 parser_thread 异步跑, g_program_load_done=1 时表示完成
+// filepath: G 代码绝对路径 (Linux 格式, Windows 端通过 SDK 的 TranslatePathForWSL 转换)
+// 返回: 0=已启动, -1=parser 正忙 (is_running=1), -2=filepath 空或越界
+int SMC_LoadProgram(const char *filepath);
+
+// 执行已加载的程序 (LoadProgram 必须先完成, g_program_load_done=1)
+// 内部重新解析同一 filepath, 这次进 motion queue, RT 实际执行
+// 返回: 0=已启动, -1=LoadProgram 未完成或已 running, -2=filepath 为空
+int SMC_RunLoadedProgram(void);
+
+// 查询当前程序结构元数据
+//   未加载时 ret_code=-1, 其他字段为零/哨兵值
+//   load 完成 (g_program_load_done=1) 后所有字段有效
+//   run 进行中 estimated_time_ms 可能不准 (T_total 边解析边累加)
+// 返回: 0=成功 (即使未加载也返回 0, 通过 ret_code 字段区分), -1=out 为空
+int SMC_GetProgramStructure(SmcGetProgramStructureRes *out);
+
+// =======================================================
+// P1-b: ClearAlarm (清除系统报警)
+// =======================================================
+// 触发 RT alarm_reset_request, RT 在安全点 (queue 空 + 驱动就绪) 时实际清。
+// 异步语义: 调用立即返回, RT 清完通过 event stream (code 0x0041) 通知 UI。
+// 注意: 若 parser 正在跑 (is_running=1) 拒绝, 要求先 AbortProcessing (防撞刀)。
+// 返回: 0=请求已提交, -1=parser 正在跑 (先 AbortProcessing), -2=轴未就绪
+int SMC_ClearAlarm(void);
 
 // 配置轴的脉冲/单位 (例如 脉冲/mm 或 脉冲/度)，用于位置/速度换算
 void SMC_ConfigPulsePerUnit(char axis_letter, double pulse_per_unit);

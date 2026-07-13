@@ -31,10 +31,17 @@
 #include "global_def.h"
 #include "kinematics.h"
 #include "macro_eval.h"
+#include "snapshot_hub.h"      /* P0-a: SnapshotHub_Init */
+#include "rpc_push_server.h"   /* P0-a: rpc_push_server_start */
+#include "preview_streamer.h"  /* P0-b v1: PreviewStreamer_Init */
+#include "rpc_preview_server.h" /* P0-b v1: rpc_preview_server_start */
+#include "event_logger.h"      /* P1-b: EventLogger_Init */
+#include "rpc_event_server.h"  /* P1-b: rpc_event_server_start */
 
 #define SMC_RPC_PORT      9527
 #define SMC_RPC_BACKLOG   8
-#define SMC_RESP_BUF_LEN  256    /* 单包响应 payload 缓冲, 所有 Res 都 < 此值 */
+/* P0-b v2: 扩到 512 容纳 SmcGetProgramStructureRes (~390B, filepath[256] + bbox×2) */
+#define SMC_RESP_BUF_LEN  512    /* 单包响应 payload 缓冲, 所有 Res 都 < 此值 */
 
 /* ---------------------------------------------------------------------
  * recv_all / send_all  —— TCP 粘包/半包/截断的根本治理
@@ -455,6 +462,50 @@ static int handle_client_request(int client_fd)
         break;
     }
 
+    /* ===== P0-b v2: LoadProgram / RunLoadedProgram / GetProgramStructure ===== */
+    case SMC_CMD_LOAD_PROGRAM: {
+        if (req_hdr.data_len < sizeof(SmcLoadProgramReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcLoadProgramReq *req = (SmcLoadProgramReq *)payload;
+        req->filepath[SMC_FILEPATH_MAX_LEN - 1] = '\0';
+        printf("[rpc] LoadProgram (preview): %s\n", req->filepath);
+        SmcLoadProgramRes *res = (SmcLoadProgramRes *)resp_buf;
+        res->ret_code = SMC_LoadProgram(req->filepath);
+        printf("[rpc] LoadProgram: 返回码=%d\n", res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcLoadProgramRes);
+        break;
+    }
+    case SMC_CMD_RUN_LOADED_PROGRAM: {
+        printf("[rpc] RunLoadedProgram\n");
+        SmcRunLoadedProgramRes *res = (SmcRunLoadedProgramRes *)resp_buf;
+        res->ret_code = SMC_RunLoadedProgram();
+        printf("[rpc] RunLoadedProgram: 返回码=%d\n", res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcRunLoadedProgramRes);
+        break;
+    }
+    case SMC_CMD_GET_PROGRAM_STRUCTURE: {
+        /* 无 Req, Res = SmcGetProgramStructureRes (~390B < SMC_RESP_BUF_LEN=512) */
+        SmcGetProgramStructureRes *res = (SmcGetProgramStructureRes *)resp_buf;
+        SMC_GetProgramStructure(res);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetProgramStructureRes);
+        break;
+    }
+    case SMC_CMD_CLEAR_ALARM: {
+        /* P1-b: 无 Req, Res = SmcClearAlarmRes */
+        printf("[rpc] ClearAlarm\n");
+        SmcClearAlarmRes *res = (SmcClearAlarmRes *)resp_buf;
+        res->ret_code = SMC_ClearAlarm();
+        printf("[rpc] ClearAlarm: 返回码=%d (0=ok, -1=parser busy, -2=axes not ready)\n",
+               res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcClearAlarmRes);
+        break;
+    }
+
     default:
         /* 未知命令: 仍回响应头让客户端可继续下一轮 */
         res_hdr.err_code = SMC_ERR_UNKNOWN_CMD;
@@ -496,6 +547,15 @@ static int kernel_init(const char *iface)
     /* 1. 系统底层内存与互斥锁初始化 */
     axis_sys_init();
     Macro_Init();
+
+    /* P0-a: 状态快照中心初始化 (RT 线程启动前必须就绪, 否则首次 Publish 读未初始化字段) */
+    SnapshotHub_Init();
+
+    /* P0-b v1: 段流推送中心初始化 (parser 启动前必须就绪, 否则首次 Push 写未初始化 ring) */
+    PreviewStreamer_Init();
+
+    /* P1-b: 事件/报警流推送中心初始化 */
+    EventLogger_Init();
 
     /* 2. 默认轴拓扑 — MoveControl 启动后通过 RPC 覆盖 */
     SMC_ConfigAxisTopology("X", 0, 5, 0);
@@ -595,6 +655,21 @@ int main(int argc, char *argv[])
         perror("[rpc] listen"); close(listen_fd); return 1;
     }
     printf("[rpc] listening on 0.0.0.0:%d ...\n", SMC_RPC_PORT);
+
+    /* P0-a: 启动状态推送通道 (9528, 独立线程, 多客户端)。失败不 fatal, 仅 9527 RPC 可用 */
+    if (rpc_push_server_start() < 0) {
+        fprintf(stderr, "[push] 推送通道启动失败, 仅 RPC 9527 可用\n");
+    }
+
+    /* P0-b v1: 启动段流推送通道 (9529, 独立线程, 多客户端)。失败不 fatal */
+    if (rpc_preview_server_start() < 0) {
+        fprintf(stderr, "[preview] 段流通道启动失败, 仅 RPC 9527 + push 9528 可用\n");
+    }
+
+    /* P1-b: 启动事件流推送通道 (9530, 独立线程, 多客户端)。失败不 fatal */
+    if (rpc_event_server_start() < 0) {
+        fprintf(stderr, "[event] 事件流通道启动失败, 仅 RPC + push + preview 可用\n");
+    }
 
     /* 接受连接主循环 */
     for (;;) {
