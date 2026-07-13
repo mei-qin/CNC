@@ -25,6 +25,12 @@
 /cnc_test
 /rpc_server
 
+# ==== 本地文档 (个人参考, 不入团队仓库) ====
+# P1b_EventLogger_Verification_Report.md 已在 commit 3b1ec16 入库, 不忽略
+/docs/INTEGRATION_GUIDE.md
+/docs/PROTOCOL_SPEC.md
+/docs/EVENT_CODES.md
+
 # ==== 临时调试脚本 (Ad-hoc Debug Scripts) ====
 # 一次性验证用, 不入团队仓库 (按需保留个人正式脚本)
 /scripts/run_*.sh
