@@ -334,6 +334,7 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
                                                    memory_order_relaxed);
         pv_seg.line_no = g_current_line_no;
         pv_seg.motion_type = g_current_motion_type;
+        pv_seg.seg_flags = g_state.laser_seg_flags;   // Laser B4: 引线/微连接段标记
 
         // 3. 推 PreviewStreamer (9529 client 收)
         PreviewStreamer_Push(&pv_seg);
@@ -580,6 +581,7 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->seg_id = atomic_fetch_add_explicit(&g_seg_id_counter, 1, memory_order_relaxed);
     seg->line_no = g_current_line_no;
     seg->motion_type = g_current_motion_type;
+    seg->seg_flags = g_state.laser_seg_flags;   // Laser B4: 引线/微连接段标记
     PreviewStreamer_Push(seg);
 
     // relaxed 推进 write_head: 由 spinlock release 统一建立可见性。

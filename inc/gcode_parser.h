@@ -86,6 +86,12 @@ typedef struct {
     // G54-G59 任意一切换会清零此字段; 反之 G54.1 Pn 激活时 modal_wcs 字段被忽略
     // 数据存储: g_coord_mgr.work_offsets_ext[48][AXIS_NUM], 由 #7001-#7948 写入
     int    modal_ext_wcs_p;
+
+    // ---- Laser Phase B4: 段级工艺标记 modal (SEG_FLAG_* 位图) ----
+    // M72/M73 包裹期间 OR SEG_FLAG_LEAD_IN; M74/M75 包裹期间 OR SEG_FLAG_MICRO_JOINT.
+    // 入队时快照到 TrajectorySegment_t.seg_flags, UI 据此区分引线/微连接段.
+    // M30/M2 程序结束自动清零 (跟其他 modal 字段一致), 防止跨程序泄漏.
+    uint8_t laser_seg_flags;
 } GCodeState_t;
 
 typedef struct{

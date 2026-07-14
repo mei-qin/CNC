@@ -107,6 +107,15 @@ typedef uint16_t uint16;
 #define MOTION_TYPE_NURBS    4   // NURBS/B-Spline 平滑段
 #define MOTION_TYPE_OTHER    0xFF // 其他 (固定循环展开段/未知)
 
+// ---- Laser Phase B4: TrajectorySegment_t.seg_flags 字段 bit 定义 ----
+// parser case 'M' M72-M75 modal 设置, 用于 UI 区分引线/微连接段
+//   M72/M73 包裹的段 → SEG_FLAG_LEAD_IN 置位
+//   M74/M75 包裹的段 → SEG_FLAG_MICRO_JOINT 置位
+// 两者可叠加 (M72 后又 M74, 段 flags = LEAD_IN|MICRO_JOINT)
+// bit2-7 保留 (未来 pierce / over-burn / tab 等)
+#define SEG_FLAG_LEAD_IN     0x01   // bit0: 引线段 (CAM 输出, UI 虚线橙)
+#define SEG_FLAG_MICRO_JOINT 0x02   // bit1: 微连接段 (CAM 输出, UI 虚线紫)
+
 #define MCODE_WAIT_TIMEOUT_MS  5000  // M代码等待绝对超时（ms），防止队列死锁
 
 /************************ 跟随误差监控参数 ************************/
@@ -308,9 +317,13 @@ typedef struct{
     //            UI G 代码编辑器据此高亮当前执行行.
     // motion_type: parser case 'G' 设 (0=G00/1=G01/2=G02/3=G03/4=NURBS/0xFF=OTHER).
     //              UI 用此字段给轨迹上色 (G00 灰/G01 蓝/G02-G03 绿/NURBS 紫).
+    // seg_flags: Laser B4 段级工艺标记 (SEG_FLAG_LEAD_IN/MICRO_JOINT), parser M72-M75 modal.
+    //            UI 据此区分引线/微连接段 (虚线渲染), 不影响 RT 插补/激光功率.
+    //            注: 加此 1B 字段复用 motion_type 后的 padding, 结构体总大小不变.
     uint64_t seg_id;
     int32_t  line_no;
     uint8_t  motion_type;
+    uint8_t  seg_flags;
     int is_fillet;      // 几何锁定标识(0/1)：1=圆弧子段、G93微段、B-样条透传段。标记为1时，禁止 Planner 对其进行 G64 拐角二次抹圆篡改。
     int is_g93_strict;  // 1=G93 强一致性段: 纯匀速,planner 不得 S 曲线限幅
     int is_rtcp_active; // 1=RTCP 路径产生段(经 Kinematics_Inverse 物理逆解);

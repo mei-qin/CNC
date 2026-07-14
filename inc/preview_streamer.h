@@ -44,7 +44,7 @@ extern "C" {
 /* ---- 帧标识 (与 SmcPreviewFrameHeader.magic 一致) ---- */
 #define SMC_PREVIEW_MAGIC       0x53524556u   /* "PREV" little-endian */
 #define SMC_PREVIEW_ACK_MAGIC   0x50524146u   /* "PRAK" - Preview Ack */
-#define SMC_PREVIEW_VERSION     1u
+#define SMC_PREVIEW_VERSION     2u   /* v2: TrajectorySegment_t 加 seg_flags (Laser B4, 2026-07-14). 结构体大小不变 560B (复用 motion_type 后 padding), 字段布局变, 旧 client fail-fast. */
 
 /* =====================================================================
  *  API

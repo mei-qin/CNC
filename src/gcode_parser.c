@@ -1032,6 +1032,8 @@ int parse_gcode_line(const char *gcode_line)
                     g_state.laser_power_pending   = 0.0;
                     g_state.laser_freq_pending    = 0.0;
                     g_state.gas_select            = 0;
+                    // Laser B4: 清段级工艺标记 modal (防跨程序泄漏)
+                    g_state.laser_seg_flags       = 0;
 
                     // Step 4: 抢写 RT 镜像, HMI 立即可见 spindle/coolant/laser 已停
                     g_interpolator.spindle_mode_rt  = 0;
@@ -1130,10 +1132,22 @@ int parse_gcode_line(const char *gcode_line)
                         // M67/M68 的 e_value 检查延迟到 case 'E' (字母循环内 E 在 M 后解析).
                         // 这里不做事, m_code 保持原值, 等待字母循环到 E 时设置 pending.
                         // 若本行无 E 字母 (单独 M67), pending 保持上一次值 (Fanuc 模态语义).
-                    } else if(m_code == 10){ g_state.gas_select = 1; }  // N2
+                    }
+                    else if(m_code == 10){ g_state.gas_select = 1; }  // N2
                     else if(m_code == 11){ g_state.gas_select = 2; }    // O2
                     else if(m_code == 12){ g_state.gas_select = 3; }    // Air
                 }
+                // ---- Laser Phase B4: 引线/微连接段标记 (modal, M72-M75) ----
+                // @Context: M72-M75 是 CAM 段级工艺标记, 不依赖激光硬件配置 (do_slave_id).
+                //   仅切换 g_state.laser_seg_flags 位, 入队时快照到 seg_flags.
+                //   M72/M73 = lead-in start/end; M74/M75 = micro-joint start/end.
+                //   M30/M2 程序结束统一清零 (见 M30 modal 重置块).
+                // @Danger: 原实现将 M72-M75 误嵌套在 M62-12 条件块内部, 导致永不执行 (已修复).
+                // @Thread-Safety: parser 单线程写, axis_ctrl 入队时原子读快照.
+                else if(m_code == 72){ g_state.laser_seg_flags |= SEG_FLAG_LEAD_IN;   m_code = -1; }
+                else if(m_code == 73){ g_state.laser_seg_flags &= ~SEG_FLAG_LEAD_IN;  m_code = -1; }
+                else if(m_code == 74){ g_state.laser_seg_flags |= SEG_FLAG_MICRO_JOINT; m_code = -1; }
+                else if(m_code == 75){ g_state.laser_seg_flags &= ~SEG_FLAG_MICRO_JOINT; m_code = -1; }
                 // ============ P0-Laser 结束 ============
                 break;
             case 'D':

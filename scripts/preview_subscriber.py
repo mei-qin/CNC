@@ -31,7 +31,7 @@ import signal
 # ---- 协议常量 ----
 PREV_MAGIC       = 0x53524556   # "PREV"
 PREV_ACK_MAGIC   = 0x50524146   # "PRAK"
-PREV_VERSION     = 1
+PREV_VERSION     = 2          # v2: TrajectorySegment_t 加 seg_flags (Laser B4)
 SMC_CMD_PREVIEW_SUBSCRIBE = 0x002B
 
 # SmcReqHeader: uint16 cmd_type + uint16 data_len
@@ -58,7 +58,8 @@ SEG_FMT = "@" + "".join([
     "Q",      # seg_id (8B align)            56-63
     "i",      # line_no                      64-67
     "B",      # motion_type                  68
-              # pad 3B                       69-71
+    "B",      # seg_flags (Laser B4)         69
+              # pad 2B                       70-71
     "i",      # is_fillet                    72-75
     "i",      # is_g93_strict                76-79
     "i",      # is_rtcp_active               80-83
@@ -103,7 +104,7 @@ SEG_SIZE = struct.calcsize(SEG_FMT)
 # 字段名 (与 SEG_FMT 顺序一致; 数组字段保留为 tuple)
 SEG_FIELDS = [
     "target_pos", "is_ready", "speed", "cmd_type",
-    "seg_id", "line_no", "motion_type",
+    "seg_id", "line_no", "motion_type", "seg_flags",
     "is_fillet", "is_g93_strict", "is_rtcp_active", "active_wcs",
     "wcs_offset_snap",
     "m_code", "s_value", "p_value", "q_value", "r_value",
@@ -281,9 +282,15 @@ def main():
             if seg["cmd_type"] == CMD_TYPE_MOTION:
                 tp = seg["target_pos"]
                 mt = MOTION_NAMES.get(seg["motion_type"], f"?{seg['motion_type']}")
+                # Laser B4: seg_flags 渲染 (L=lead-in, J=micro-joint)
+                flags_str = ""
+                if seg["seg_flags"] & 0x01: flags_str += "L"
+                if seg["seg_flags"] & 0x02: flags_str += "J"
+                flags_field = f" flags={flags_str:<2}" if flags_str else " flags=  "
                 print(
                     f"seg_id={seg['seg_id']:>6} line={seg['line_no']:>4} "
-                    f"{mt:<6} target=({tp[0]:+8.2f},{tp[1]:+8.2f},{tp[2]:+8.2f},"
+                    f"{mt:<6}{flags_field} "
+                    f"target=({tp[0]:+8.2f},{tp[1]:+8.2f},{tp[2]:+8.2f},"
                     f"{tp[3]:+6.2f},{tp[4]:+6.2f}) "
                     f"v_max={seg['v_max']:.1f}mm/s "
                     f"wcs={seg['active_wcs']} rtcp={seg['is_rtcp_active']}",
