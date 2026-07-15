@@ -38,6 +38,9 @@
 /scripts/debug_*
 /scripts/inspect_nc.sh
 /scripts/sim_test_client.py
+/scripts/test_laser_*.py
+/scripts/verify_laser_*.py
+/scripts/analyze_laser_*.py
 
 # ==== 本地测试用例 (Local Test Fixtures) ====
 # G 代码测试文件 + 验证脚本均为本地验证产物, 不入团队仓库
