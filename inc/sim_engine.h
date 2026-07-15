@@ -57,6 +57,11 @@ typedef struct {
     // laser_v_actual_mm_s: 当前周期瞬时速度 (mm/s), 验证 P-v 耦合曲线
     //                       对比 v_target 列可看 S 曲线 phase + 耦合比
     double   laser_v_actual_mm_s;         // RT 写, g_laser_rt.v_actual_mm_s
+    // ---- P0-Laser-Q: 状态查询闭环 CSV 追踪 (验证 pierce_count/laser_on_time/seg_flags/is_piercing) ----
+    int32_t  pierce_count;                // 累计穿孔次数 (M64 段完成 ++, 跨程序不清零)
+    int64_t  laser_on_time_ms;            // 累计激光开启时间 ms (enable&&shutter&&!ekill 时累加)
+    uint8_t  current_seg_flags;           // 当前段工艺标记 (bit0=lead_in, bit1=micro_joint)
+    int      is_piercing;                 // 是否在 G04 穿孔 dwell 中 (派生: is_waiting_mcode && current_mcode==64)
 } sim_trace_record_t;
 
 // 二进制文件头 (固定 512 bytes, record_count 在关闭时回填)
@@ -149,7 +154,11 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int gas_select,
                                      int laser_emergency_kill,
                                      uint16_t laser_interlock,
-                                     double laser_v_actual_mm_s);
+                                     double laser_v_actual_mm_s,
+                                     int32_t pierce_count,
+                                     int64_t laser_on_time_ms,
+                                     uint8_t current_seg_flags,
+                                     int is_piercing);
 
 // ================== inline 实现 ==================
 
@@ -170,7 +179,11 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int gas_select,
                                      int laser_emergency_kill,
                                      uint16_t laser_interlock,
-                                     double laser_v_actual_mm_s)
+                                     double laser_v_actual_mm_s,
+                                     int32_t pierce_count,
+                                     int64_t laser_on_time_ms,
+                                     uint8_t current_seg_flags,
+                                     int is_piercing)
 {
     sim_logger_t *L = &g_sim_logger;
     int idx = atomic_load_explicit(&L->active_idx, memory_order_relaxed);
@@ -213,6 +226,11 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
     r->laser_emergency_kill = laser_emergency_kill;
     r->laser_interlock      = laser_interlock;
     r->laser_v_actual_mm_s  = laser_v_actual_mm_s;
+    // P0-Laser-Q: 状态查询闭环 4 字段 (从 g_laser_rt / g_interpolator 读, 调用方传入)
+    r->pierce_count         = pierce_count;
+    r->laser_on_time_ms     = laser_on_time_ms;
+    r->current_seg_flags    = current_seg_flags;
+    r->is_piercing          = is_piercing;
 
     atomic_store_explicit(&L->counts[idx], count + 1, memory_order_release);
     atomic_fetch_add_explicit(&L->total_records, 1, memory_order_relaxed);

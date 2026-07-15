@@ -524,6 +524,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_interpolator.laser_power_w_rt = seg.aux_laser_power_w;
                         g_interpolator.laser_freq_hz_rt = seg.aux_laser_freq_hz;
                         g_interpolator.gas_select_rt    = seg.aux_gas_select;
+                        // P0-Laser-Q: 段级工艺标记镜像 (M 段消费时同步)
+                        // M 段 (含 M64 dwell / M72-M75 段标记) 也要同步 seg_flags,
+                        // 让 HMI 在穿孔 dwell 期间能读到正确的 lead_in 上下文.
+                        g_interpolator.current_seg_flags_rt = seg.seg_flags;
                         laser_rt_apply_aux(&seg);
                         break;
                     }
@@ -558,6 +562,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.v_end=seg.v_end;
                     g_interpolator.virtual_time_ms = 0.0;
                     g_interpolator.current_seg_id_rt = seg.seg_id;  // P0-c: 记录当前段 ID
+                    // P0-Laser-Q: 段级工艺标记镜像 (运动段消费时同步)
+                    // 运动段 (G00-G03) 的 seg_flags 由 parser M72-M75 modal 快照而来,
+                    // HMI 据此判断 "当前切割段是不是引线/微连接".
+                    g_interpolator.current_seg_flags_rt = seg.seg_flags;
                     g_interpolator.current_phase = 1;
                     g_interpolator.phase_T_curr = 0.0;
                     g_interpolator.phase_T_next = seg.T1;
@@ -702,7 +710,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_laser_rt.emergency_kill,
                                 g_laser_rt.interlock_status,
                                 // Phase B1: 当前周期瞬时速度 (供验证 P-v 耦合曲线)
-                                g_laser_rt.v_actual_mm_s);
+                                g_laser_rt.v_actual_mm_s,
+                                // P0-Laser-Q: 状态查询闭环 4 字段
+                                g_laser_rt.pierce_count,
+                                g_laser_rt.laser_on_time_ms,
+                                g_interpolator.current_seg_flags_rt,
+                                // is_piercing 派生: G04 dwell (M64) 等待期间为 1
+                                (g_interpolator.is_waiting_mcode &&
+                                 g_interpolator.current_mcode == 64) ? 1 : 0);
             }
 
             // ---- P0-a: 状态快照推送 (所有模式, 无条件) ----
@@ -775,6 +790,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                    g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
                     g_interpolator.is_waiting_mcode=0;
                     g_interpolator.mcode_wait_timer=0;
+                    // P0-Laser-Q: M64 (G04 dwell) 完成时累计穿孔次数
+                    // @Context: 1ms Hard-RT Thread
+                    // @Danger: 仅 int32 ++, 无 malloc/阻塞/math.h
+                    // 必须判 current_mcode==64: 该完成分支处理所有 M 段 (M0/M1/M60-M75),
+                    // 只有 M64 (G04 dwell 转换来的穿孔段) 才算穿孔.
+                    if (g_interpolator.current_mcode == 64) {
+                        g_laser_rt.pierce_count++;
+                    }
                 }
             }
 
@@ -951,6 +974,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // 读 g_interpolator.v_current + 耦合表, 重算 g_laser_rt.power_w.
             // coupling_mode=0 时内部直接 return, 不影响性能 (单次 int 比较).
             laser_rt_coupling_update();
+
+            // ---- P0-Laser-Q: 加工统计累计 (cycle 尾, coupling 后, flush 前) ----
+            // laser_on_time_ms: enable && shutter && !emergency_kill 时每 cycle += 1 (1ms)
+            //   enable=主使能 (M3), shutter=激光闸 (M62), 两者都 1 才真出光 (Phase A 设计)
+            //   emergency_kill 时禁累加 (急停后不计入加工时长)
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: 仅 int64 += 1, 无 malloc/阻塞/math.h
+            if (g_laser_rt.enable && g_laser_rt.shutter && !g_laser_rt.emergency_kill) {
+                g_laser_rt.laser_on_time_ms += 1;
+            }
 
             // ---- P0-Laser: cycle 末刷新激光 PDO ----
             // 必须在 ecx_send_processdata 之前, 保证 DO/AO 在本周期 PDO 帧中生效.

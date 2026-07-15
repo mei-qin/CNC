@@ -47,6 +47,19 @@ extern "C" {
 #define SMC_STATUS_STR_MAX_LEN   32     /* 系统状态字符串缓冲 */
 
 /* ============================================================
+ * 1.5 激光 P-v 耦合查表共享类型 (P0-Laser-ConfigRPC 移入)
+ * 原 laser_ctrl.h 本地定义, 因 SDK 端 SMC_ConfigLaserCoupleTable 需要可见,
+ * 移到协议头让 C 端 + C++ SDK 共享同一布局.
+ * pack(1) 下 16B (2×double 无 padding), 与原 laser_ctrl.h 自然对齐布局一致.
+ * ============================================================ */
+#define LASER_COUPLE_TABLE_MAX  16      /* P-v 耦合表最大采样点数 */
+
+typedef struct {
+    double v_mm_s;   /* 速度采样点 (mm/s), 单调不减 */
+    double ratio;    /* 输出比例 (0-1) */
+} LaserCouplePoint_t;
+
+/* ============================================================
  * 2. 命令类型枚举
  *    按功能段划分并预留空号, 便于未来追加新 API 而不打乱编号。
  * ============================================================ */
@@ -90,12 +103,22 @@ typedef enum {
     SMC_CMD_SET_ZERO                 = 0x0030,
     SMC_CMD_MOVE_RELATIVE            = 0x0031,
     SMC_CMD_GO_ZERO                  = 0x0032,
+    SMC_CMD_GET_LASER_STATE          = 0x0033,  /* P0-Laser-Q: 激光器完整状态查询 (含统计) */
 
     /* --- G 代码加工 0x0040 ~ 0x004F --- */
     SMC_CMD_RUN_GCODE_FILE           = 0x0040,
     SMC_CMD_PAUSE_PROCESSING         = 0x0041,
     SMC_CMD_RESUME_PROCESSING        = 0x0042,
     SMC_CMD_ABORT_PROCESSING         = 0x0043,
+
+    /* --- 激光配置 0x0050 ~ 0x005F (P0-Laser-ConfigRPC) --- */
+    SMC_CMD_CONFIG_LASER_IO          = 0x0050,  /* 配置 3 个 EtherCAT 从站 id */
+    SMC_CMD_CONFIG_LASER_DO_BITS     = 0x0051,  /* 配置 DO bit 偏移 (6 位) */
+    SMC_CMD_CONFIG_LASER_DI_BITS     = 0x0052,  /* 配置 DI bit 偏移 (6 位) */
+    SMC_CMD_CONFIG_LASER_AO_CHANNELS = 0x0053,  /* 配置 AO 通道偏移 (2 通道) */
+    SMC_CMD_CONFIG_LASER_RANGE       = 0x0054,  /* 配置功率/频率量程 */
+    SMC_CMD_CONFIG_LASER_COUPLING    = 0x0055,  /* 配置 P-v 耦合开关 + 低速阈值 */
+    SMC_CMD_CONFIG_LASER_COUPLE_TABLE= 0x0056,  /* 配置 P-v 耦合查表 (固定 16 槽) */
 } SmcCmdType;
 
 /* ============================================================
@@ -290,6 +313,33 @@ typedef struct {
     int32_t ret_code;
 } SmcGetCurrentToolRes;
 
+/* SMC_GET_LASER_STATE: 无 Req
+ * 镜像 g_laser_rt (RT 单写者) + g_interpolator 派生字段, 共 14 字段.
+ * 字段顺序: 状态 → 统计 → ret_code (与 SpindleStateRes ret_code 末置一致).
+ * pack(1) 下 ~75B, 远低于 SMC_MAX_PAYLOAD_BYTES (4096). */
+typedef struct {
+    /* ---- 状态字段 (镜像 g_laser_rt, RT 单写者) ---- */
+    int32_t  enable;            /* 0/1, 激光器主使能 (M3=1, M5=0) */
+    int32_t  shutter;           /* 0/1, 激光闸 (M62=1, M63=0) */
+    double   power_w;           /* 当前输出功率 W (P-v 耦合后) */
+    double   freq_hz;           /* 频率 Hz */
+    int32_t  gas_select;        /* 0=off, 1=N2, 2=O2, 3=Air */
+    uint16_t interlock;         /* 互锁位图: bit0=door, bit1=estop_soft, bit2=laser_alm,
+                                   bit3=water_temp, bit4=water_flow, bit5=gas_press,
+                                   bit15=system_alarm; 0=正常 */
+    int32_t  emergency_kill;    /* 急停锁存 (1=已锁存, 需 alarm_reset 路径调 laser_rt_reset) */
+    double   P_base_w;          /* 基准功率 (M67 设定, 不被 P-v 耦合覆盖) */
+    double   v_actual_mm_s;     /* 当前周期瞬时速度 mm/s (RT 写, 耦合 update 推进) */
+    int32_t  coupling_mode_rt;  /* 当前段耦合模式 (0=off, 1=查表) */
+    int32_t  is_piercing;       /* 是否在 G04 穿孔 dwell 中 (派生: is_waiting_mcode && current_mcode==64) */
+    uint8_t  current_seg_flags; /* 当前段工艺标记: bit0=lead_in, bit1=micro_joint */
+    /* ---- 加工统计 (RT 累计, 跨程序不清零) ---- */
+    int32_t  pierce_count;      /* 累计穿孔次数 (M64 段完成 ++) */
+    int64_t  laser_on_time_ms;  /* 累计激光开启时间 ms (enable&&shutter&&!ekill 时累加) */
+    /* ---- 返回码 ---- */
+    int32_t  ret_code;          /* 0=ok, -1=激光未配置 (do_slave_id<0) */
+} SmcGetLaserStateRes;
+
 typedef struct {
     int32_t enable;     /* 0=禁用 M1, 1=M1 等价 M0 */
 } SmcSetOptionalStopEnableReq;
@@ -378,6 +428,74 @@ typedef struct {
     uint32_t event_count;      /* 本帧事件数 (1..EVENT_READ_MAX) */
     uint32_t crc32;            /* CRC32(event_count + events) */
 } SmcEventFrameHeader;
+
+/* ============================================================
+ * 激光配置 Payload (0x0050-0x0056, P0-Laser-ConfigRPC)
+ * 7 组 Req/Res, Res 统一仅含 int32_t ret_code (与 SMC_ConfigLaser* 返回值对齐)
+ * CoupleTable Req 固定 16 槽 (count 指示实际有效数), pack(1) 260B
+ * ============================================================ */
+
+/* SMC_CONFIG_LASER_IO: 3 个 EtherCAT 从站 id, -1=未配置 */
+typedef struct {
+    int32_t do_slave_id;    /* 数字输出从站 */
+    int32_t ao_slave_id;    /* 模拟输出从站 */
+    int32_t di_slave_id;    /* 安全互锁输入从站 */
+} SmcConfigLaserIOReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserIORes;
+
+/* SMC_CONFIG_LASER_DO_BITS: 6 个 DO bit 偏移 (0-15) */
+typedef struct {
+    uint8_t b_enable;
+    uint8_t b_shutter;
+    uint8_t b_gas_n2;
+    uint8_t b_gas_o2;
+    uint8_t b_gas_air;
+    uint8_t b_alarm_lamp;
+} SmcConfigLaserDOBitsReq;     /* pack(1) 6B */
+typedef struct { int32_t ret_code; } SmcConfigLaserDOBitsRes;
+
+/* SMC_CONFIG_LASER_DI_BITS: 6 个 DI bit 偏移 (0-15) */
+typedef struct {
+    uint8_t b_door;
+    uint8_t b_estop;
+    uint8_t b_laser_alm;
+    uint8_t b_water_t;
+    uint8_t b_water_f;
+    uint8_t b_gas_p;
+} SmcConfigLaserDIBitsReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserDIBitsRes;
+
+/* SMC_CONFIG_LASER_AO_CHANNELS: 2 个 AO 通道偏移 */
+typedef struct {
+    uint8_t ch_power;
+    uint8_t ch_freq;
+} SmcConfigLaserAOChannelsReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserAOChannelsRes;
+
+/* SMC_CONFIG_LASER_RANGE: 物理量程 (功率/频率 W/Hz) */
+typedef struct {
+    double power_max_w;     /* 满量程功率, 默认 3000 */
+    double freq_max_hz;     /* 满量程频率, 默认 5000 */
+    double power_min_w;     /* 起辉功率下限, 默认 50 */
+} SmcConfigLaserRangeReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserRangeRes;
+
+/* SMC_CONFIG_LASER_COUPLING: P-v 耦合开关 + 低速阈值 */
+typedef struct {
+    int32_t mode;           /* 0=off (默认), 1=查表耦合 */
+    double  v_thresh_mm_s;  /* 低速阈值 mm/s, 默认 5.0 */
+} SmcConfigLaserCouplingReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserCouplingRes;
+
+/* SMC_CONFIG_LASER_COUPLE_TABLE: P-v 耦合查表 (固定 16 槽)
+ * count: 实际有效采样点数 (1..16), 超范围 SMC_ConfigLaserCoupleTable 返回 -1
+ * points: 固定 16 槽, 未用槽为零值 (count 之后的内容被忽略)
+ * pack(1) 下 4 + 16*16 = 260B, 远低于 SMC_MAX_PAYLOAD_BYTES */
+typedef struct {
+    int32_t            count;
+    LaserCouplePoint_t points[LASER_COUPLE_TABLE_MAX];
+} SmcConfigLaserCoupleTableReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserCoupleTableRes;
 
 #pragma pack(pop)
 

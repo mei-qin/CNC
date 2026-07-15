@@ -137,6 +137,36 @@ public:
      * 返回码: 0=请求已提交, -1=parser 正在跑 (先 AbortProcessing), -2=轴未就绪 */
     bool ClearAlarm(int &out_ret_code);
 
+    /* =============================================================
+     * P0-Laser-Q: 激光切割子系统状态查询
+     * ============================================================= */
+    /* 查询激光器完整状态 (镜像 RT 单写者字段 + 段级派生 + 加工统计, ~75B 响应)
+     * 返回码 (out.ret_code): 0=ok, -1=激光未配置 (do_slave_id<0)
+     * 字段详见 SmcGetLaserStateRes 定义 (smc_protocol.h):
+     *   状态: enable/shutter/power_w/freq_hz/gas_select/interlock/emergency_kill/
+     *         P_base_w/v_actual_mm_s/coupling_mode_rt/is_piercing/current_seg_flags
+     *   统计: pierce_count/laser_on_time_ms */
+    bool GetLaserState(SmcGetLaserStateRes &out);
+
+    /* =============================================================
+     * P0-Laser-ConfigRPC: 激光配置 (0x0050-0x0056)
+     * 时序: 必须在 InitAndStart 前调用 (init-time 单写者语义, 与 ConfigAxisTopology 同)
+     * 返回码: 0=成功, -1=参数越界 (由 SMC_ConfigLaser* 内部校验)
+     * ============================================================= */
+    bool ConfigLaserIO(int do_slave_id, int ao_slave_id, int di_slave_id, int &out_ret_code);
+    bool ConfigLaserDOBits(uint8_t b_enable, uint8_t b_shutter,
+                           uint8_t b_gas_n2, uint8_t b_gas_o2, uint8_t b_gas_air,
+                           uint8_t b_alarm_lamp, int &out_ret_code);
+    bool ConfigLaserDIBits(uint8_t b_door, uint8_t b_estop, uint8_t b_laser_alm,
+                           uint8_t b_water_t, uint8_t b_water_f, uint8_t b_gas_p,
+                           int &out_ret_code);
+    bool ConfigLaserAOChannels(uint8_t ch_power, uint8_t ch_freq, int &out_ret_code);
+    bool ConfigLaserRange(double power_max_w, double freq_max_hz, double power_min_w,
+                          int &out_ret_code);
+    bool ConfigLaserCoupling(int mode, double v_thresh_mm_s, int &out_ret_code);
+    /* P-v 耦合查表 (count: 1..16, 越界 SDK 层拦截返回 ret_code=-1 不发 RPC) */
+    bool ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count, int &out_ret_code);
+
 private:
     /* ---------- 内部收发原语 ---------- */
     int  send_all(const void *buf, size_t n);

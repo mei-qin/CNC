@@ -136,6 +136,9 @@ void laser_ctrl_init(void)
     // Phase B1: P_base / v_actual 归零
     g_laser_rt.P_base_w         = 0.0;
     g_laser_rt.v_actual_mm_s    = 0.0;
+    // P0-Laser-Q: 加工统计归零 (跨程序累计, 仅 init 阶段清零一次)
+    g_laser_rt.pierce_count     = 0;
+    g_laser_rt.laser_on_time_ms = 0;
 }
 
 // =====================================================================

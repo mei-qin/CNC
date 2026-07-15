@@ -32,9 +32,10 @@
 
 #include <stdint.h>
 #include "axis_cfg.h"   // TrajectorySegment_t / _Atomic
+#include "smc_protocol.h"  // LaserCouplePoint_t + LASER_COUPLE_TABLE_MAX (P0-Laser-ConfigRPC 移入协议头供 SDK 共享)
 
 // =====================================================================
-// P0-Laser Phase B1: 功率-速度耦合 (分段查表)
+// P0-Laser Phase B1: 功率-速度耦合 (分段查表) 表语义说明
 // =====================================================================
 // 表语义: 绝对速度表, 输入 v_current (mm/s), 输出 ratio (0-1)
 //   ratio = laser_lookup_ratio(v_current)
@@ -42,13 +43,8 @@
 // 表约束: v_mm_s 单调不减, ratio 在 [0, 1] 内, 长度 1..LASER_COUPLE_TABLE_MAX
 // 默认表 (laser_ctrl_init 设置): 线性, v=0→0, v=50 mm/s→1.0
 // 用户通过 SMC_ConfigLaserCoupleTable 自定义 (典型: 起弧/切割/饱和 三段)
+// 注: LaserCouplePoint_t / LASER_COUPLE_TABLE_MAX 定义已移到 smc_protocol.h (P0-Laser-ConfigRPC)
 // =====================================================================
-#define LASER_COUPLE_TABLE_MAX  16
-
-typedef struct {
-    double v_mm_s;   // 速度采样点 (mm/s), 单调不减
-    double ratio;    // 输出比例 (0-1)
-} LaserCouplePoint_t;
 
 typedef struct {
     // ---- EtherCAT 从站索引 (-1 = 该通道未配置, RT 跳过) ----
@@ -101,6 +97,13 @@ typedef struct {
     double power_w;             // 当前功率 (W)
     double freq_hz;             // 当前频率 (Hz)
     int    gas_select;          // 0=off, 1=N2, 2=O2, 3=Air
+
+    // ---- 加工统计 (RT 单写者累计, HMI 只读) ----
+    // pierce_count: M64 段 (G04 dwell) 完成时 ++, 跨程序不清零 (累计量)
+    // laser_on_time_ms: enable && shutter && !emergency_kill 时每 cycle += 1 (1ms 周期)
+    //   64-bit 字段在 32-bit 平台可能撕裂, HMI 容忍 1ms 级滞后 (统计字段非安全关键)
+    int32_t  pierce_count;
+    int64_t  laser_on_time_ms;
 
     // ---- 急停锁存 (一旦置 1, 需显式 laser_rt_reset() 才能再开) ----
     int    emergency_kill;

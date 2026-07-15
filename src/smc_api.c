@@ -729,20 +729,41 @@ int SMC_GetCurrentTool(int *tool_id)
     return 0;
 }
 
-// 激光器实际状态查询 (镜像 RT 单写者字段 g_laser_rt)
-// @Thread-Safety: g_laser_rt 由 RT 线程单写者推进, 此处 acquire 读
-//   int/double 字段对齐天然原子, 但 emergency_kill 与 enable 可能瞬间撕裂
-//   HMI 容忍 1ms 级滞后
-int SMC_GetLaserState(int *enable, int *shutter, double *power_w,
-                      double *freq_hz, int *gas_select, uint16_t *interlock)
+// 激光器完整状态查询 (镜像 RT 单写者字段 g_laser_rt + g_interpolator 派生 + 加工统计)
+// @Thread-Safety: g_laser_rt / g_interpolator 均为 RT 线程单写者, 此处 acquire 读.
+//   int/double 字段对齐天然原子; pierce_count (int32) / laser_on_time_ms (int64)
+//   在 32-bit 平台可能撕裂, HMI 容忍 1ms 级滞后 (统计字段非安全关键).
+//   emergency_kill 与 enable 可能瞬间撕裂, HMI 容忍 1ms 级滞后.
+// 返回: 0=成功 (out 已 fill), -1=out 为空或激光未配置 (do_slave_id<0)
+int SMC_GetLaserState(SmcGetLaserStateRes *out)
 {
-    if (g_laser_cfg.do_slave_id < 0) return -1;  // 未配置激光
-    if (enable)     *enable     = g_laser_rt.enable;
-    if (shutter)    *shutter    = g_laser_rt.shutter;
-    if (power_w)    *power_w    = g_laser_rt.power_w;
-    if (freq_hz)    *freq_hz    = g_laser_rt.freq_hz;
-    if (gas_select) *gas_select = g_laser_rt.gas_select;
-    if (interlock)  *interlock  = g_laser_rt.interlock_status;
+    if (!out) return -1;
+    if (g_laser_cfg.do_slave_id < 0) { out->ret_code = -1; return -1; }
+
+    // ---- 状态字段 (镜像 g_laser_rt) ----
+    out->enable           = g_laser_rt.enable;
+    out->shutter          = g_laser_rt.shutter;
+    out->power_w          = g_laser_rt.power_w;
+    out->freq_hz          = g_laser_rt.freq_hz;
+    out->gas_select       = g_laser_rt.gas_select;
+    out->interlock        = g_laser_rt.interlock_status;
+    out->emergency_kill   = g_laser_rt.emergency_kill;
+    out->P_base_w         = g_laser_rt.P_base_w;
+    out->v_actual_mm_s    = g_laser_rt.v_actual_mm_s;
+    out->coupling_mode_rt = g_laser_rt.coupling_mode_rt;
+
+    // ---- 派生字段 (从 g_interpolator 计算) ----
+    // is_piercing: G04 dwell (M64 段) 等待期间为 1, 供 HMI 显示 "穿孔中" 状态
+    out->is_piercing = (g_interpolator.is_waiting_mcode &&
+                        g_interpolator.current_mcode == 64) ? 1 : 0;
+    // current_seg_flags: 当前段工艺标记 (lead_in / micro_joint), 段消费环同步
+    out->current_seg_flags = g_interpolator.current_seg_flags_rt;
+
+    // ---- 加工统计 (RT 累计, 跨程序不清零) ----
+    out->pierce_count     = g_laser_rt.pierce_count;
+    out->laser_on_time_ms = g_laser_rt.laser_on_time_ms;
+
+    out->ret_code = 0;
     return 0;
 }
 

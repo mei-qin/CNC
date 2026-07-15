@@ -372,6 +372,103 @@ static int handle_client_request(int client_fd)
         resp_payload_len = sizeof(SmcGetCurrentToolRes);
         break;
     }
+    case SMC_CMD_GET_LASER_STATE: {
+        /* P0-Laser-Q: 激光器完整状态查询 (14 字段 + ret_code, ~75B)
+         * SMC_GetLaserState struct-based out param, 直接 fill res.
+         * memset 兜底: 未配置激光时 SMC_GetLaserState 返回 -1 早返回,
+         * pierce_count / laser_on_time_ms 等字段需为 0 而非未初始化垃圾值. */
+        SmcGetLaserStateRes *res = (SmcGetLaserStateRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = SMC_GetLaserState(res);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetLaserStateRes);
+        break;
+    }
+
+    /* ===== P0-Laser-ConfigRPC: 激光配置 (0x0050-0x0056) =====
+     * 7 个 case 块同模式: data_len 守卫 → cast req → 调 SMC_ConfigLaser* → 返回 Res(ret_code)
+     * ConfigLaser* 必须在 SMC_InitAndStart 前调 (init-time 单写者), rpc 层不做时序校验. */
+    case SMC_CMD_CONFIG_LASER_IO: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserIOReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserIOReq *req = (SmcConfigLaserIOReq *)payload;
+        SmcConfigLaserIORes *res = (SmcConfigLaserIORes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserIO(req->do_slave_id, req->ao_slave_id, req->di_slave_id);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserIORes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_DO_BITS: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserDOBitsReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserDOBitsReq *req = (SmcConfigLaserDOBitsReq *)payload;
+        SmcConfigLaserDOBitsRes *res = (SmcConfigLaserDOBitsRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserDOBits(req->b_enable, req->b_shutter,
+                                              req->b_gas_n2, req->b_gas_o2,
+                                              req->b_gas_air, req->b_alarm_lamp);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserDOBitsRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_DI_BITS: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserDIBitsReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserDIBitsReq *req = (SmcConfigLaserDIBitsReq *)payload;
+        SmcConfigLaserDIBitsRes *res = (SmcConfigLaserDIBitsRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserDIBits(req->b_door, req->b_estop, req->b_laser_alm,
+                                              req->b_water_t, req->b_water_f, req->b_gas_p);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserDIBitsRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_AO_CHANNELS: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserAOChannelsReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserAOChannelsReq *req = (SmcConfigLaserAOChannelsReq *)payload;
+        SmcConfigLaserAOChannelsRes *res = (SmcConfigLaserAOChannelsRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserAOChannels(req->ch_power, req->ch_freq);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserAOChannelsRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_RANGE: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserRangeReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserRangeReq *req = (SmcConfigLaserRangeReq *)payload;
+        SmcConfigLaserRangeRes *res = (SmcConfigLaserRangeRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserRange(req->power_max_w, req->freq_max_hz, req->power_min_w);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserRangeRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_COUPLING: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserCouplingReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserCouplingReq *req = (SmcConfigLaserCouplingReq *)payload;
+        SmcConfigLaserCouplingRes *res = (SmcConfigLaserCouplingRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserCoupling(req->mode, req->v_thresh_mm_s);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserCouplingRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_COUPLE_TABLE: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserCoupleTableReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserCoupleTableReq *req = (SmcConfigLaserCoupleTableReq *)payload;
+        SmcConfigLaserCoupleTableRes *res = (SmcConfigLaserCoupleTableRes *)resp_buf;
+        /* count 越界 (0 或 >16) 由 SMC_ConfigLaserCoupleTable 内部校验, 返回 -1 */
+        res->ret_code = SMC_ConfigLaserCoupleTable(req->points, req->count);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserCoupleTableRes);
+        break;
+    }
     case SMC_CMD_SET_OPTIONAL_STOP_ENABLE: {
         if (req_hdr.data_len < sizeof(SmcSetOptionalStopEnableReq)) {
             res_hdr.err_code = SMC_ERR_PARAM; break;

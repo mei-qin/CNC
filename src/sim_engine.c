@@ -94,6 +94,9 @@ int sim_engine_init(const char *output_path, int use_binary)
                 "gas_select,laser_emergency_kill,laser_interlock");
         // Phase B1: 功率-速度耦合速度列
         fprintf(g_sim_logger.fp, ",laser_v_actual_mm_s");
+        // P0-Laser-Q: 状态查询闭环 4 列
+        fprintf(g_sim_logger.fp,
+                ",pierce_count,laser_on_time_ms,current_seg_flags,is_piercing");
         fprintf(g_sim_logger.fp, "\n");
         fflush(g_sim_logger.fp);
     }
@@ -188,6 +191,12 @@ void *sim_flush_thread_func(void *arg)
                             (unsigned)r->laser_interlock);
                     // Phase B1: 速度列 (1 列)
                     fprintf(L->fp, ",%.3f", r->laser_v_actual_mm_s);
+                    // P0-Laser-Q: 状态查询闭环 4 列
+                    fprintf(L->fp, ",%d,%lld,%u,%d",
+                            (int)r->pierce_count,
+                            (long long)r->laser_on_time_ms,
+                            (unsigned)r->current_seg_flags,
+                            r->is_piercing);
                     fprintf(L->fp, "\n");
                 }
                 L->file_record_count += cnt;

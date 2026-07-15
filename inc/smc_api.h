@@ -231,14 +231,14 @@ int SMC_ConfigLaserCoupling(int mode, double v_thresh_mm_s);
 //   SMC_ConfigLaserCoupleTable(t, 3);
 int SMC_ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count);
 
-// 6.查询激光器实际状态 (HMI 用, 镜像 RT 单写者字段)
-// *enable / *shutter: 0/1
-// *power_w / *freq_hz: 当前 W / Hz
-// *gas_select: 0=off, 1=N2, 2=O2, 3=Air
-// *interlock: 互锁位图 (bit0=door ... bit15=system_alarm); 0=正常
-// 返回: 0=成功, -1=激光未配置
-int SMC_GetLaserState(int *enable, int *shutter, double *power_w,
-                      double *freq_hz, int *gas_select, uint16_t *interlock);
+// 6.查询激光器完整状态 (HMI 用, 镜像 RT 单写者字段 + 段级派生 + 加工统计)
+// struct-based out param: 字段过多 (14 个), out param 模式不可读, 改用 Res 结构体直接 fill
+// (参考 SMC_GetProgramStructure 模式). SmcGetLaserStateRes 定义在 smc_protocol.h.
+// @Thread-Safety: g_laser_rt / g_interpolator 均为 RT 单写者, 此处 acquire 读.
+//   int/double 字段对齐天然原子; pierce_count / laser_on_time_ms 64-bit 字段
+//   在 32-bit 平台可能撕裂, HMI 容忍 1ms 级滞后 (统计字段非安全关键).
+// 返回: 0=成功, -1=out 为空或激光未配置 (do_slave_id<0)
+int SMC_GetLaserState(SmcGetLaserStateRes *out);
 
 
 #ifdef __cplusplus

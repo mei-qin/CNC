@@ -639,3 +639,116 @@ bool SmcController::ClearAlarm(int &out_ret_code)
     /* 无 Req, Res = SmcClearAlarmRes (仅 int32_t ret_code) */
     return invokeIntRet(SMC_CMD_CLEAR_ALARM, out_ret_code);
 }
+
+/* ============================================================
+ * P0-Laser-Q: 激光切割子系统状态查询
+ * ============================================================ */
+bool SmcController::GetLaserState(SmcGetLaserStateRes &out)
+{
+    /* 无 Req, Res 直接拷到 out (~75B)。先 send 再 recv, 与 GetProgramStructure 同模式。
+     * 不需要 TranslatePathForWSL (无 filepath 参数)。WSAStartup 已在 ctor 完成。 */
+    std::lock_guard<std::mutex> lock(comm_mutex_);
+    if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
+    if (!sendRequest(SMC_CMD_GET_LASER_STATE, nullptr, 0)) return false;
+
+    int32_t  err = 0;
+    uint32_t len = 0;
+    if (!recvResponse(err, &out, sizeof(out), len)) return false;
+    if (err != SMC_OK) { last_err_ = err; return false; }
+    if (len < sizeof(out)) { last_err_ = SMC_ERR_INTERNAL; return false; }
+    return true;
+}
+
+/* ============================================================
+ * P0-Laser-ConfigRPC: 激光配置 (0x0050-0x0056)
+ * 7 个方法同模式: memset Req → 填字段 → invokeIntRet 发送
+ * 参考 ConfigAxisDynamics (line 442-455) 的 invokeIntRet 用法
+ * ============================================================ */
+bool SmcController::ConfigLaserIO(int do_slave_id, int ao_slave_id, int di_slave_id,
+                                  int &out_ret_code)
+{
+    SmcConfigLaserIOReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.do_slave_id = do_slave_id;
+    req.ao_slave_id = ao_slave_id;
+    req.di_slave_id = di_slave_id;
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_IO, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::ConfigLaserDOBits(uint8_t b_enable, uint8_t b_shutter,
+                                      uint8_t b_gas_n2, uint8_t b_gas_o2,
+                                      uint8_t b_gas_air, uint8_t b_alarm_lamp,
+                                      int &out_ret_code)
+{
+    SmcConfigLaserDOBitsReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.b_enable    = b_enable;
+    req.b_shutter   = b_shutter;
+    req.b_gas_n2    = b_gas_n2;
+    req.b_gas_o2    = b_gas_o2;
+    req.b_gas_air   = b_gas_air;
+    req.b_alarm_lamp = b_alarm_lamp;
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_DO_BITS, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::ConfigLaserDIBits(uint8_t b_door, uint8_t b_estop, uint8_t b_laser_alm,
+                                      uint8_t b_water_t, uint8_t b_water_f, uint8_t b_gas_p,
+                                      int &out_ret_code)
+{
+    SmcConfigLaserDIBitsReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.b_door      = b_door;
+    req.b_estop     = b_estop;
+    req.b_laser_alm = b_laser_alm;
+    req.b_water_t   = b_water_t;
+    req.b_water_f   = b_water_f;
+    req.b_gas_p     = b_gas_p;
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_DI_BITS, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::ConfigLaserAOChannels(uint8_t ch_power, uint8_t ch_freq, int &out_ret_code)
+{
+    SmcConfigLaserAOChannelsReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.ch_power = ch_power;
+    req.ch_freq  = ch_freq;
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_AO_CHANNELS, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::ConfigLaserRange(double power_max_w, double freq_max_hz, double power_min_w,
+                                     int &out_ret_code)
+{
+    SmcConfigLaserRangeReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.power_max_w = power_max_w;
+    req.freq_max_hz = freq_max_hz;
+    req.power_min_w = power_min_w;
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_RANGE, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::ConfigLaserCoupling(int mode, double v_thresh_mm_s, int &out_ret_code)
+{
+    SmcConfigLaserCouplingReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.mode         = mode;
+    req.v_thresh_mm_s = v_thresh_mm_s;
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_COUPLING, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count,
+                                           int &out_ret_code)
+{
+    /* SDK 层 count 守卫: 防止 memcpy 越界 + 减少无效 RPC 往返
+     * 越界时协议层返回 true (RPC 未发), 业务层 ret_code=-1 标识参数错 */
+    if (points == nullptr || count < 1 || count > LASER_COUPLE_TABLE_MAX) {
+        out_ret_code = -1;
+        return true;
+    }
+    SmcConfigLaserCoupleTableReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.count = count;
+    for (int i = 0; i < count; i++) {
+        req.points[i] = points[i];
+    }
+    return invokeIntRet(SMC_CMD_CONFIG_LASER_COUPLE_TABLE, out_ret_code, &req, sizeof(req));
+}

@@ -278,6 +278,12 @@ typedef struct{
     //                    静止时 (is_moving=0) 保留上一段 id, UI 可显示"刚执行完"。
     uint64_t current_seg_id_rt;
 
+    // ---- P0-Laser-Q: 段级工艺标记镜像 (与 current_seg_id_rt 同步) ----
+    // M 段 + 运动段消费时都从 seg.seg_flags 拷贝, HMI 据此判断:
+    //   "当前段是不是引线/微连接" + "穿孔 dwell 期间是不是 lead_in 上下文"
+    // 段级快照原则 (B1 教训): 走段消费环同步, 不走全局读 g_state.laser_seg_flags.
+    uint8_t  current_seg_flags_rt;
+
 }Interpolator_t;
 
 /*
