@@ -30,6 +30,7 @@
 /docs/INTEGRATION_GUIDE.md
 /docs/PROTOCOL_SPEC.md
 /docs/EVENT_CODES.md
+/docs/archive/
 
 # ==== 临时调试脚本 (Ad-hoc Debug Scripts) ====
 # 一次性验证用, 不入团队仓库 (按需保留个人正式脚本)
@@ -41,6 +42,9 @@
 /scripts/test_laser_*.py
 /scripts/verify_laser_*.py
 /scripts/analyze_laser_*.py
+/scripts/diag_*.py
+/scripts/probe*override.py
+/scripts/verify_p2a_*.py
 
 # ==== 本地测试用例 (Local Test Fixtures) ====
 # G 代码测试文件 + 验证脚本均为本地验证产物, 不入团队仓库
