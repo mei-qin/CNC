@@ -385,6 +385,40 @@ static int handle_client_request(int client_fd)
         break;
     }
 
+    case SMC_CMD_SET_OVERRIDE: {
+        /* P2-A: 实时倍率 + 模式标志设置
+         * mask/value 模式: -1=不改 (允许部分修改), 实际生效值通过 Res 回读.
+         * EventLogger_Push 0x0042 INFO: 操作员旋钮变更审计 (便于事后追溯). */
+        if (req_hdr.data_len < sizeof(SmcSetOverrideReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcSetOverrideReq *req = (SmcSetOverrideReq *)payload;
+        SmcSetOverrideRes *res = (SmcSetOverrideRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = SMC_SetOverride(req->feed_pct, req->rapid_pct, req->spindle_pct,
+                                        req->mode_mask, req->mode_value,
+                                        &res->actual_feed_pct, &res->actual_rapid_pct,
+                                        &res->actual_spindle_pct, &res->actual_mode_flags);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcSetOverrideRes);
+
+        /* P2-A: MANUAL 0x0042 override changed (INFO, 便于操作员面板审计) */
+        EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0042,
+                         (int32_t)res->actual_mode_flags,
+                         "override changed by operator");
+        break;
+    }
+    case SMC_CMD_GET_OVERRIDE: {
+        /* P2-A: 实时倍率 + 模式标志查询 (无 Req, ~16B Res) */
+        SmcGetOverrideRes *res = (SmcGetOverrideRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = SMC_GetOverride(&res->feed_pct, &res->rapid_pct,
+                                        &res->spindle_pct, &res->mode_flags);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetOverrideRes);
+        break;
+    }
+
     /* ===== P0-Laser-ConfigRPC: 激光配置 (0x0050-0x0056) =====
      * 7 个 case 块同模式: data_len 守卫 → cast req → 调 SMC_ConfigLaser* → 返回 Res(ret_code)
      * ConfigLaser* 必须在 SMC_InitAndStart 前调 (init-time 单写者), rpc 层不做时序校验. */

@@ -434,6 +434,8 @@ static int planner_fillet_preprocess(int plan_tail, int old_head)
          || s_curr->cmd_type != CMD_TYPE_MOTION
          || s_prev->is_fillet == 1
          || s_curr->is_fillet == 1
+         || s_prev->is_exact_stop == 1     // P2-A-4: 精准停段跳过圆角化
+         || s_curr->is_exact_stop == 1
          || s_prev->total_distance <= 1e-6
          || s_curr->total_distance <= 1e-6) {
             i = prev; continue;
@@ -763,6 +765,17 @@ void planner_recalculate_locked(int force_flush)
                 if (g_cmd_queue.buffer[next_idx].cmd_type == CMD_TYPE_MCODE) {
                     s_curr->v_end = 0.0;
                 }
+                // P2-A-4: G09/G61 精准停屏障
+                // 若下一段标记为 is_exact_stop, 强制本段 v_end=0 (与 MCODE 屏障同机制).
+                // 工业语义: 精准停拐角必须完全静止才能开始下段, 防过切/清根.
+                if (g_cmd_queue.buffer[next_idx].is_exact_stop) {
+                    s_curr->v_end = 0.0;
+                }
+            }
+            // P2-A-4: 本段标记为 is_exact_stop 时, 也强制 v_end=0
+            // (G09/G61 段本身出口必须停稳, 不依赖下段标记)
+            if (s_curr->is_exact_stop) {
+                s_curr->v_end = 0.0;
             }
 
             // ---- G93 强一致性: v_start 锁定 v_target,不走 junction 限幅 ----
@@ -818,6 +831,16 @@ void planner_recalculate_locked(int force_flush)
             if (s_curr->is_g93_strict) {
                 s_curr->v_end = s_curr->v_target;
                 g_cmd_queue.buffer[next].v_start = s_curr->v_target;
+                curr = next;
+                continue;
+            }
+
+            // ---- P2-A-4: G09/G61 精准停正向屏障 ----
+            // 若本段标记为 is_exact_stop, 强制 v_end=0, 下段 v_start=0 (精准停拐角).
+            // 必须在 G93 strict 之后, 正常加速限幅之前 (优先级: G93 > 精准停 > G64 圆角).
+            if (s_curr->is_exact_stop) {
+                s_curr->v_end = 0.0;
+                g_cmd_queue.buffer[next].v_start = 0.0;
                 curr = next;
                 continue;
             }

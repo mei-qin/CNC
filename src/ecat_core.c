@@ -113,7 +113,7 @@ void ec_sync(int64 reftime,int64 cycletime,int64 *offsettime){
 // 关键修复 (阶段 1-A): case 7 末态 v_now = v_end (而非硬编码 0.0),
 //   保证跨段瞬间速度连续 (v_end_A = v_start_B by planner 反向扫描)。
 // ====================================================================
-static inline void rt_resolve_scurve_step(void)
+static inline void rt_resolve_scurve_step(double eff_scale)
 {
     double t = g_interpolator.virtual_time_ms;
     double s = 0.0;
@@ -207,9 +207,13 @@ static inline void rt_resolve_scurve_step(void)
     }
 
     // T4 phase 跳过 v_current 写入 (已预置); 其他 phase 写回 v_now
+    // P2-A: v_current 必须是"物理瞬时速度" = 段内 S 曲线速度(ds/dτ) × 实际时间缩放(eff_scale).
+    //   eff_scale = time_scale × override_ratio, 即 virtual_time 相对 wall-clock 的真实推进速率.
+    //   不乘 eff_scale 则 override/feedhold 期间 v_current 仍显示满速, 与 operator HMI/探针语义不符
+    //   (代码注释 line 740 明确标注 v_current = "物理瞬时速度"). 正常加工 eff_scale=1.0, 行为不变.
     if (phase != 4) {
         if (v_now < 0.0) v_now = 0.0;
-        g_interpolator.v_current = v_now;
+        g_interpolator.v_current = v_now * eff_scale;
     }
 }
 
@@ -420,6 +424,27 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             g_interpolator.hold_state = HOLD_RESUMING;
                         }
                     }
+                } else {
+                    // P2-A-3: 单段死锁修复 (Plan agent 发现的关键 BUG)
+                    // 现象: G93 strict 段完成时 v_current=v_target (非 0), 段完成 is_moving 1→0,
+                    //       原状态机因 if(is_moving) gate 跳过 → pause_request 永不消费 → 死锁.
+                    //       同样问题在普通段 + 单段模式时也发生 (段完成瞬间 is_moving=0).
+                    // 修复: !is_moving && pause_request && hold_state==NORMAL → 直接 HOLD_PAUSED.
+                    //       无需刹车 (本就静止), 直接进入 PAUSED 等待 ResumeProcessing.
+                    //       time_scale 置 0 防止 ms_budget 误判本周期仍要插补.
+                    if (g_interpolator.pause_request
+                        && g_interpolator.hold_state == HOLD_NORMAL) {
+                        g_interpolator.hold_state = HOLD_PAUSED;
+                        g_interpolator.time_scale = 0.0;
+                    } else if (!g_interpolator.pause_request
+                               && g_interpolator.hold_state == HOLD_PAUSED) {
+                        // P2-A-3 单段模式 resume 修复 (补 is_moving=0 分支):
+                        //   段完成瞬间 is_moving=0 且 hold_state=HOLD_PAUSED, 若只在
+                        //   is_moving=1 分支处理 !pause_request→HOLD_RESUMING, 则 resume
+                        //   清掉 pause_request 后本分支无出口 → 永久 HOLD_PAUSED 死锁
+                        //   (D4 单段只停一次且 done=False 的根因). 此处补上静止态 resume.
+                        g_interpolator.hold_state = HOLD_RESUMING;
+                    }
                 }
 
                 const double TIME_DEC_STEP = 0.005;
@@ -443,7 +468,31 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // 必须在 while 之前声明 (C 语法: 先声明后使用)
             static int just_loaded_seg = 0;
             #define RT_ITER_CAP 64  // 防御: 64 段/周期 已足够覆盖最密集微段场景
-            double ms_budget = g_interpolator.time_scale;
+            // ---- P2-A: 实时倍率数学 ----
+            // @Context: 1ms Hard-RT Thread (EtherCAT)
+            // @Danger: NO BLOCKING / NO MATH.H / NO PRINTF / NO MALLOC. 仅乘法 + clamp.
+            //
+            // 设计原则: 完全复用 time_scale feedhold 机制. eff_scale 是 time_scale × override_ratio.
+            //   - time_scale 由 feedhold 状态机维护 (HOLD_BRAKING/RESUMING 平滑过渡)
+            //   - override_ratio 由 SMC_SetOverride (非 RT) 写, RT 每 cycle 读
+            //   - G00 段用 rapid_override_ratio, G01/G02/G03 用 feed_override_ratio
+            //   - dry_run 模式下所有段都走 rapid_override (industry std prove-out)
+            //   - G93 strict 段也受影响 (与 LinuxCNC/Fanuc 一致: virtual time 流速变慢 → wall-clock 翻倍)
+            //
+            // 红线 #3 (无缝插补无 static 状态继承): ms_budget 仅缩放 virtual_time_ms 推进步长,
+            //   7 段 S 曲线解析方程 s(τ) = s_n + v_n·τ + ½·a_n·τ² + ⅙·j_n·τ³ 不变.
+            // v1 clamp: eff_scale ≤ 1.0 (与 feedhold envelope 测试一致, v2 开放到 1.5).
+            double eff_scale = g_interpolator.time_scale;
+            if (g_interpolator.is_moving) {
+                int is_rapid = (g_interpolator.current_motion_type_rt == 0);  // G00 = motion_type 0
+                if (g_interpolator.mode_flags & SMC_MODE_DRY_RUN) is_rapid = 1;  // dry_run 强制 rapid 通道
+                double ratio = is_rapid ? g_interpolator.rapid_override_ratio
+                                        : g_interpolator.feed_override_ratio;
+                eff_scale *= ratio;
+                if (eff_scale > 1.0) eff_scale = 1.0;  // v1 不允许超 100% (待 v2 envelope 验证)
+                if (eff_scale < 0.0) eff_scale = 0.0;  // 防御 (override 不应为负, 但 clamp 兜底)
+            }
+            double ms_budget = eff_scale;
             int rt_iter = 0;
 
             while (ms_budget > 1e-6 && rt_iter < RT_ITER_CAP) {
@@ -562,6 +611,13 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.v_end=seg.v_end;
                     g_interpolator.virtual_time_ms = 0.0;
                     g_interpolator.current_seg_id_rt = seg.seg_id;  // P0-c: 记录当前段 ID
+                    // P2-A: 同步当前段 motion_type 给 RT 倍率数学 (区分 feed/rapid 通道)
+                    // 必须在 ms_budget 计算前完成 (本块在 while 主循环内, 下次 cycle 立即生效).
+                    // 注意: 第一次进入本块时 is_moving=0, ms_budget 不读 current_motion_type_rt
+                    //       (eff_scale 计算有 is_moving 门控), 无 stale read 风险.
+                    g_interpolator.current_motion_type_rt = seg.motion_type;
+                    // P2-A-4: 镜像精准停标记 (E2E 可观测, 客户端/测试据此识别精准停拐角)
+                    g_interpolator.current_seg_is_exact_stop_rt = seg.is_exact_stop;
                     // P0-Laser-Q: 段级工艺标记镜像 (运动段消费时同步)
                     // 运动段 (G00-G03) 的 seg_flags 由 parser M72-M75 modal 快照而来,
                     // HMI 据此判断 "当前切割段是不是引线/微连接".
@@ -573,7 +629,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     if (seg.T_total > 0.5) {
                         // 正常段: 进入插补消费
                         g_interpolator.is_moving = 1;
-                        g_interpolator.v_current = seg.v3;  // T4 预置 (case 1 会立即覆盖)
+                        g_interpolator.v_current = seg.v3 * eff_scale;  // T4 预置 (case 1 会立即覆盖)
                     } else {
                         // 微段 Snap (阶段 1-B 修复死循环):
                         //   T_total ≤ 0.5ms 时无法稳定插补,直接快进到 target_pos。
@@ -604,18 +660,57 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     if (ms_budget < remaining_time) {
                         // 路径 A: 预算不够走完本段,停留
                         g_interpolator.virtual_time_ms += ms_budget;
-                        rt_resolve_scurve_step();  // 解析当前 phase,更新 current_pos/v_current
+                        rt_resolve_scurve_step(eff_scale);  // 解析当前 phase,更新 current_pos/v_current
                         ms_budget = 0.0;  // 预算耗尽,while 退出
                     } else {
                         // 路径 B: 跨段! 本段在本周期内结束
                         g_interpolator.virtual_time_ms = g_interpolator.T7;
-                        rt_resolve_scurve_step();  // 末态: s=total_distance, v_current=v_end
+                        rt_resolve_scurve_step(eff_scale);  // 末态: s=total_distance, v_current=v_end
                         ms_budget -= remaining_time;
                         g_interpolator.is_moving = 0;  // 标记本段结束,下次 while 加载新段
+                        // P2-A-3: 单段模式 re-arm (运动段完成时)
+                        // 读 mode_flags 当前值, 允许 UI 中途 toggle off (下次完成时不再 re-arm).
+                        // 设 ms_budget=0 强制 while 退出, 防止本 cycle 内连续吃多段.
+                        // 下个 cycle 顶部状态机会检测到 pause_request 并进 HOLD_PAUSED.
+                        if (g_interpolator.mode_flags & SMC_MODE_SINGLE_BLOCK) {
+                            g_interpolator.pause_request = 1;
+                            ms_budget = 0.0;
+                        }
                         // while 继续 (若 ms_budget 还有,加载下一段)
                     }
                 }
             }  // end while
+
+            // ---- P2-A-2: Override + Dry-Run "有效输出"计算 (RT 单写者) ----
+            // @Context: 1ms Hard-RT Thread (EtherCAT)
+            // @Danger: 仅乘法 + 条件赋值, NO BLOCKING / NO MATH.H / NO PRINTF.
+            //
+            // 设计原因: 主轴倍率必须连续生效 (操作员旋钮实时性要求), 不能只在 seg-load 时乘.
+            //          Dry-Run 是工业 prove-out 安全机制: 强制 spindle/coolant/laser 不出力,
+            //          让程序空跑验证轨迹不碰撞, 但主轴/激光不实际启动.
+            //
+            // 计算时机: 在 seg-load while 之后, sim_engine_push / SnapshotHub_Publish 之前.
+            //          每 cycle 1 次 (不论段边界), 保证操作员旋钮变化 1 cycle 内可见.
+            //
+            // 红线合规:
+            //   - 仅修改输出镜像, 不改 *_rt 原始模态 (dry_run 关闭后立即恢复正常)
+            //   - 不影响 ms_budget (override 时间缩放在前面已完成)
+            //   - laser_enable_rt 强制 0 后, laser_rt_apply_aux 不会重开 (emergency_kill 同机制)
+            if (g_interpolator.mode_flags & SMC_MODE_DRY_RUN) {
+                // Dry-Run: 强制 0
+                g_interpolator.eff_spindle_mode_rt  = 0;
+                g_interpolator.eff_spindle_rpm_rt   = 0.0;
+                g_interpolator.eff_coolant_state_rt = 0;
+                g_interpolator.eff_laser_enable_rt  = 0;
+            } else {
+                // 正常: 应用主轴倍率 (连续生效, 旋钮变化 1 cycle 内可见)
+                g_interpolator.eff_spindle_mode_rt  = g_interpolator.spindle_mode_rt;
+                g_interpolator.eff_spindle_rpm_rt   = (g_interpolator.spindle_mode_rt != 0)
+                    ? g_interpolator.spindle_rpm_rt * g_interpolator.spindle_override_ratio
+                    : 0.0;
+                g_interpolator.eff_coolant_state_rt = g_interpolator.coolant_state_rt;
+                g_interpolator.eff_laser_enable_rt  = g_interpolator.laser_enable_rt;
+            }
 
             // ---- 无锁轨迹探针 + 仿真采集 (阶段 3 精简) ----
             // @Context: 1ms Hard-RT Thread (EtherCAT)
@@ -697,9 +792,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_coord_mgr.current_logical_pos,
                                 local_off,
                                 off_g54_x,
-                                g_interpolator.spindle_mode_rt,
-                                g_interpolator.spindle_rpm_rt,
-                                g_interpolator.coolant_state_rt,
+                                g_interpolator.eff_spindle_mode_rt,
+                                g_interpolator.eff_spindle_rpm_rt,
+                                g_interpolator.eff_coolant_state_rt,
                                 g_interpolator.current_tool_id_rt,
                                 // P0-Laser: 7 个激光状态镜像 (从 g_laser_rt 读)
                                 g_laser_rt.enable,
@@ -797,6 +892,12 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     // 只有 M64 (G04 dwell 转换来的穿孔段) 才算穿孔.
                     if (g_interpolator.current_mcode == 64) {
                         g_laser_rt.pierce_count++;
+                    }
+                    // P2-A-3: 单段模式 re-arm (M 段完成时)
+                    // M 段 (M3/M5/M8/M64 dwell 等) 完成后, 若 single_block 模式,
+                    // 设 pause_request=1, 下个 cycle 进 HOLD_PAUSED 等 Cycle Start.
+                    if (g_interpolator.mode_flags & SMC_MODE_SINGLE_BLOCK) {
+                        g_interpolator.pause_request = 1;
                     }
                 }
             }

@@ -284,6 +284,35 @@ typedef struct{
     // 段级快照原则 (B1 教训): 走段消费环同步, 不走全局读 g_state.laser_seg_flags.
     uint8_t  current_seg_flags_rt;
 
+    // ---- P2-A: 实时倍率 + 模式标志 (RT 单写者字段) ----
+    // 设计原因: CNC 操作面板必备 Feed/Rapid/Spindle 倍率旋钮 + 单段/空运行开关.
+    //          完全复用现有 time_scale 机制 (feedhold envelope 测试充分).
+    //          RT 在 ms_budget 计算时把 time_scale × override_ratio 得到 eff_scale.
+    // @Thread-Safety: 由非 RT 线程 (SMC_SetOverride) 写, RT 每 cycle 读.
+    //   int/double 对齐天然原子, 单字段读写不会撕裂 (与 g_parser_ctrl.* 同模式).
+    //   非一致快照容忍 (操作员旋钮转一刻度 → 1-2 个 cycle 内全部生效).
+    //
+    // v1 范围: feed/rapid 都是 [0.0, 1.0] (超 100% 留待 v2 验证 envelope 后开放).
+    //          spindle [0.0, 1.2] (50-120% 工业惯例, v1 允许 0% 完全停转).
+    double   feed_override_ratio;      // 默认 1.0, G01/G02/G03 段用
+    double   rapid_override_ratio;     // 默认 1.0, G00 段用 (dry_run 时所有段用此)
+    double   spindle_override_ratio;   // 默认 1.0, M3/M4 输出时乘 (连续生效, 见 ecat_core.c)
+    uint16_t mode_flags;               // SMC_MODE_* 位图 (见 smc_protocol.h)
+    int      _mode_pad16;              // 4B 对齐填充 (uint16 + 隐式 2B pad → 显式补 4B)
+    int      current_motion_type_rt;   // 段消费时从 seg.motion_type 拷贝 (0=G00/1=G01/2=G02/3=G03)
+    int      current_seg_is_exact_stop_rt;  // P2-A-4: 段消费时从 seg.is_exact_stop 拷贝 (精准停段=1)
+
+    // ---- P2-A-2: Override + Dry-Run 后的"有效输出"镜像 (RT 单写者) ----
+    // 设计原因: spindle/coolant/laser 的 raw 状态由 M 段消费时同步 (spindle_mode_rt 等),
+    //          但实际下发给 PDO/sim/snapshot 的应是 override 后的 effective 值.
+    //          干运行 (dry_run) 时强制 0 (industry std prove-out: 不出力).
+    // RT 每 cycle (seg-load while 之后) 一次性计算, 所有消费者 (sim_engine_push /
+    //   SnapshotHub_Publish / 未来 PDO 写) 都读 eff_*, 不读 raw *_rt.
+    int     eff_spindle_mode_rt;    // dry_run 时强制 0; 否则 = spindle_mode_rt
+    double  eff_spindle_rpm_rt;     // dry_run 时 0; 否则 = spindle_rpm_rt * spindle_override_ratio
+    int     eff_coolant_state_rt;   // dry_run 时 0; 否则 = coolant_state_rt
+    int     eff_laser_enable_rt;    // dry_run 时 0; 否则 = laser_enable_rt (laser_rt_apply_aux 处理 shutter/power)
+
 }Interpolator_t;
 
 /*
@@ -335,6 +364,12 @@ typedef struct{
     int is_rtcp_active; // 1=RTCP 路径产生段(经 Kinematics_Inverse 物理逆解);
                         // 仅元数据: 供 Trace 日志分类与未来度量扩展,
                         // 不参与插补决策 (target_pos 已是物理关节坐标)
+    // P2-A-4: G09/G61 精准停标记
+    // 0=连续切削 (G64 默认, 拐角允许 G64 容差内过弯不减速到 0)
+    // 1=精准停 (G09 单次 / G61 模态): planner 反向扫描强制 v_end=0, 正向扫描强制下段 v_start=0,
+    //   fillet_preprocess 跳过圆角化. 工业用途: 拐角清根/防过切/精密定位.
+    // 盖章时机: api_push_trajectory_impl 入队时 = g_state.modal_exact_stop || exact_stop_this_block
+    int is_exact_stop;
     // 工件坐标系索引 (G53..G59)，由 Parser 在 push 时从 g_state.modal_wcs 盖章。
     // RT 线程在消费本段时据此更新 g_coord_mgr.current_coord，避免 parser/RT 时序错位
     // 导致 UI 显示与宏系统变量 #5001+ 跳变到"未来坐标系"。

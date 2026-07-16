@@ -167,6 +167,24 @@ public:
     /* P-v 耦合查表 (count: 1..16, 越界 SDK 层拦截返回 ret_code=-1 不发 RPC) */
     bool ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count, int &out_ret_code);
 
+    /* =============================================================
+     * P2-A: 实时倍率系统 (Feed/Rapid/Spindle Override + Mode Flags)
+     *
+     * 典型流程: HMI 滑条/旋钮 onChange → SetOverride (mask/value 模式, 允许部分修改)
+     *           HMI 60Hz refresh → GetOverride (同步旋钮位置, 防止多 client 竞争)
+     *
+     * 参数语义 (与 SMC_SetOverride 一致):
+     *   feed_pct/rapid_pct/spindle_pct: -1=不改, 0..120=设置值 (clamp 后通过 out 回读)
+     *   mode_mask: 要修改的 mode_flags 位 (0=不改任何位)
+     *   mode_value: mask 标识的位写入 0 或 1
+     *   out.*: clamp 后的实际生效值
+     * 返回: true=协议层成功 (clamp 不视为错误)
+     * ============================================================= */
+    bool SetOverride(int feed_pct, int rapid_pct, int spindle_pct,
+                     uint16_t mode_mask, uint16_t mode_value,
+                     SmcSetOverrideRes &out);
+    bool GetOverride(SmcGetOverrideRes &out);
+
 private:
     /* ---------- 内部收发原语 ---------- */
     int  send_all(const void *buf, size_t n);

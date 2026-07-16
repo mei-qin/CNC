@@ -6,6 +6,7 @@
 #include "macro_eval.h"   // 宏变量与表达式引擎
 #include "program_loader.h"  // Phase 2B M1: 文件加载器 + N 标签 + GOTO
 #include "event_logger.h"    // P1-b: 参数校验报警 + 程序生命周期
+#include "smc_protocol.h"    // P2-A: SMC_MODE_* 位定义 (M30 override 重置用)
 #include <math.h>
 #include <stdatomic.h>    // atomic_store_explicit (M3 S 值保护报警)
 #define PI 3.14159265358979323846
@@ -842,6 +843,14 @@ int parse_gcode_line(const char *gcode_line)
                 }
                 else if(value==93.0) g_state.feed_mode=FEED_MODE_G93; // G93 倒数时间
                 else if(value==94.0) g_state.feed_mode=FEED_MODE_G94; // G94 每分钟
+                // ---- P2-A-4: G09/G61/G64 精准停 ----
+                // G09: 单次精准停 (仅本运动段 v_end=0, 不影响后续段模态)
+                // G61: 模态精准停开启 (后续所有段 v_end=0, 直到 G64 取消)
+                // G64: 模态连续切削 (默认, 拐角允许 G64 容差内过弯不归零)
+                // 工业用途: G09/G61 用于拐角清根/防过切/精密定位; G64 用于高速连续加工.
+                else if(value==9.0)  { g_state.exact_stop_this_block = 1; is_non_motion_g = 1; }
+                else if(value==61.0) { g_state.modal_exact_stop = 1; is_non_motion_g = 1; }
+                else if(value==64.0) { g_state.modal_exact_stop = 0; is_non_motion_g = 1; }
                 else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
                 else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
                 else if(fabs(value - 54.1) < 0.05){
@@ -1034,6 +1043,27 @@ int parse_gcode_line(const char *gcode_line)
                     g_state.gas_select            = 0;
                     // Laser B4: 清段级工艺标记 modal (防跨程序泄漏)
                     g_state.laser_seg_flags       = 0;
+
+                    // P2-A: M30/M2 重置 override (默认行为, 除非 OVERRIDE_PERSIST 置位)
+                    // 工业惯例: 每次新程序从 100% 开始, 防上次调机残留倍率影响下一件.
+                    // UI 想跨程序保留 (调试场景) 可设 SMC_MODE_OVERRIDE_PERSIST (bit4).
+                    // 此处直接写 g_interpolator (parser 已等队列空, RT 不会同时写 override).
+                    // @BugFix: 仅 RUN 模式 (真实程序结束) 重置. PREVIEW 仅是结构解析,
+                    //   不应对"尚未运行的程序"动手, 否则会抹掉操作员 Load 前设的倍率
+                    //   (典型工作流: SetOverride → LoadProgram → RunLoadedProgram).
+                    if (g_parser_ctrl.program_mode == PROGRAM_MODE_RUN) {
+                        if (!(g_interpolator.mode_flags & SMC_MODE_OVERRIDE_PERSIST)) {
+                            g_interpolator.feed_override_ratio    = 1.0;
+                            g_interpolator.rapid_override_ratio   = 1.0;
+                            g_interpolator.spindle_override_ratio = 1.0;
+                        }
+                        // 运行模式标志 (single block / dry run) 随 M30 程序复位一并清零,
+                        // 保证"程序结束 = 干净起点" (也满足 T11 期望 mode_flags=0).
+                        g_interpolator.mode_flags = 0;
+                    }
+                    // 模态精准停也要重置 (G61 不应跨程序)
+                    g_state.modal_exact_stop       = 0;
+                    g_state.exact_stop_this_block  = 0;
 
                     // Step 4: 抢写 RT 镜像, HMI 立即可见 spindle/coolant/laser 已停
                     g_interpolator.spindle_mode_rt  = 0;
@@ -1952,9 +1982,16 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             if(!abort_file){
                 printf("[Parser] 文件处理完成: %s (PC 步进 %d)\n",
                        g_parser_ctrl.filepath, g_pc_step_counter);
-                /* P1-b: 程序生命周期事件 - 解析完成 (M30 自然结束) */
-                EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0033, g_pc_step_counter,
-                                 "program done (M30 or EOF reached)");
+                /* P1-b: 程序生命周期事件 - 解析完成 (M30 自然结束)
+                 * P2-A-0 (2026-07-16): 区分 PREVIEW vs RUN 完成事件码
+                 *   - PREVIEW 走 0x0031 (LoadProgram done), UI 据此知道可 RunLoadedProgram
+                 *   - RUN 走 0x0033 (program done), UI 据此知道加工结束
+                 * 修复 P1-b 已知限制 #2 (0x0031 之前未独立 instrument). */
+                EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER,
+                                 g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? 0x0031 : 0x0033,
+                                 g_pc_step_counter,
+                                 g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ?
+                                    "LoadProgram done (preview)" : "program done (M30 or EOF reached)");
             }
 
             // ---- P0-b v2: LoadProgram (PREVIEW 模式) 完成信号 ----

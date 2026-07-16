@@ -92,6 +92,16 @@ typedef struct {
     // 入队时快照到 TrajectorySegment_t.seg_flags, UI 据此区分引线/微连接段.
     // M30/M2 程序结束自动清零 (跟其他 modal 字段一致), 防止跨程序泄漏.
     uint8_t laser_seg_flags;
+
+    // ---- P2-A-4: G09/G61/G64 精准停模态 ----
+    // modal_exact_stop: 0=G64 连续切削 (默认), 1=G61 精准停 (模态, 后续段都 v_end=0)
+    // exact_stop_this_block: G09 一次性标志, 入队后清零.
+    //   G-code 语义: G09 单次精准停本段, G61 模态精准停后续段, G64 取消模态精准停.
+    //   Fanuc 行为: G09 单独一行无运动代码时, 标志延续到下一运动段 (符合工业惯例).
+    // 入队时 (api_push_trajectory_impl): seg.is_exact_stop = modal_exact_stop || exact_stop_this_block;
+    //                                    exact_stop_this_block = 0;  // 消费一次
+    int modal_exact_stop;
+    int exact_stop_this_block;
 } GCodeState_t;
 
 typedef struct{

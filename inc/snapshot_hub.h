@@ -57,7 +57,8 @@ extern "C" {
 
 /* ---- 帧标识 (与 SmcPushFrameHeader.magic 一致) ---- */
 #define SMC_SNAPSHOT_MAGIC    0x534E4150u   /* "SNAP" little-endian */
-#define SMC_SNAPSHOT_VERSION  3u   /* v3: 加 current_seg_id + segment_progress 字段 (2026-07-13, P0-c) */
+#define SMC_SNAPSHOT_VERSION  4u   /* v4: P2-A 实时倍率字段 (2026-07-16).
+                                    *      v3: 加 current_seg_id + segment_progress 字段 (2026-07-13, P0-c) */
 
 #pragma pack(push, 1)
 
@@ -149,7 +150,24 @@ typedef struct {
     int32_t sys_alarm_state;     /* g_sys_alarm_state (0=正常, 1=软停机) */
     int32_t parser_is_running;   /* g_parser_ctrl.is_running (best-effort) */
     int32_t parser_is_paused;    /* g_parser_ctrl.is_paused (best-effort) */
-    int32_t _tail_pad;           /* 末尾对齐填充, 便于未来字段追加不破坏布局 */
+
+    /* === P2-A: 实时倍率 (16B, 2026-07-16) ===
+     * 反映 RT 当前生效的 override + mode_flags (与 SMC_GetOverride RPC 同源).
+     * UI 60Hz refresh 时直接读 snapshot, 不必再发 RPC, 减 9527 流量.
+     * 字段语义:
+     *   feed_override_pct    ∈ [0..100] (v1 锁 100, 超 100 clamp)
+     *   rapid_override_pct   ∈ [0..100]
+     *   spindle_override_pct ∈ [0..120]
+     *   mode_flags           见 smc_protocol.h SMC_MODE_* 位定义:
+     *                          bit0=SINGLE_BLOCK, bit1=DRY_RUN, bit4=OVERRIDE_PERSIST */
+    int32_t feed_override_pct;
+    int32_t rapid_override_pct;
+    int32_t spindle_override_pct;
+    int32_t mode_flags;
+
+    int32_t current_seg_is_exact_stop;  /* P2-A-4: 当前段 is_exact_stop 镜像 (RT 段消费环同步),
+                                           供客户端/测试识别精准停拐角 (G09/G61=1, G64=0).
+                                           复用原 _tail_pad 预留位, 保持 SNAP_SIZE=440 不变. */
 } SMC_Snapshot_t;
 
 #pragma pack(pop)

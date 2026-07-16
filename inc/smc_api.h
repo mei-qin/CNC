@@ -86,6 +86,33 @@ int SMC_SetOptionalStopEnable(int enable);
 
 
 // =======================================================
+// P2-A: 实时倍率系统 (Feed/Rapid/Spindle Override + Mode Flags)
+// =======================================================
+// 设计原则:
+//   - 完全复用现有 time_scale feedhold 机制 (ecat_core.c ms_budget 计算)
+//   - RT 单写者字段 (g_interpolator.feed_override_ratio 等), 非 RT 写, RT 读
+//   - v1 范围: feed/rapid [0..100]%, spindle [0..120]%; feed/rapid 超 100% clamp 到 100%
+//
+// SMC_SetOverride 语义 (mask/value 模式, 与位寄存器同):
+//   feed_pct/rapid_pct/spindle_pct: -1=不改, 0..120=设置值 (clamp 后通过 out 返回)
+//   mode_mask: 要修改的 mode_flags 位掩码 (0=不改任何位)
+//   mode_value: mask 标识的位写入 0 或 1 (其他位不变)
+//   out_*: 全部非 NULL 时回读 clamp 后的实际生效值 (UI 旋钮位置同步用)
+// 返回: 0=成功 (clamp 不视为错误), -1=参数全 -1 且 mask=0 (no-op)
+int SMC_SetOverride(int feed_pct, int rapid_pct, int spindle_pct,
+                    uint16_t mode_mask, uint16_t mode_value,
+                    int *out_feed, int *out_rapid, int *out_spindle,
+                    uint16_t *out_mode);
+
+// SMC_GetOverride 语义:
+//   反映 RT 当前生效的 override + mode_flags (RT 单写者 → 此处单读者)
+//   HMI 60Hz 调用安全 (与 SMC_GetSpindleState 同模式)
+// 返回: 0=成功, -1=参数全 NULL
+int SMC_GetOverride(int *feed_pct, int *rapid_pct, int *spindle_pct,
+                    uint16_t *mode_flags);
+
+
+// =======================================================
 // 运动控制 API
 // =======================================================
 // 设定原点 (工件坐标系 G54)，axis_letter='*' 全轴归零

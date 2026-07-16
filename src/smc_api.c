@@ -31,6 +31,16 @@ int SMC_InitAndStart(const char *netif_name)
 {
     printf("[SMC_API] 正在初始化运动控制内核...\n");
 
+    // P2-A: 实时倍率字段初始化 (必须在 RT 线程启动前完成)
+    // g_interpolator 是 BSS 零初始化全局, override_ratio 必须 1.0 (非零) 才能
+    //   保证未调 SMC_SetOverride 时正常加工 (feed=100% 默认).
+    // mode_flags 默认 0: single_block=0 / dry_run=0 / override_persist=0 (M30 重置生效).
+    g_interpolator.feed_override_ratio    = 1.0;
+    g_interpolator.rapid_override_ratio   = 1.0;
+    g_interpolator.spindle_override_ratio = 1.0;
+    g_interpolator.mode_flags             = 0;
+    g_interpolator.current_motion_type_rt = 0;
+
     // sim 模式: sim_drive 必须在 RT 线程启动前初始化好
     // 否则 RT 主循环进入 dorun==1 后立即调 sim_drive_get_sw 会读到 cia_state=0,
     // 而 sim_cia_advance 对未初始化状态返回原值, 状态机永久卡死。
@@ -772,5 +782,80 @@ int SMC_SetOptionalStopEnable(int enable)
 {
     g_optional_stop_enabled = enable ? 1 : 0;
     printf("[SMC_API] M1 可选停开关 -> %d\n", g_optional_stop_enabled);
+    return 0;
+}
+
+// ================== P2-A: 实时倍率系统 ==================
+// @Context: Non-RealTime (HMI/CAM 通过 RPC 调用)
+// @Thread-Safety: 单写者 (此 API), RT 单读者 (每 cycle ms_budget 计算).
+//   int/double 对齐天然原子, 单字段不会撕裂. 多字段非一致快照容忍
+//   (操作员旋钮转一刻度 → 1-2 个 cycle 内全部生效).
+//
+// clamp 规则 (v1):
+//   feed_pct   ∈ [0, 100]  (> 100 clamp 100, 不报错)
+//   rapid_pct  ∈ [0, 100]
+//   spindle_pct ∈ [0, 120]
+// clamp 不视为错误, ret_code=0, 实际值通过 out_* 回读.
+int SMC_SetOverride(int feed_pct, int rapid_pct, int spindle_pct,
+                    uint16_t mode_mask, uint16_t mode_value,
+                    int *out_feed, int *out_rapid, int *out_spindle,
+                    uint16_t *out_mode)
+{
+    // 全 no-op 检测 (UI 误调用保护)
+    if (feed_pct < 0 && rapid_pct < 0 && spindle_pct < 0 && mode_mask == 0) {
+        if (out_feed)    *out_feed    = (int)(g_interpolator.feed_override_ratio   * 100.0 + 0.5);
+        if (out_rapid)   *out_rapid   = (int)(g_interpolator.rapid_override_ratio  * 100.0 + 0.5);
+        if (out_spindle) *out_spindle = (int)(g_interpolator.spindle_override_ratio * 100.0 + 0.5);
+        if (out_mode)    *out_mode    = g_interpolator.mode_flags;
+        return -1;
+    }
+
+    // feed_override_ratio
+    if (feed_pct >= 0) {
+        int v = feed_pct;
+        if (v > 100) v = 100;       // v1 锁 100
+        g_interpolator.feed_override_ratio = v / 100.0;
+    }
+    // rapid_override_ratio
+    if (rapid_pct >= 0) {
+        int v = rapid_pct;
+        if (v > 100) v = 100;
+        g_interpolator.rapid_override_ratio = v / 100.0;
+    }
+    // spindle_override_ratio
+    if (spindle_pct >= 0) {
+        int v = spindle_pct;
+        if (v > 120) v = 120;
+        g_interpolator.spindle_override_ratio = v / 100.0;
+    }
+    // mode_flags: mask/value 模式 (与位寄存器同)
+    if (mode_mask != 0) {
+        uint16_t cur = g_interpolator.mode_flags;
+        uint16_t new_flags = (cur & ~mode_mask) | (mode_value & mode_mask);
+        g_interpolator.mode_flags = new_flags;
+    }
+
+    // 回读 clamp 后实际生效值 (UI 旋钮位置同步用)
+    if (out_feed)    *out_feed    = (int)(g_interpolator.feed_override_ratio   * 100.0 + 0.5);
+    if (out_rapid)   *out_rapid   = (int)(g_interpolator.rapid_override_ratio  * 100.0 + 0.5);
+    if (out_spindle) *out_spindle = (int)(g_interpolator.spindle_override_ratio * 100.0 + 0.5);
+    if (out_mode)    *out_mode    = g_interpolator.mode_flags;
+
+    printf("[SMC_API] Override: feed=%d%% rapid=%d%% spindle=%d%% mode=0x%04X\n",
+           (int)(g_interpolator.feed_override_ratio   * 100.0 + 0.5),
+           (int)(g_interpolator.rapid_override_ratio  * 100.0 + 0.5),
+           (int)(g_interpolator.spindle_override_ratio * 100.0 + 0.5),
+           g_interpolator.mode_flags);
+    return 0;
+}
+
+int SMC_GetOverride(int *feed_pct, int *rapid_pct, int *spindle_pct,
+                    uint16_t *mode_flags)
+{
+    if (!feed_pct && !rapid_pct && !spindle_pct && !mode_flags) return -1;
+    if (feed_pct)    *feed_pct    = (int)(g_interpolator.feed_override_ratio   * 100.0 + 0.5);
+    if (rapid_pct)   *rapid_pct   = (int)(g_interpolator.rapid_override_ratio  * 100.0 + 0.5);
+    if (spindle_pct) *spindle_pct = (int)(g_interpolator.spindle_override_ratio * 100.0 + 0.5);
+    if (mode_flags)  *mode_flags  = g_interpolator.mode_flags;
     return 0;
 }

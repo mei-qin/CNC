@@ -25,7 +25,8 @@ import signal
 
 # ---- 协议常量 (与 inc/snapshot_hub.h / inc/rpc_push_server.h 一致) ----
 SNAP_MAGIC = 0x534E4150   # "SNAP" little-endian
-SNAP_VERSION = 3          # v3: 加 current_seg_id + segment_progress (2026-07-13, P0-c)
+SNAP_VERSION = 4          # v4: P2-A 实时倍率字段 (2026-07-16)
+                           # v3: 加 current_seg_id + segment_progress (2026-07-13, P0-c)
 SMC_CMD_SUBSCRIBE = 0x002A
 SMC_ACK_MAGIC = 0x534E414B   # "SNAK" - SubscribeAck 帧, 与 SNAP 同族末字节不同
 
@@ -93,11 +94,15 @@ SNAP_FMT = (
     "i"    # sys_alarm_state
     "i"    # parser_is_running
     "i"    # parser_is_paused
-    "i"    # _tail_pad
+    "i"    # feed_override_pct        (v4 新增: P2-A 实时倍率)
+    "i"    # rapid_override_pct       (v4 新增)
+    "i"    # spindle_override_pct     (v4 新增)
+    "i"    # mode_flags               (v4 新增: SMC_MODE_* 位图)
+    "i"    # current_seg_is_exact_stop (P2-A-4: 精准停段镜像, 复用原 _tail_pad 位)
 )
 
 SNAP_SIZE = struct.calcsize(SNAP_FMT)
-assert SNAP_SIZE == 424, f"SMC_Snapshot_t size mismatch: {SNAP_SIZE} != 424 (v3 含 current_seg_id + segment_progress)"
+assert SNAP_SIZE == 440, f"SMC_Snapshot_t size mismatch: {SNAP_SIZE} != 440 (v4 含 P2-A 倍率字段)"
 
 # 字段名 (与 SNAP_FMT 顺序一致, 数组字段保留为元组)
 SNAP_FIELDS = [
@@ -112,7 +117,9 @@ SNAP_FIELDS = [
     "spindle_mode", "spindle_rpm", "coolant_state", "tool_id",
     "laser_enable", "laser_shutter", "laser_power_w", "laser_freq_hz",
     "gas_select", "laser_emergency_kill", "laser_interlock", "_pad16", "laser_v_actual_mm_s",
-    "sys_alarm_state", "parser_is_running", "parser_is_paused", "_tail_pad",
+    "sys_alarm_state", "parser_is_running", "parser_is_paused",
+    "feed_override_pct", "rapid_override_pct", "spindle_override_pct", "mode_flags",
+    "current_seg_is_exact_stop",
 ]
 
 # flags 位定义
@@ -291,6 +298,11 @@ def main():
 
         # 单行打印关键字段
         mp = snap["machine_pos"]
+        # P2-A: 倍率显示 (F/R/S%, mode_flags 解码)
+        mode_str = (
+            f"{'SB' if snap['mode_flags'] & 0x01 else '--'}"
+            f"{'DR' if snap['mode_flags'] & 0x02 else '--'}"
+        )
         print(
             f"cycle={snap['cycle']:>8} seq={snap['snapshot_seq']:>6} "
             f"state={state_str(snap):<14} "
@@ -299,6 +311,7 @@ def main():
             f"{motion_str(snap['motion_mode'])} "
             f"spindle={snap['spindle_mode']}@{snap['spindle_rpm']:.0f}rpm "
             f"laser={snap['laser_enable']}P={snap['laser_power_w']:.0f}W "
+            f"ovr=F{snap['feed_override_pct']}%/R{snap['rapid_override_pct']}%/S{snap['spindle_override_pct']}%[{mode_str}] "
             f"up={snap['uptime_ms']/1000.0:.2f}s "
             f"vt={snap['virtual_time_ms']:.1f}ms "
             f"ts={snap['time_scale']:.2f} "

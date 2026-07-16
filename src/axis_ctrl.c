@@ -502,6 +502,12 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->is_fillet = is_fillet ? 1 : 0;
     seg->is_g93_strict = (is_g93_strict && g93_dt_sec > 1e-9) ? 1 : 0;
     seg->is_rtcp_active = is_rtcp_active ? 1 : 0;
+    // P2-A-4: G09/G61 精准停盖章
+    // modal_exact_stop: G61 模态开启 (后续段都精准停)
+    // exact_stop_this_block: G09 单次标志 (本段精准停, 消费一次)
+    // 消费一次后清零, 防 G09 单独行无运动时泄漏到后续段 (Fanuc 语义保留为正常行为)
+    seg->is_exact_stop = (g_state.modal_exact_stop || g_state.exact_stop_this_block) ? 1 : 0;
+    g_state.exact_stop_this_block = 0;
     seg->active_wcs = wcs;   // 段内带内 WCS, RT 消费时同步 g_coord_mgr.current_coord
     for(int i = 0; i < AXIS_NUM; i++){
         seg->wcs_offset_snap[i] = wcs_offset_snap[i];  // H-1: 冻结入队瞬间的偏置向量

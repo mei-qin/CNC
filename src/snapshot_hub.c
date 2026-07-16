@@ -101,11 +101,12 @@ void SnapshotHub_Publish(uint32_t cycle)
     /* g_state.feedrate_mm_min: best-effort 读 (parser 写) */
     p->feedrate_mm_min = g_state.feedrate_mm_min;
 
-    /* Modal (g_state, best-effort 读, parser 写频率 ~10Hz)
-     * 注意 motion_mode 反映"当前活动运动类型", IDLE (is_moving=0) 时强制 0.
-     * 原始 modal 残留 (G01 等) 在 IDLE 时显示会让 UI 用户误判正在切削.
-     * modal 状态 UI 可从 cycle start 后首段 G 代码识别, 不需 snapshot 提供. */
-    p->motion_mode   = p->is_moving ? g_state.motion_mode : 0;
+    /* Modal (RT 单写者 current_motion_type_rt, 段装载时更新, ecat_core.c:606)
+     * 注意: 不能用 g_state.motion_mode — 那是 parser 解析期的 modal, RUN 执行期
+     *       已滞后/被后续段覆盖, 导致运行中 motion_mode 恒为 0 (T1/T2 中段过滤失效).
+     *       改用 RT 实际当前段 motion_type (G00=0, G01=1, G02=2, G03=3).
+     *       IDLE (is_moving=0) 时强制 0, 避免残留 modal 误导 UI. */
+    p->motion_mode   = p->is_moving ? g_interpolator.current_motion_type_rt : 0;
     p->active_plane  = g_state.active_plane;
     p->is_absolute   = g_state.is_absolute;
     p->feed_mode     = g_state.feed_mode;
@@ -119,14 +120,19 @@ void SnapshotHub_Publish(uint32_t cycle)
         p->logical_pos[i]   = g_coord_mgr.current_logical_pos[i];
     }
 
-    /* 主轴/冷却/刀 (_rt 镜像, RT 单写者: 段消费时从 seg 同步) */
-    p->spindle_mode  = g_interpolator.spindle_mode_rt;
-    p->spindle_rpm   = g_interpolator.spindle_rpm_rt;
-    p->coolant_state = g_interpolator.coolant_state_rt;
+    /* 主轴/冷却/刀 (P2-A-2: 使用 eff_* override 后的有效输出, 不是 raw *_rt)
+     * dry_run 时 eff_* 全 0 (强制 spindle/coolant/laser 不出力);
+     * 主轴倍率旋钮实时反映 (eff_spindle_rpm_rt = raw * spindle_override_ratio). */
+    p->spindle_mode  = g_interpolator.eff_spindle_mode_rt;
+    p->spindle_rpm   = g_interpolator.eff_spindle_rpm_rt;
+    p->coolant_state = g_interpolator.eff_coolant_state_rt;
     p->tool_id       = g_interpolator.current_tool_id_rt;
 
-    /* 激光 (g_laser_rt, RT 单写者) */
-    p->laser_enable         = g_laser_rt.enable;
+    /* 激光 (g_laser_rt, RT 单写者)
+     * 注意: laser_enable 用 eff_* 镜像 (与 spindle/coolant 一致),
+     * 这样 dry_run 时 eff_laser_enable_rt=0 会正确反映到 snapshot,
+     * 否则 dry-run 主轴/激光强制 0 的安全机制在 HMI 上看不出来. */
+    p->laser_enable         = g_interpolator.eff_laser_enable_rt;
     p->laser_shutter        = g_laser_rt.shutter;
     p->laser_power_w        = g_laser_rt.power_w;
     p->laser_freq_hz        = g_laser_rt.freq_hz;
@@ -139,6 +145,14 @@ void SnapshotHub_Publish(uint32_t cycle)
     p->sys_alarm_state   = atomic_load_explicit(&g_sys_alarm_state, memory_order_relaxed);
     p->parser_is_running = g_parser_ctrl.is_running;   /* best-effort */
     p->parser_is_paused  = g_parser_ctrl.is_paused;    /* best-effort */
+
+    /* P2-A: 实时倍率 (与 SMC_GetOverride RPC 同源, UI 60Hz 直接读 snapshot) */
+    p->feed_override_pct    = (int32_t)(g_interpolator.feed_override_ratio    * 100.0 + 0.5);
+    p->rapid_override_pct   = (int32_t)(g_interpolator.rapid_override_ratio   * 100.0 + 0.5);
+    p->spindle_override_pct = (int32_t)(g_interpolator.spindle_override_ratio * 100.0 + 0.5);
+    p->mode_flags           = (int32_t)g_interpolator.mode_flags;
+    /* P2-A-4: 精准停段镜像 (复用原 _tail_pad 位) */
+    p->current_seg_is_exact_stop = g_interpolator.current_seg_is_exact_stop_rt;
 
     /* flags 位图聚合 (SDK 端做 RUN/HOLD/ALARM 语义聚合更方便) */
     uint32_t fl = 0;

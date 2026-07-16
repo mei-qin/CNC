@@ -104,6 +104,8 @@ typedef enum {
     SMC_CMD_MOVE_RELATIVE            = 0x0031,
     SMC_CMD_GO_ZERO                  = 0x0032,
     SMC_CMD_GET_LASER_STATE          = 0x0033,  /* P0-Laser-Q: 激光器完整状态查询 (含统计) */
+    SMC_CMD_SET_OVERRIDE             = 0x0034,  /* P2-A: 实时倍率 + 模式标志设置 */
+    SMC_CMD_GET_OVERRIDE             = 0x0035,  /* P2-A: 实时倍率 + 模式标志查询 */
 
     /* --- G 代码加工 0x0040 ~ 0x004F --- */
     SMC_CMD_RUN_GCODE_FILE           = 0x0040,
@@ -346,6 +348,50 @@ typedef struct {
 typedef struct {
     int32_t ret_code;
 } SmcSetOptionalStopEnableRes;
+
+/* ============================================================
+ * P2-A: 实时倍率系统 mode_flags 位定义 (与 g_interpolator.mode_flags 一致)
+ * UI/HMI 通过 SMC_SetOverride mask/value 模式修改, RT 每 cycle 读.
+ * ============================================================ */
+#define SMC_MODE_SINGLE_BLOCK     0x0001   /* bit0: 单段模式 (每段完成自动 feedhold, 等 Cycle Start) */
+#define SMC_MODE_DRY_RUN          0x0002   /* bit1: 空运行 (G01/G02/G03 走 rapid_override 通道,
+                                            *        spindle/coolant/laser 输出强制 0 - 工业安全 prove-out) */
+#define SMC_MODE_OPTIONAL_STOP    0x0004   /* bit2: M1 可选停使能 (复用现有 SMC_SetOptionalStopEnable 语义,
+                                            *        v1 保留位, 通过 SMC_SetOverride 写入不同步到 g_optional_stop_enabled,
+                                            *        UI 调用 SMC_SetOptionalStopEnable 才生效) */
+#define SMC_MODE_BLOCK_SKIP_VERIFY 0x0008  /* bit3: 跳步验证 (v1 预留位, / 跳步号校验, 不影响 RT) */
+#define SMC_MODE_OVERRIDE_PERSIST  0x0010  /* bit4: M30/M2 程序结束时不重置 override 旋钮 (默认重置) */
+/* bit5..15 预留 */
+
+/* SMC_SET_OVERRIDE (0x0034): mask/value 模式修改倍率 + 模式
+ * -1 = 不改 (允许部分修改), 0..120 = 设置值 (clamp 后通过 Res 回读)
+ * 全部 -1 且 mask=0 视为 no-op, 返回 ret_code=-1 */
+typedef struct {
+    int32_t  feed_pct;        /* -1=不改, [0..100]% (v1 锁 100, 超 100 clamp) */
+    int32_t  rapid_pct;       /* -1=不改, [0..100]% */
+    int32_t  spindle_pct;     /* -1=不改, [0..120]% (50-120% 工业惯例, v1 允许 0%) */
+    uint16_t mode_mask;       /* 要修改的 mode_flags 位 (0=不改任何位) */
+    uint16_t mode_value;      /* mask 标识的位写入 0 或 1 */
+} SmcSetOverrideReq;
+
+typedef struct {
+    int32_t  ret_code;            /* 0=ok, -1=no-op (全 -1 且 mask=0) */
+    int32_t  actual_feed_pct;     /* clamp 后的实际生效值 */
+    int32_t  actual_rapid_pct;
+    int32_t  actual_spindle_pct;
+    uint16_t actual_mode_flags;
+    uint16_t _pad16;
+} SmcSetOverrideRes;
+
+/* SMC_GET_OVERRIDE (0x0035): 无 Req, Res 回读 RT 当前生效值 */
+typedef struct {
+    int32_t  feed_pct;
+    int32_t  rapid_pct;
+    int32_t  spindle_pct;
+    uint16_t mode_flags;
+    uint16_t _pad16;
+    int32_t  ret_code;            /* 0=ok (永远成功, 即使参数 NULL 也返回 -1) */
+} SmcGetOverrideRes;
 
 /* ----- 运动控制 ----- */
 typedef struct {

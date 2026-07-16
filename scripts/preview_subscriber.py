@@ -31,7 +31,7 @@ import signal
 # ---- 协议常量 ----
 PREV_MAGIC       = 0x53524556   # "PREV"
 PREV_ACK_MAGIC   = 0x50524146   # "PRAK"
-PREV_VERSION     = 2          # v2: TrajectorySegment_t 加 seg_flags (Laser B4)
+PREV_VERSION     = 3          # v3: TrajectorySegment_t 加 is_exact_stop (P2-A 精准停, 2026-07-16)
 SMC_CMD_PREVIEW_SUBSCRIBE = 0x002B
 
 # SmcReqHeader: uint16 cmd_type + uint16 data_len
@@ -63,9 +63,10 @@ SEG_FMT = "@" + "".join([
     "i",      # is_fillet                    72-75
     "i",      # is_g93_strict                76-79
     "i",      # is_rtcp_active               80-83
-    "i",      # active_wcs                   84-87
-    "5d",     # wcs_offset_snap[5]           88-127
-    "i",      # m_code                       128-131
+    "i",      # is_exact_stop (P2-A v3)      84-87
+    "i",      # active_wcs                   88-91
+    "5d",     # wcs_offset_snap[5]           92-131
+    "i",      # m_code                       132-135
               # pad 4B                       132-135
     "d",      # s_value                      136-143
     "d",      # p_value                      144-151
@@ -99,13 +100,13 @@ SEG_FMT = "@" + "".join([
     "d",      # jerk                         552-559
 ])
 SEG_SIZE = struct.calcsize(SEG_FMT)
-# 预期 560, 实际由 ack.seg_size_bytes 校验
+# 预期 564 (v3 含 is_exact_stop), 实际由 ack.seg_size_bytes 校验
 
 # 字段名 (与 SEG_FMT 顺序一致; 数组字段保留为 tuple)
 SEG_FIELDS = [
     "target_pos", "is_ready", "speed", "cmd_type",
     "seg_id", "line_no", "motion_type", "seg_flags",
-    "is_fillet", "is_g93_strict", "is_rtcp_active", "active_wcs",
+    "is_fillet", "is_g93_strict", "is_rtcp_active", "is_exact_stop", "active_wcs",
     "wcs_offset_snap",
     "m_code", "s_value", "p_value", "q_value", "r_value",
     "aux_spindle_mode", "aux_spindle_rpm",

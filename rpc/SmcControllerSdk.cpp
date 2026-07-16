@@ -660,8 +660,51 @@ bool SmcController::GetLaserState(SmcGetLaserStateRes &out)
 }
 
 /* ============================================================
- * P0-Laser-ConfigRPC: 激光配置 (0x0050-0x0056)
- * 7 个方法同模式: memset Req → 填字段 → invokeIntRet 发送
+ * P2-A: 实时倍率系统 (Feed/Rapid/Spindle Override + Mode Flags)
+ * ============================================================ */
+bool SmcController::SetOverride(int feed_pct, int rapid_pct, int spindle_pct,
+                                uint16_t mode_mask, uint16_t mode_value,
+                                SmcSetOverrideRes &out)
+{
+    /* Req = SmcSetOverrideReq (mask/value 模式, -1=不改允许部分修改)
+     * Res = SmcSetOverrideRes (含 clamp 后实际生效值, UI 旋钮位置同步用) */
+    SmcSetOverrideReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.feed_pct    = feed_pct;
+    req.rapid_pct   = rapid_pct;
+    req.spindle_pct = spindle_pct;
+    req.mode_mask   = mode_mask;
+    req.mode_value  = mode_value;
+
+    std::lock_guard<std::mutex> lock(comm_mutex_);
+    if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
+    if (!sendRequest(SMC_CMD_SET_OVERRIDE, &req, sizeof(req))) return false;
+
+    int32_t  err = 0;
+    uint32_t len = 0;
+    if (!recvResponse(err, &out, sizeof(out), len)) return false;
+    if (err != SMC_OK) { last_err_ = err; return false; }
+    if (len < sizeof(out)) { last_err_ = SMC_ERR_INTERNAL; return false; }
+    return true;
+}
+
+bool SmcController::GetOverride(SmcGetOverrideRes &out)
+{
+    /* 无 Req, Res 直接拷到 out (~16B). 与 GetLaserState 同模式. */
+    std::lock_guard<std::mutex> lock(comm_mutex_);
+    if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
+    if (!sendRequest(SMC_CMD_GET_OVERRIDE, nullptr, 0)) return false;
+
+    int32_t  err = 0;
+    uint32_t len = 0;
+    if (!recvResponse(err, &out, sizeof(out), len)) return false;
+    if (err != SMC_OK) { last_err_ = err; return false; }
+    if (len < sizeof(out)) { last_err_ = SMC_ERR_INTERNAL; return false; }
+    return true;
+}
+
+/* ============================================================
+ * P0-Laser-ConfigRPC: 激光配置 (0x0050-0x0056) * 7 个方法同模式: memset Req → 填字段 → invokeIntRet 发送
  * 参考 ConfigAxisDynamics (line 442-455) 的 invokeIntRet 用法
  * ============================================================ */
 bool SmcController::ConfigLaserIO(int do_slave_id, int ao_slave_id, int di_slave_id,
