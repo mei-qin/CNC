@@ -268,6 +268,113 @@ int SMC_ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count);
 int SMC_GetLaserState(SmcGetLaserStateRes *out);
 
 
+// =======================================================
+// P0-3: Safe Z Lift (紧急抬升避让)
+// =======================================================
+// 设计原则:
+//   - 报警时 (emergency_kill 同周期) 自动把 Z 抬到配置的 G53 绝对安全高度
+//     防激光头停在工件上方 0.5~2mm 处, 操作员开门处理时碰撞
+//   - 抬升由 RT 独立子状态机执行 (不走段消费环, 不走 time_scale)
+//     修改 g_axis[z].current_cmd_pos, PDO 写入循环自动传播 (单驱/双驱天然适配)
+//   - 配置时序: 必须在 SMC_InitAndStart 之前调 (与 ConfigAxisDynamics 同语义)
+//
+// 配置 API:
+//   z_letter:        Z 轴字母 (如 'Z'), 经 axis_lookup 解析
+//   safe_z_mm:       G53 绝对机床坐标目标 (推荐 +50mm; 必须 ≤ Z 软限位正限)
+//   lift_speed_mm_s: 抬升速度 (默认 20.0; 越大越快但驱动器扭矩要求越高)
+//   auto_on_alarm:   0=仅手动 API 触发, 1=报警路径自动触发 + 手动仍可用
+// 返回: 0=成功, -1=轴未配置/参数非法/旋转轴, -2=safe_z 超软限位 (event 0x0044)
+int SMC_ConfigSafeLiftZ(char z_letter, double safe_z_mm,
+                        double lift_speed_mm_s, int auto_on_alarm);
+
+// 手动触发抬升 (idempotent: PENDING/RUNNING/DONE 中再调为 no-op, 返回 0)
+// 不需 alarm 上下文, 加工中也可调用作为紧急避让
+// 返回: 0=请求已提交, -1=未配置
+int SMC_SafeLiftZ(void);
+
+// 取消抬升 (仅 PENDING/DONE 状态有效, RUNNING 拒绝避免 Z 卡在中间高度)
+// 返回: 0=已取消, -1=正在抬升中拒绝 (避免撞刀)
+int SMC_CancelSafeLiftZ(void);
+
+// 查询抬升状态 (HMI 用)
+//   *out_state: 0=IDLE, 1=PENDING, 2=RUNNING, 3=DONE
+//   *out_progress_mm: 已抬升距离 (current_z - start_z), 可为 NULL
+// 返回: 0=成功, -1=未配置
+int SMC_GetSafeLiftState(int *out_state, double *out_progress_mm);
+
+
+// =======================================================
+// P0-1: 工业级回零 (G28 / SMC_HomeAxis / SMC_HomeAll)
+// =======================================================
+// 设计原则:
+//   - 5 状态机: IDLE → PENDING → RUNNING → DONE / FAULT
+//   - RT 仅维护状态字段 + 冻结 queue (不阻塞); Non-RT (parser_thread) 跑阻塞 axis_homing()
+//   - method 35 (软件法, v1) / method 1-19 (硬件, v2 预留)
+//   - 串行顺序默认 Z → X → Y → B → C, 可配置
+//   - 部分成功 all-or-nothing: HomeAll 第 N 轴失败回滚前 N-1 轴
+//   - 与 SafeLift/JOG 三功能互斥 (cycle 头检测)
+//   - 配置时序: 必须在 SMC_InitAndStart 之前调
+
+// 配置单轴回零参数 (init 阶段)
+// axis_letter:   轴字母
+// method:        35 (v1 唯一支持), 1-19 v1 拒绝 (-3)
+// search_speed:  method 1-19 寻零速度 mm/s (v1 忽略)
+// creep_speed:   method 1-19 蠕动速度 mm/s (v1 忽略)
+// direction:     +1 / -1 (method 1-19 寻零方向)
+// timeout_ms:    超时 (默认 10000), 大行程轴可设 30000
+// 返回: 0=ok, -1=轴未配置/参数非法/运行中, -3=method 不支持
+int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
+                     double creep_speed, int direction, int timeout_ms);
+
+// 配置回零顺序 (init 阶段)
+// order_letters: 轴字母字符串, 如 "ZXYBC" (Z 先, C 后)
+// 返回: 0=ok, -1=参数非法, -2=未配置的轴
+int SMC_ConfigHomingAll(const char *order_letters);
+
+// 单轴回零 (异步, 立即返回)
+// 返回: 0=已提交, -1=未配置/parser 正在跑/与其他子状态机冲突
+int SMC_HomeAxis(char axis_letter);
+
+// 全轴串行回零 (异步, 立即返回; 内部按 order 顺序, all-or-nothing 回滚)
+// 返回: 0=已提交, -1=未配置/parser 正在跑/与其他子状态机冲突
+int SMC_HomeAll(void);
+
+// 取消回零 (仅 PENDING/DONE, RUNNING 拒绝)
+// 返回: 0=已取消, -1=未配置/正在 RUNNING 拒绝
+int SMC_CancelHoming(void);
+
+// 查询回零状态 (HMI 用)
+//   *out_state: 0=IDLE, 1=PENDING, 2=RUNNING, 3=DONE, 4=FAULT
+//   *out_axis_idx: 当前回零轴 (-1=HomeAll 顺序模式)
+//   *out_progress_pct: 进度 0.0-1.0 (HomeAll 模式按轴数计算)
+// 返回: 0=ok, -1=未配置
+int SMC_GetHomingState(int *out_state, int *out_axis_idx, double *out_progress_pct);
+
+
+// =======================================================
+// P0-1: JOG 模式 (method 35 前置依赖 — 手动定位参考位)
+// =======================================================
+// 设计原则:
+//   - 持续运动直到 SMC_JogStop 或撞软限位
+//   - 不切 op-mode (复用 CSP), RT 子状态机直接写 current_cmd_pos 增量
+//   - 与 SafeLift/Homing 互斥
+//   - 软限位撞停自停 + event 0x000B
+
+// 启动 JOG (持续运动)
+//   direction: +1 正向 / -1 负向
+//   speed_mm_s: JOG 速度 (典型 10-50 mm/s)
+// 返回: 0=已启动, -1=轴未配置/运动中/homing 中/safelift 中, -2=方向非法
+int SMC_JogStart(char axis_letter, int direction, double speed_mm_s);
+
+// 停止 JOG (零差, 直接停, 不做减速规划)
+//   axis_letter: '*' 停所有轴
+// 返回: 0=已停止, -1=未在 JOG
+int SMC_JogStop(char axis_letter);
+
+// JOG 中实时位置查询 (UI 显示用, 等价于 SMC_GetLogicalPos 但语义清晰)
+double SMC_JogGetPos(char axis_letter);
+
+
 #ifdef __cplusplus
 }
 #endif

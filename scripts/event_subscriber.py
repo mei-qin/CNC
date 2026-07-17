@@ -50,6 +50,12 @@ EVENT_CODE_DESC = {
     (4, 0x0002): "drive SW_ERROR",
     (4, 0x0003): "follow err hard",
     (4, 0x0004): "follow err warn",
+    (4, 0x0005): "safe_z_lift state",  # P0-3: value=0 done(above) / 1 cancel / 2 running / 3 done / interlock位图(alarm触发)
+    (4, 0x0006): "homing state",      # P0-1: value=1 pending / 2 running / 3 done / 4 cancel
+    (4, 0x0007): "homing timeout",    # P0-1: value=axis_idx
+    (4, 0x0008): "homing FAULT",      # P0-1: value=axis_idx (含 all-or-nothing 回滚)
+    (4, 0x0009): "homing method N/A", # P0-1: value=method (v1 仅 35)
+    (4, 0x000B): "jog soft limit",    # P0-1: value=axis_idx
     # LASER
     (3, 0x0010): "laser safety door",
     (3, 0x0011): "estop soft",
@@ -68,6 +74,10 @@ EVENT_CODE_DESC = {
     # MANUAL
     (6, 0x0040): "ClearAlarm req",
     (6, 0x0041): "alarm cleared by RT",
+    (6, 0x0042): "override changed",       # P2-A
+    (6, 0x0043): "safe_z_lift manual",     # P0-3: value=0 pending / 1 cancelled
+    (6, 0x0044): "safe_lift config reject",# P0-3: value=safe_z_mm × 100
+    (6, 0x004A): "jog start",              # P0-1: value=axis_idx
 }
 
 REQ_HDR_FMT = "<HH"

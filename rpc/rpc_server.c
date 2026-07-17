@@ -637,6 +637,155 @@ static int handle_client_request(int client_fd)
         break;
     }
 
+    /* ===== P0-3: Safe Z Lift ===== */
+    case SMC_CMD_CONFIG_SAFE_LIFT: {
+        if (req_hdr.data_len < sizeof(SmcConfigSafeLiftReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigSafeLiftReq *req = (SmcConfigSafeLiftReq *)payload;
+        SmcConfigSafeLiftRes *res = (SmcConfigSafeLiftRes *)resp_buf;
+        res->ret_code = SMC_ConfigSafeLiftZ((char)req->z_letter,
+                                             req->safe_z_mm,
+                                             req->lift_speed_mm_s,
+                                             req->auto_on_alarm);
+        printf("[rpc] ConfigSafeLiftZ: z=%c target=%.2f ret=%d\n",
+               (char)req->z_letter, req->safe_z_mm, res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigSafeLiftRes);
+        break;
+    }
+    case SMC_CMD_SAFE_LIFT_TRIGGER: {
+        /* 无 Req */
+        SmcSafeLiftTriggerRes *res = (SmcSafeLiftTriggerRes *)resp_buf;
+        res->ret_code = SMC_SafeLiftZ();
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcSafeLiftTriggerRes);
+        break;
+    }
+    case SMC_CMD_SAFE_LIFT_CANCEL: {
+        /* 无 Req */
+        SmcSafeLiftCancelRes *res = (SmcSafeLiftCancelRes *)resp_buf;
+        res->ret_code = SMC_CancelSafeLiftZ();
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcSafeLiftCancelRes);
+        break;
+    }
+    case SMC_CMD_GET_SAFE_LIFT: {
+        /* 无 Req, Res = SmcGetSafeLiftRes (~36B) */
+        SmcGetSafeLiftRes *res = (SmcGetSafeLiftRes *)resp_buf;
+        int state = 0;
+        double progress = 0.0;
+        int rc = SMC_GetSafeLiftState(&state, &progress);
+        res->ret_code     = rc;
+        res->state        = state;
+        res->enabled      = g_safe_lift_cfg.enabled;
+        res->_pad         = 0;
+        res->progress_mm  = progress;
+        res->z_target_mm  = g_safe_lift_cfg.safe_z_target_mm;
+        res->z_current_mm = (g_safe_lift_cfg.enabled && g_safe_lift_cfg.z_axis_idx >= 0)
+                            ? g_axis[g_safe_lift_cfg.z_axis_idx].current_cmd_pos
+                            : 0.0;
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetSafeLiftRes);
+        break;
+    }
+
+    /* ===== P0-1 Homing ===== */
+    case SMC_CMD_CONFIG_HOMING_AXIS: {
+        if (req_hdr.data_len < sizeof(SmcConfigHomingAxisReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigHomingAxisReq *req = (SmcConfigHomingAxisReq *)payload;
+        SmcConfigHomingAxisRes *res = (SmcConfigHomingAxisRes *)resp_buf;
+        res->ret_code = SMC_ConfigHoming((char)req->z_letter, req->method,
+                                          req->search_speed_mm_s,
+                                          req->creep_speed_mm_s,
+                                          req->direction, req->timeout_ms);
+        printf("[rpc] ConfigHoming %c method=%d ret=%d\n",
+               (char)req->z_letter, req->method, res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigHomingAxisRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_HOMING_ORDER: {
+        if (req_hdr.data_len < sizeof(SmcConfigHomingOrderReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigHomingOrderReq *req = (SmcConfigHomingOrderReq *)payload;
+        req->order_letters[SMC_HOMING_ORDER_MAX_LEN - 1] = '\0';
+        SmcConfigHomingOrderRes *res = (SmcConfigHomingOrderRes *)resp_buf;
+        res->ret_code = SMC_ConfigHomingAll(req->order_letters);
+        printf("[rpc] ConfigHomingAll order=%s ret=%d\n",
+               req->order_letters, res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigHomingOrderRes);
+        break;
+    }
+    case SMC_CMD_HOMING_TRIGGER: {
+        if (req_hdr.data_len < sizeof(SmcHomingTriggerReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcHomingTriggerReq *req = (SmcHomingTriggerReq *)payload;
+        SmcHomingTriggerRes *res = (SmcHomingTriggerRes *)resp_buf;
+        if (req->z_letter == 0) {
+            res->ret_code = SMC_HomeAll();
+            printf("[rpc] HomeAll ret=%d\n", res->ret_code);
+        } else {
+            res->ret_code = SMC_HomeAxis((char)req->z_letter);
+            printf("[rpc] HomeAxis %c ret=%d\n", (char)req->z_letter, res->ret_code);
+        }
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcHomingTriggerRes);
+        break;
+    }
+    case SMC_CMD_HOMING_CANCEL: {
+        SmcHomingCancelRes *res = (SmcHomingCancelRes *)resp_buf;
+        res->ret_code = SMC_CancelHoming();
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcHomingCancelRes);
+        break;
+    }
+    case SMC_CMD_GET_HOMING: {
+        SmcGetHomingRes *res = (SmcGetHomingRes *)resp_buf;
+        int state = 0, axis_idx = -1;
+        double progress = 0.0;
+        int rc = SMC_GetHomingState(&state, &axis_idx, &progress);
+        res->ret_code     = rc;
+        res->state        = state;
+        res->axis_idx     = axis_idx;
+        res->enabled      = g_homing_cfg.enabled;
+        res->_pad         = 0;
+        res->progress_pct = progress;
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetHomingRes);
+        break;
+    }
+
+    /* ===== P0-1 JOG ===== */
+    case SMC_CMD_JOG_START: {
+        if (req_hdr.data_len < sizeof(SmcJogStartReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcJogStartReq *req = (SmcJogStartReq *)payload;
+        SmcJogStartRes *res = (SmcJogStartRes *)resp_buf;
+        res->ret_code = SMC_JogStart((char)req->z_letter, req->direction,
+                                      req->speed_mm_s);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcJogStartRes);
+        break;
+    }
+    case SMC_CMD_JOG_STOP: {
+        if (req_hdr.data_len < sizeof(SmcJogStopReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcJogStopReq *req = (SmcJogStopReq *)payload;
+        SmcJogStopRes *res = (SmcJogStopRes *)resp_buf;
+        res->ret_code = SMC_JogStop((char)req->z_letter);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcJogStopRes);
+        break;
+    }
+
     default:
         /* 未知命令: 仍回响应头让客户端可继续下一轮 */
         res_hdr.err_code = SMC_ERR_UNKNOWN_CMD;

@@ -343,6 +343,99 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 EventLogger_Push(SEVERITY_ALARM, SOURCE_LASER, 0x0010,
                                  (int32_t)g_laser_rt.interlock_status,
                              "laser safety interlock triggered (door/estop/alm/water/gas)");
+
+                /* P0-3 SafeLift: 报警路径自动触发抬升 (若配置 auto_on_alarm=1)
+                 * 设计: 与 emergency_kill 同周期触发, RT 后续在安全点 (HOLD_PAUSED)
+                 *       才真正启动抬升, 避免与 feedhold 平滑刹车冲突.
+                 * 幂等保护: 仅 IDLE→PENDING, 已 PENDING/RUNNING/DONE 时 no-op. */
+                if (g_safe_lift_cfg.enabled && g_safe_lift_cfg.auto_on_alarm
+                    && g_interpolator.safe_lift_state == 0) {
+                    g_interpolator.safe_lift_state  = 1;  /* PENDING */
+                    g_interpolator.safe_lift_pending_fresh = 1;  /* 本 cycle 刚入 PENDING */
+                    g_interpolator.safe_lift_source = SOURCE_DRIVE;
+                    EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0005,
+                                     (int32_t)g_laser_rt.interlock_status,
+                                     "safe_z_lift pending (alarm)");
+                }
+            }
+
+            // === P0-3 SafeLift: 手动 API 触发消费 (在 alarm_reset 块之前) ===
+            // API 端 atomic_store safe_lift_pending_req=1, 此处 acquire 读后清.
+            // 幂等: 仅 IDLE 时转 PENDING, 已激活状态忽略重复请求.
+            {
+                int pending = atomic_load_explicit(&g_interpolator.safe_lift_pending_req,
+                                                    memory_order_acquire);
+                if (pending) {
+                    if (g_interpolator.safe_lift_state == 0) {
+                        g_interpolator.safe_lift_state  = 1;  /* PENDING */
+                        g_interpolator.safe_lift_pending_fresh = 1;  /* 本 cycle 刚入 PENDING */
+                        g_interpolator.safe_lift_source = SOURCE_MANUAL;
+                        EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0043, 0,
+                                         "safe_z_lift pending (manual)");
+                    }
+                    atomic_store_explicit(&g_interpolator.safe_lift_pending_req, 0,
+                                          memory_order_release);
+                }
+            }
+
+            // === P0-3 SafeLift: 手动 cancel 消费 (仅 PENDING/DONE 有效, RUNNING 拒绝) ===
+            // SMC_CancelSafeLiftZ 在 state==2 时已经返回 -1, 这里仅作 RT 内 final check.
+            {
+                int cancel = atomic_load_explicit(&g_interpolator.safe_lift_cancel_req,
+                                                   memory_order_acquire);
+                if (cancel) {
+                    int st = g_interpolator.safe_lift_state;
+                    if (st == 1 || st == 3) {  /* PENDING 或 DONE 才允许 cancel */
+                        g_interpolator.safe_lift_state = 0;  /* → IDLE */
+                        if (st == 3) {
+                            g_interpolator.time_scale = 1.0;  /* 解冻 */
+                        }
+                        EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0043, 1,
+                                         "safe_z_lift cancelled");
+                    }
+                    atomic_store_explicit(&g_interpolator.safe_lift_cancel_req, 0,
+                                          memory_order_release);
+                }
+            }
+
+            /* === P0-1 Homing: pending_req 消费 (IDLE→PENDING) ===
+             * SMC_HomeAxis/HomeAll/G28 通过 atomic_store 设 pending_req=1
+             * RT 这里 acquire 读, 仅 IDLE 时转 PENDING, 已激活状态忽略重复请求.
+             * 互斥检查: SafeLift/JOG 激活时拒绝 (cycle 头三者互斥) */
+            {
+                int hpending = atomic_load_explicit(&g_interpolator.homing_pending_req,
+                                                     memory_order_acquire);
+                if (hpending) {
+                    int mutex_ok = (g_interpolator.safe_lift_state == 0
+                                    && atomic_load_explicit(&g_interpolator.jog_active_req,
+                                                            memory_order_acquire) == 0);
+                    if (g_interpolator.homing_state == 0 && mutex_ok) {
+                        g_interpolator.homing_state = 1;  /* PENDING */
+                        g_interpolator.homing_pending_fresh = 1;  /* P0-1 fix: PENDING 至少可见一周期 */
+                        EventLogger_Push(SEVERITY_INFO,
+                                         g_interpolator.homing_source,
+                                         0x0006, 1, "homing pending");
+                    }
+                    atomic_store_explicit(&g_interpolator.homing_pending_req, 0,
+                                          memory_order_release);
+                }
+            }
+
+            /* === P0-1 Homing: cancel_req 消费 (仅 PENDING/DONE) === */
+            {
+                int hcancel = atomic_load_explicit(&g_interpolator.homing_cancel_req,
+                                                    memory_order_acquire);
+                if (hcancel) {
+                    int st = g_interpolator.homing_state;
+                    if (st == 1 || st == 3) {
+                        g_interpolator.homing_state = 0;  /* → IDLE */
+                        if (st == 3) g_interpolator.time_scale = 1.0;
+                        EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0006, 4,
+                                         "homing cancelled");
+                    }
+                    atomic_store_explicit(&g_interpolator.homing_cancel_req, 0,
+                                          memory_order_release);
+                }
             }
 
             // === 报警复位安全点：必须在 g_all_axis_op_ready 门控之外 ===
@@ -350,6 +443,36 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // 但消费条件必须同时满足：插补器已停稳 + 驱动器全部就绪。
             // 若驱动器仍在 case 4 故障恢复中，此条件不满足，RT 线程安全空转等待。
             if(g_interpolator.alarm_reset_request){
+                /* P0-3 SafeLift: alarm_reset 与抬升状态机的协同
+                 *   state==2 (RUNNING): 拒绝本周期清, 等下个 cycle 抬完. 否则 Z 卡在
+                 *                        工件与安全高度之间, 下次 motion 必撞.
+                 *   state==3 (DONE):    清 safe_lift_state→IDLE, 落入常规 alarm_reset.
+                 *   state==1 (PENDING): 直接清 → IDLE (无需抬升, 安全无碰撞风险).
+                 *   state==0 (IDLE):    无 SafeLift 上下文, 直接走常规 alarm_reset. */
+                if (g_interpolator.safe_lift_state == 2) {
+                    /* 抬升中: alarm_reset_request 保持 1, 跳过本周期清, 不进 if 主体 */
+                } else {
+                    if (g_interpolator.safe_lift_state == 3
+                        || g_interpolator.safe_lift_state == 1) {
+                        g_interpolator.safe_lift_state = 0;  /* → IDLE */
+                    }
+                    /* P0-1 Homing: alarm_reset 协同 (同 SafeLift 模式)
+                     *   state==2 (RUNNING): 拒绝清 (axis_homing 在 Non-RT 跑, 不能中断)
+                     *   state==3 DONE / state==1 PENDING / state==4 FAULT: 清 → IDLE */
+                    if (g_interpolator.homing_state == 2) {
+                        /* 同 SafeLift: 不清 alarm_reset_request, 跳过本周期 */
+                    } else if (g_interpolator.homing_state == 3
+                               || g_interpolator.homing_state == 1
+                               || g_interpolator.homing_state == 4) {
+                        g_interpolator.homing_state = 0;  /* → IDLE */
+                    }
+                    /* P0-1 JOG: alarm_reset 时强停 JOG (alarm 必停车) */
+                    if (atomic_load_explicit(&g_interpolator.jog_active_req,
+                                              memory_order_acquire) != 0) {
+                        atomic_store_explicit(&g_interpolator.jog_active_req, 0,
+                                              memory_order_release);
+                        g_interpolator.jog_axis_idx = -1;
+                    }
                 if(g_all_axis_op_ready && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)){
                     g_interpolator.is_moving = 0;
                     g_interpolator.is_waiting_mcode = 0;
@@ -383,6 +506,85 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     /* P1-b: 通知 UI alarm 已清 (异步 ClearAlarm 的最终确认) */
                     EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0041, 0,
                                      "alarm cleared by RT (queue flushed, pos synced)");
+                }
+                }  /* close else (safe_lift_state != 2) */
+            }
+
+            /* P0-3 SafeLift: PENDING → RUNNING 转换
+             * 安全条件: 插补器已停 (is_moving=0 或 HOLD_PAUSED) + Z 轴就绪 + 全轴 op_ready.
+             * 决策:
+             *   - safe_z ≤ current_z: 直接 DONE (不下降, 防撞已抬高的场景)
+             *   - 否则: 锚定 start_z, 预计算 pulse_step = lift_speed × ppu / 1000, 进入 RUNNING
+             *           并冻结 time_scale=0 (与段消费 while gate 双保险).
+             * @Context: 1ms Hard-RT Thread
+             * @Danger: 仅整数 + 乘除, 无 math.h/malloc/printf. */
+            if (g_interpolator.safe_lift_state == 1
+                && g_safe_lift_cfg.enabled) {
+                int z = g_safe_lift_cfg.z_axis_idx;
+                int safe_now = (!g_interpolator.is_moving)
+                            || (g_interpolator.hold_state == HOLD_PAUSED);
+                if (safe_now
+                    && z >= 0 && z < AXIS_NUM
+                    && g_axis[z].slave_count >= 1
+                    && g_axis[z].slave_ids[0] > 0) {
+                    /* 刚进入 PENDING 的当周不提升: 让 PENDING(1) 在 1ms CSV 至少记录一次,
+                     * 否则 0->1->2 同周完成会令 CSV 看不到 state=1 (用户验收要求 0->1->2->3 可见).
+                     * 仅延迟一个 RT 周期, 对报警避让时序无任何影响. */
+                    if (g_interpolator.safe_lift_pending_fresh) {
+                        g_interpolator.safe_lift_pending_fresh = 0;
+                    } else {
+                    /* P0-3 设计要点: 此处【不】要求 g_all_axis_op_ready。
+                     * Safe Z Lift 的触发源正是报警 (含他轴故障, 如 X 轴 ALM/跟随误差),
+                     * 而报警会清零 g_all_axis_op_ready。若在此门控内, 抬升会在最该
+                     * 触发时被拦截 -> 完全违背"报警自动抬 Z 避让"的初衷。
+                     * 仅需 Z 轴自身已配置有效从站 (上面两项已保证 PDO 能写到 Z 驱动器);
+                     * Z 自身故障时抬升虽无法物理移动, 但状态机仍安全推进, 不崩溃。
+                     * 注意: PDO 写入循环 (L1062+) 本身无条件每周期执行, 故 Z 就绪时必抬。 */
+                    double cur_z = g_axis[z].current_cmd_pos;
+                    if (g_safe_lift_cfg.safe_z_target_mm <= cur_z) {
+                        g_interpolator.safe_lift_state = 3;  /* DONE 直接 */
+                        EventLogger_Push(SEVERITY_INFO,
+                                         g_interpolator.safe_lift_source,
+                                         0x0005, 0,
+                                         "safe_z_lift done (already above target)");
+                    } else {
+                        g_interpolator.safe_lift_start_z    = cur_z;
+                        g_interpolator.safe_lift_pulse_step =
+                            g_safe_lift_cfg.lift_speed_mm_s
+                            * g_axis[z].pulse_per_unit / 1000.0;
+                        g_interpolator.safe_lift_state      = 2;  /* RUNNING */
+                        g_interpolator.time_scale           = 0.0;  /* 冻结段消费 */
+                        EventLogger_Push(SEVERITY_INFO,
+                                         g_interpolator.safe_lift_source,
+                                         0x0005, 2,
+                                         "safe_z_lift running");
+                    }
+                    }  /* end else (非 fresh 周, 执行提升) */
+                }
+            }
+
+            /* P0-1 Homing: PENDING → RUNNING 转换
+             * 安全条件: 插补器已停 + 全轴 op_ready (与 SafeLift 不同, Homing 不能在 alarm 期间执行)
+             * 进入 RUNNING 后, RT 仅冻结 queue + 跳过该轴 CSP PDO 写;
+             * 实际 SDO/轮询由 Non-RT (parser_thread/SMC_HomeAxis 异步路径) 的 axis_homing() 完成.
+             * Non-RT axis_homing 入口会再次设 state==2 (idempotent). */
+            if (g_interpolator.homing_state == 1
+                && g_homing_cfg.enabled
+                && g_all_axis_op_ready) {
+                int safe_now = (!g_interpolator.is_moving)
+                            || (g_interpolator.hold_state == HOLD_PAUSED);
+                if (safe_now) {
+                    /* P0-1 fix: 刚进 PENDING 的当周不提升, 让 PENDING(1) 在 1ms CSV
+                     * 至少记录一次 (与 safe_lift_pending_fresh 同构). 否则 cycle 头
+                     * 消费 pending_req 置 state=1 后, 本块同 cycle 立刻推到 2,
+                     * CSV 只见 state=2, 验收要求 0->1->2->3 可见的 PENDING 丢失. */
+                    if (g_interpolator.homing_pending_fresh) {
+                        g_interpolator.homing_pending_fresh = 0;
+                    } else {
+                        g_interpolator.homing_state = 2;  /* RUNNING */
+                        g_interpolator.time_scale   = 0.0;  /* 冻结段消费 */
+                        /* event 推送由 Non-RT axis_homing 入口负责 (避免 RT 内重复推) */
+                    }
                 }
             }
 
@@ -495,7 +697,84 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             double ms_budget = eff_scale;
             int rt_iter = 0;
 
-            while (ms_budget > 1e-6 && rt_iter < RT_ITER_CAP) {
+            /* P0-3 SafeLift: RUNNING 每周期动作 (段消费 while 之前, PDO 写入之前)
+             * 数学: step_mm = pulse_step / ppu = lift_speed_mm_s / 1000 (恒定, 每周期 1ms)
+             *       收敛检测: step_mm >= remaining → 锁定 target, 转 DONE
+             * @Danger: 仅 + - * /, 无 math.h; EventLogger_Push 非阻塞 ring 写.
+             * 双驱天然适配: 仅改 current_cmd_pos[z], PDO 写入循环 (L1062 附近)
+             *               内 for(s) 自动用相同 logical_pulse, 仅 home_offset[s] 不同. */
+            if (g_interpolator.safe_lift_state == 2) {
+                int z = g_safe_lift_cfg.z_axis_idx;
+                double ppu       = g_axis[z].pulse_per_unit;
+                double remaining = g_safe_lift_cfg.safe_z_target_mm
+                                   - g_axis[z].current_cmd_pos;
+                double step_mm   = (ppu > 1e-9)
+                                   ? g_interpolator.safe_lift_pulse_step / ppu
+                                   : 0.0;
+                if (step_mm >= remaining) {
+                    /* 收敛: 锁定目标, 转 DONE */
+                    g_axis[z].current_cmd_pos       = g_safe_lift_cfg.safe_z_target_mm;
+                    g_interpolator.current_pos[z]   = g_axis[z].current_cmd_pos;
+                    g_interpolator.safe_lift_state  = 3;  /* DONE */
+                    /* time_scale 保持 0, 由 alarm_reset 路径或 cancel 恢复 1.0 */
+                    EventLogger_Push(SEVERITY_INFO,
+                                     g_interpolator.safe_lift_source,
+                                     0x0005, 3, "safe_z_lift done");
+                } else {
+                    g_axis[z].current_cmd_pos      += step_mm;
+                    g_interpolator.current_pos[z]   = g_axis[z].current_cmd_pos;
+                }
+                /* 强冻结本周期段消费 (即使 feedhold 路径设过 time_scale, 这里覆盖保险) */
+                g_interpolator.time_scale = 0.0;
+                ms_budget = 0.0;
+            }
+
+            /* P0-1 Homing: RUNNING 期间冻结段消费 (axis_homing 在 Non-RT 做 SDO, 这里只冻结)
+             * @Danger: 仅 time_scale=0 + ms_budget=0, 无 math.h/malloc/printf */
+            if (g_interpolator.homing_state == 2) {
+                g_interpolator.time_scale = 0.0;
+                ms_budget = 0.0;
+            }
+
+            /* P0-1 JOG: ACTIVE 期间每 cycle 增量 + 软限位撞停 (method 35 前置依赖)
+             * @Danger: 仅 + - * / 和软限位比较, 无 math.h; EventLogger_Push 非阻塞 ring.
+             * 与 SafeLift/Homing 互斥 (cycle 头 SMC_JogStart 已检查, 这里 RT 信任 active_req) */
+            if (atomic_load_explicit(&g_interpolator.jog_active_req,
+                                      memory_order_acquire) != 0) {
+                int j = g_interpolator.jog_axis_idx;
+                if (j >= 0 && j < AXIS_NUM) {
+                    double new_pos = g_axis[j].current_cmd_pos
+                                   + g_interpolator.jog_step_mm;
+                    /* 软限位撞停 */
+                    if (g_axis[j].enable_soft_limit) {
+                        if (new_pos > g_axis[j].soft_limit_pos) {
+                            new_pos = g_axis[j].soft_limit_pos;
+                            atomic_store_explicit(&g_interpolator.jog_active_req, 0,
+                                                  memory_order_release);
+                            g_interpolator.jog_axis_idx = -1;
+                            EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x000B, j,
+                                             "jog stopped at soft limit +");
+                        } else if (new_pos < g_axis[j].soft_limit_neg) {
+                            new_pos = g_axis[j].soft_limit_neg;
+                            atomic_store_explicit(&g_interpolator.jog_active_req, 0,
+                                                  memory_order_release);
+                            g_interpolator.jog_axis_idx = -1;
+                            EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x000B, j,
+                                             "jog stopped at soft limit -");
+                        }
+                    }
+                    g_axis[j].current_cmd_pos       = new_pos;
+                    g_interpolator.current_pos[j]   = new_pos;
+                    g_interpolator.time_scale       = 0.0;
+                    ms_budget = 0.0;
+                }
+            }
+
+            while (ms_budget > 1e-6 && rt_iter < RT_ITER_CAP
+                   && g_interpolator.safe_lift_state != 2
+                   && g_interpolator.homing_state != 2
+                   && atomic_load_explicit(&g_interpolator.jog_active_req,
+                                            memory_order_acquire) == 0) {
                 rt_iter++;
 
                 // (1) M 代码屏障: 冻结插补,等待 mcode_wait_timer 计时
@@ -737,10 +1016,41 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // Phase B2: M 段等待期间也记录 (dwell/M3/M5 等 freeze 期 is_moving=0 但状态机在变)
             // 不加此项: G04 P1000 dwell 期间 CSV 0 行, 无法验证 dwell power_w=P_base
             int in_mcode_wait = (g_interpolator.is_waiting_mcode != 0);
+            // P0-1 fix: JOG 停止落盘补记. jog_active_req 1->0 时 (JogStop / 软限位撞停),
+            //   should_log 的 jog 条件立刻失效 -> jog_active=0 那一行永不落盘, CSV 末行
+            //   卡在 jog_active=1, 验收看不到归零. 检测下降沿后强制补记 3 个 cycle,
+            //   保证 jog_active=0 + jog_axis_idx=-1 至少落盘一次.
+            static int prev_jog_active = 0;
+            static int jog_stop_flush  = 0;
+            int cur_jog_active = atomic_load_explicit(&g_interpolator.jog_active_req,
+                                                      memory_order_acquire);
+            if (prev_jog_active != 0 && cur_jog_active == 0) {
+                jog_stop_flush = 3;
+            }
+            prev_jog_active = cur_jog_active;
             int should_log_this_cycle = current_is_moving || just_loaded_seg
-                                     || force_log || in_mcode_wait;
+                                     || force_log || in_mcode_wait
+                                     // P0-3: 抬升期间插补器被冻结 (time_scale=0, is_moving=0),
+                                     // 但 Z 经 current_cmd_pos 直接抬升且状态机在变
+                                     // (0->1->2->3)。若不加此项, 静止后 should_log=0 ->
+                                     // 整段抬升轨迹(尤其 PENDING/DONE 瞬时态)漏记,
+                                     // CSV 末两列无法验证 0->1->2->3 / 5->50.
+                                     || (g_interpolator.safe_lift_state != 0)
+                                     // P0-1: JOG/Homing 同理 —— 二者 RT 期间 time_scale=0
+                                     // (无段消费, is_moving=0), 但 jog_active 时 z_cmd 每
+                                     // cycle 增量、homing_state 0->1->2->3(4) 状态机在变。
+                                     // 不加此项则程序结束后静止, should_log=0 -> JOG 轨迹
+                                     // 与 homing 状态转换漏记, CSV 末 4 列无法验证.
+                                     || (atomic_load_explicit(&g_interpolator.jog_active_req,
+                                                              memory_order_acquire) != 0)
+                                     || (g_interpolator.homing_state != 0)
+                                     // P0-1: JOG 停止下降沿补记 (见上 jog_stop_flush)
+                                     || (jog_stop_flush > 0);
             if (force_log) {
                 atomic_store_explicit(&g_sim_force_log, 0, memory_order_release);
+            }
+            if (jog_stop_flush > 0) {
+                jog_stop_flush--;
             }
 
             // 探针速度基准: 物理瞬时速度 v_current
@@ -812,7 +1122,18 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_interpolator.current_seg_flags_rt,
                                 // is_piercing 派生: G04 dwell (M64) 等待期间为 1
                                 (g_interpolator.is_waiting_mcode &&
-                                 g_interpolator.current_mcode == 64) ? 1 : 0);
+                                 g_interpolator.current_mcode == 64) ? 1 : 0,
+                                // P0-3 SafeLift: 抬升状态机 2 字段
+                                g_interpolator.safe_lift_state,
+                                (g_safe_lift_cfg.enabled && g_safe_lift_cfg.z_axis_idx >= 0)
+                                    ? g_axis[g_safe_lift_cfg.z_axis_idx].current_cmd_pos
+                                    : 0.0,
+                                // P0-1 Homing + JOG: 状态机 4 字段
+                                g_interpolator.homing_state,
+                                g_interpolator.homing_axis_idx,
+                                atomic_load_explicit(&g_interpolator.jog_active_req,
+                                                      memory_order_acquire),
+                                g_interpolator.jog_axis_idx);
             }
 
             // ---- P0-a: 状态快照推送 (所有模式, 无条件) ----
@@ -1057,6 +1378,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         rt_log("[CiA402] %s 故障已清除，重新使能", g_axis[i].axis_name);
                     }
                     break;
+                }
+
+                /* P0-1 Homing: 该轴 RUNNING 时跳过 CSP PDO 写入, 让驱动器内部 homing 接管
+                 * (CiA402 mode 6 + method 35, axis_homing Non-RT 已触发)
+                 * JOG 不需要门: CSP 持续写 current_cmd_pos 增量即是 JOG 的实现 */
+                if (g_interpolator.homing_state == 2
+                    && g_interpolator.homing_axis_idx == i) {
+                    continue;
                 }
 
                 for(int s=0;s<g_axis[i].slave_count;s++){

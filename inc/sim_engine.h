@@ -62,6 +62,14 @@ typedef struct {
     int64_t  laser_on_time_ms;            // 累计激光开启时间 ms (enable&&shutter&&!ekill 时累加)
     uint8_t  current_seg_flags;           // 当前段工艺标记 (bit0=lead_in, bit1=micro_joint)
     int      is_piercing;                 // 是否在 G04 穿孔 dwell 中 (派生: is_waiting_mcode && current_mcode==64)
+    // ---- P0-3 SafeLift: 抬升状态机 CSV 追踪 (验证 alarm 自动 / 手动 / DONE 路径) ----
+    int      safe_lift_state;             // 0=IDLE, 1=PENDING, 2=RUNNING, 3=DONE
+    double   safe_lift_z_cmd;             // Z 轴当前命令位置 (mm) = g_axis[z_idx].current_cmd_pos
+    // ---- P0-1 Homing + JOG: 状态机 CSV 追踪 ----
+    int      homing_state;                // 0/1/2/3/4
+    int      homing_axis_idx;             // 当前回零轴 (-1=HomeAll)
+    int      jog_active;                  // 0/1
+    int      jog_axis_idx;                // JOG 中的轴 (-1=未激活)
 } sim_trace_record_t;
 
 // 二进制文件头 (固定 512 bytes, record_count 在关闭时回填)
@@ -158,7 +166,13 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int32_t pierce_count,
                                      int64_t laser_on_time_ms,
                                      uint8_t current_seg_flags,
-                                     int is_piercing);
+                                     int is_piercing,
+                                     int safe_lift_state,
+                                     double safe_lift_z_cmd,
+                                     int homing_state,
+                                     int homing_axis_idx,
+                                     int jog_active,
+                                     int jog_axis_idx);
 
 // ================== inline 实现 ==================
 
@@ -183,7 +197,13 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int32_t pierce_count,
                                      int64_t laser_on_time_ms,
                                      uint8_t current_seg_flags,
-                                     int is_piercing)
+                                     int is_piercing,
+                                     int safe_lift_state,
+                                     double safe_lift_z_cmd,
+                                     int homing_state,
+                                     int homing_axis_idx,
+                                     int jog_active,
+                                     int jog_axis_idx)
 {
     sim_logger_t *L = &g_sim_logger;
     int idx = atomic_load_explicit(&L->active_idx, memory_order_relaxed);
@@ -231,6 +251,14 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
     r->laser_on_time_ms     = laser_on_time_ms;
     r->current_seg_flags    = current_seg_flags;
     r->is_piercing          = is_piercing;
+    // P0-3 SafeLift: 抬升状态机 CSV 追踪
+    r->safe_lift_state      = safe_lift_state;
+    r->safe_lift_z_cmd      = safe_lift_z_cmd;
+    // P0-1 Homing + JOG: 状态机 CSV 追踪
+    r->homing_state         = homing_state;
+    r->homing_axis_idx      = homing_axis_idx;
+    r->jog_active           = jog_active;
+    r->jog_axis_idx         = jog_axis_idx;
 
     atomic_store_explicit(&L->counts[idx], count + 1, memory_order_release);
     atomic_fetch_add_explicit(&L->total_records, 1, memory_order_relaxed);

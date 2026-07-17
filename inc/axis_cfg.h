@@ -203,6 +203,54 @@ typedef struct {
 extern PlannerConfig_t g_planner_config;
 
 
+// ================== P0-3: Safe Z Lift 配置 (init 阶段, 非RT) ==================
+// 报警时自动 / 操作员手动把 Z 轴抬到固定 G53 绝对高度, 防激光头停工件上方碰撞.
+// 抬升动作由 RT 子状态机执行 (不走段消费环, 不走 time_scale), 见 ecat_core.c.
+typedef struct {
+    int    enabled;           // 主开关 (默认 0; SMC_ConfigSafeLiftZ 成功后置 1)
+    int    z_axis_idx;        // 配置时由 z_letter 经 axis_lookup 解析, -1=未配置
+    double safe_z_target_mm;  // G53 绝对机床坐标目标 (推荐 +50mm)
+    double lift_speed_mm_s;   // 抬升速度 (默认 20.0; pulse 步长 = speed × ppu / 1000)
+    int    auto_on_alarm;     // 0/1: 报警路径是否自动触发 (emergency_kill 同周期)
+} SafeLiftConfig_t;
+
+extern SafeLiftConfig_t g_safe_lift_cfg;  // 定义在 smc_api.c
+
+
+// ================== P0-1 Homing (工业级回零) 配置 ==================
+// 触发: SMC_HomeAxis/SMC_HomeAll API + G28 G 代码
+// 多轴顺序: 串行 Z 优先 (Z → X → Y → B → C 默认, 可配置)
+// 回零方法: v1 method 35 (软件法, 把当前位置标为零, 需 JOG 前置定位)
+//          v2 method 1-19 (硬件 home switch, 当前硬件未接入)
+// 错误恢复: FAULT 状态 + alarm + all-or-nothing 回滚 (HomeAll 串行第 N 轴失败时回滚前 N-1 轴)
+typedef struct {
+    int    enabled;             // 0/1: 该轴是否参与回零
+    int    method;              // 35 (v1 唯一支持) / 1-19 (v2 预留)
+    double search_speed_mm_s;   // method 1-19 寻零速度 (v1 忽略)
+    double creep_speed_mm_s;    // method 1-19 蠕动速度 (v1 忽略)
+    int    direction;           // +1 / -1 (method 1-19 寻零方向)
+    int    timeout_ms;          // 默认 10000
+    int    home_switch_pdo_bit; // method 1-19 DI bit 偏移 (v2 用)
+} HomingAxisCfg_t;
+
+typedef struct {
+    int             enabled;        // SMC_ConfigHomingAll 成功后置 1
+    int             order[AXIS_NUM]; // 回零轴顺序 (axis_idx 数组, 默认 {Z,X,Y,B,C})
+    int             order_count;    // 实际有效轴数
+    HomingAxisCfg_t axis[AXIS_NUM];
+} HomingGlobalConfig_t;
+
+extern HomingGlobalConfig_t g_homing_cfg;  // 定义在 smc_api.c
+
+// Homing 部分成功 all-or-nothing 回滚快照 (axis_homing_multi 内部用)
+typedef struct {
+    int     axis_idx;
+    int     slave_count_snapshot;
+    int32_t home_offset_snapshot[MAX_SLAVES_PER_AXIS];
+    double  current_cmd_pos_snapshot;
+} HomingRollbackEntry_t;
+
+
 typedef enum{
     HOLD_NORMAL=0,
     HOLD_BRAKING,
@@ -283,6 +331,48 @@ typedef struct{
     //   "当前段是不是引线/微连接" + "穿孔 dwell 期间是不是 lead_in 上下文"
     // 段级快照原则 (B1 教训): 走段消费环同步, 不走全局读 g_state.laser_seg_flags.
     uint8_t  current_seg_flags_rt;
+
+    // ---- P0-3: Safe Z Lift RT 子状态机 (RT 单写者字段) ----
+    // 4 状态: 0=IDLE, 1=PENDING (等安全点), 2=RUNNING (抬升中), 3=DONE
+    // 触发: API 手动 (safe_lift_pending_req) 或 报警路径自动 (auto_on_alarm=1)
+    // 消费: RT 在 cycle 头检测 pending_req → PENDING; PENDING 在安全点 → RUNNING;
+    //       RUNNING 每 cycle 给 current_cmd_pos[z] 加固定 pulse 步长 → DONE;
+    //       DONE 在 alarm_reset 路径或 manual cancel 时清 → IDLE.
+    // @Thread-Safety: pending_req/cancel_req 由非RT API atomic_store 写,
+    //   RT acquire 读后清. 其余字段 RT 单写者.
+    _Atomic int safe_lift_pending_req;  // SMC_SafeLiftZ 触发, RT IDLE→PENDING 消费
+    _Atomic int safe_lift_cancel_req;   // SMC_CancelSafeLiftZ 触发, RT 消费 (仅 PENDING/DONE 有效)
+    int     safe_lift_state;            // 0/1/2/3
+    int     safe_lift_source;           // SOURCE_DRIVE / SOURCE_MANUAL (EventLogger 区分)
+    double  safe_lift_start_z;          // PENDING→RUNNING 时锚定, 进度查询用
+    double  safe_lift_pulse_step;       // PENDING→RUNNING 时预计算 = lift_speed × ppu / 1000
+    int     safe_lift_pending_fresh;    // 本 cycle 刚进入 PENDING=1, 供 implant B 跳过当周提升,
+                                        // 保证 PENDING(1) 在 1ms CSV 中至少记录一次 (0->1->2->3 可见)
+
+    // ---- P0-1 Homing: RT 协同字段 (RT 单写者, API/parser_thread Non-RT 写 atomic req) ----
+    // 5 状态: 0=IDLE, 1=PENDING (等安全点), 2=RUNNING (axis_homing 阻塞中),
+    //         3=DONE, 4=FAULT
+    // RT 仅做状态字段维护 + 冻结 queue; 实际 SDO 写 + 轮询 status bit12 在 Non-RT
+    // (parser_thread G28 路径 或 SMC_HomeAxis/HomeAll 异步路径)
+    _Atomic int homing_pending_req;    // SMC_HomeAxis/HomeAll/G28 触发
+    _Atomic int homing_cancel_req;     // SMC_CancelHoming
+    int     homing_state;              // 0/1/2/3/4
+    int     homing_axis_idx;           // 当前回零轴 (-1=HomeAll 顺序模式)
+    int     homing_source;             // SOURCE_DRIVE/MANUAL/PARSER (EventLogger 区分)
+    int     homing_method_in_use;      // 触发时拷贝 (RT 读出上报 UI)
+    int     homing_pending_fresh;      // P0-1 fix: 本 cycle 刚进 PENDING=1, 供 RT 延迟一周期再
+                                       // 提升到 RUNNING, 保证 PENDING(1) 在 1ms CSV 至少记录一次
+                                       // (与 safe_lift_pending_fresh 同构; 否则 0->1->2 同周不可见)
+
+    // ---- P0-1 JOG: RT 协同字段 (与 SafeLift/Homing 同模式) ----
+    // JOG: 持续运动直到 SMC_JogStop 或撞软限位. method 35 前置依赖 (手动定位参考位)
+    // RT 每 cycle: current_cmd_pos[axis] += jog_step_mm; 软限位撞停自停 + event 0x000B
+    // 不切 op-mode (复用 CSP), 与 SafeLift 完全同构
+    _Atomic int jog_active_req;        // SMC_JogStart 设 1, SMC_JogStop 设 0
+    int     jog_axis_idx;              // JOG 中的轴 (-1=未激活)
+    int     jog_direction;             // +1 / -1
+    double  jog_speed_mm_s;            // 速度 (mm/s)
+    double  jog_step_mm;               // 预计算每 cycle 步长 = speed × direction / 1000
 
     // ---- P2-A: 实时倍率 + 模式标志 (RT 单写者字段) ----
     // 设计原因: CNC 操作面板必备 Feed/Rapid/Spindle 倍率旋钮 + 单段/空运行开关.

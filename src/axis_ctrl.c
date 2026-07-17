@@ -8,6 +8,7 @@
 #include "planner.h"
 #include "gcode_parser.h"
 #include "preview_streamer.h"   /* P0-b v1: PreviewStreamer_Push */
+#include "event_logger.h"       /* P0-1: EventLogger_Push + SEVERITY_* (homing/jog 事件) */
 /************************ 全局变量定义（仅轴相关，其余在ecat_core.c） ************************/
 AxisCtrl_t g_axis[AXIS_NUM];            // 五轴核心数组，全局唯一定义
 int g_axis_map[26];                     // 动态轴映射表：'A'-'Z' → 轴索引，-1=未映射
@@ -1371,47 +1372,245 @@ int32_t axis_pdo_read_follow_err(int slave_id)
 }
 
 /************************ 执行原点复归 (Homing) ************************/
+// P0-1 工业级回零状态机 (重构 v2)
+// @Context: Non-RealTime (parser_thread G28 路径 或 SMC_HomeAxis/HomeAll 异步路径)
+// @Safe: 含 SDO 写 + osal_usleep 阻塞轮询, 严禁从 RT 调用
+//
+// 5 状态机 (g_interpolator.homing_state):
+//   0=IDLE → 1=PENDING (RT cycle 头消费 pending_req)
+//          → 2=RUNNING (axis_homing 入口设; 期间 RT 冻结 queue + 跳过该轴 CSP PDO 写)
+//          → 3=DONE / 4=FAULT
+//
+// v1 仅 method 35 (软件法): 把当前位置标为零, 需 JOG 前置定位
+// 双驱同步: 主从 motor 同时触发 CiA402 homing
+// 错误恢复: FAULT 时单轴回滚 home_offset + current_cmd_pos 到快照值
+//   (HomeAll 串行回滚由 axis_homing_multi 管理)
+//
+// sim_mode: 直接 state=DONE 不调 SDO (让状态机逻辑可验证)
 void axis_homing(int axis_idx)
 {
-    if (g_sim_mode) return; // 仿真模式: 跳过真实 SDO 归零
-    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return;
-    int slave_id = g_axis[axis_idx].slave_id;
-    
-    printf("[Homing] %s 开始原点复归...\n", g_axis[axis_idx].axis_name);
-    
-    // 1. 切换到原点复归模式 (0x6060 = 6)
+    // ① 边界检查
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) {
+        g_interpolator.homing_state = 4;
+        return;
+    }
+    if (g_axis[axis_idx].slave_count < 1 || g_axis[axis_idx].slave_ids[0] <= 0) {
+        printf("[Homing] %s 未配置从站\n", g_axis[axis_idx].axis_name);
+        g_interpolator.homing_state = 4;
+        return;
+    }
+
+    int source = g_interpolator.homing_source;
+    HomingAxisCfg_t *cfg = &g_homing_cfg.axis[axis_idx];
+    int timeout_ms = cfg->timeout_ms;
+    int method     = cfg->method;
+
+    printf("[Homing] %s 开始回零 (method=%d, timeout=%d ms)\n",
+           g_axis[axis_idx].axis_name, method, timeout_ms);
+
+    // ② sim_mode: 直接 DONE 不调 SDO
+    if (g_sim_mode) {
+        g_interpolator.homing_state = 3;
+        EventLogger_Push(SEVERITY_INFO, source, 0x0006, 3,
+                         "homing done (sim stub)");
+        printf("[Homing] %s sim 模式直接 DONE\n", g_axis[axis_idx].axis_name);
+        return;
+    }
+
+    // ③ 单轴快照 (FAULT 时回滚)
+    int32_t ho_snap[MAX_SLAVES_PER_AXIS];
+    int slave_count = g_axis[axis_idx].slave_count;
+    for (int s = 0; s < slave_count; s++) {
+        ho_snap[s] = g_axis[axis_idx].home_offset[s];
+    }
+    double ccp_snap = g_axis[axis_idx].current_cmd_pos;
+
+    // ④ 设 state=RUNNING (RT 协同门已开, RT 跳过该轴 CSP PDO 写)
+    g_interpolator.homing_state = 2;
+    __sync_synchronize();
+
+    // ⑤ 双驱循环触发 homing (CiA402 mode 6 + method + CW trigger)
     uint8_t homing_mode = 6;
-    ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &homing_mode, EC_TIMEOUTRXM);
-    osal_usleep(100000);
-    
-    // 2. 设置原点复归方法 (0x6098 = 35) —— 将当前位置设为原点
-    int8_t homing_method = 35;
-    ecx_SDOwrite(&ctx, slave_id, 0x6098, 0x00, FALSE, 1, &homing_method, EC_TIMEOUTRXM);
-    osal_usleep(50000);
-    
-    // 3. 触发原点复归（控制字 bit4 = 1）
-    // 注意：需要先使能，然后发送带触发位的控制字
-    // 假设此时伺服已在使能状态（状态字0x0237）
-    axis_pdo_write_cw_only(axis_idx, 0x001F);  // 0x001F = 使能 + 触发位
+    int8_t  homing_method = (int8_t)method;
+    uint8_t csp_mode = 8;
+    int fault = 0;
+
+    for (int s = 0; s < slave_count; s++) {
+        int slave_id = g_axis[axis_idx].slave_ids[s];
+        ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &homing_mode, EC_TIMEOUTRXM);
+        osal_usleep(100000);  // 100ms
+        ecx_SDOwrite(&ctx, slave_id, 0x6098, 0x00, FALSE, 1, &homing_method, EC_TIMEOUTRXM);
+        osal_usleep(50000);   // 50ms
+    }
+    // 触发 homing (双驱同周期发 CW)
+    axis_pdo_write_cw_only(axis_idx, 0x001F);  // bit4=START_HOME + 使能位
     ecx_send_processdata(&ctx);
-    
-    // 4. 等待复归完成（状态字 bit12 可能变为1，或等待一段时间）
-    int timeout = 100; // 100ms * 100 = 10s
-    uint16_t sw = 0;
-    do {
+
+    EventLogger_Push(SEVERITY_INFO, source, 0x0006, 2,
+                     "homing running (SDO done, polling bit12)");
+
+    // ⑥ 轮询双驱 bit12 同步 + cancel 检测 + SW_ERROR
+    int timeout = timeout_ms / 100;
+    while (timeout-- > 0) {
         osal_usleep(100000);
-        sw = axis_pdo_read_sw(axis_idx);
-        timeout--;
-        if (timeout == 0) {
-            printf("[Homing] %s 超时！\n", g_axis[axis_idx].axis_name);
+        // cancel 检测 (PENDING/DONE cancel 不进这里, 但 v1 简化也允许 RUNNING cancel)
+        if (atomic_load_explicit(&g_interpolator.homing_cancel_req,
+                                  memory_order_acquire) != 0) {
+            printf("[Homing] %s 用户取消\n", g_axis[axis_idx].axis_name);
+            fault = 1;
             break;
         }
-    } while (!(sw & 0x1000)); // 假设 bit12 表示复归完成（需查手册）
-    
-    printf("[Homing] %s 完成，状态字=0x%04X\n", g_axis[axis_idx].axis_name, sw);
-    
-    // 5. 切换回CSP模式
-    uint8_t csp_mode = 8;
-    ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &csp_mode, EC_TIMEOUTRXM);
-    osal_usleep(100000);
+        int all_done = 1;
+        for (int s = 0; s < slave_count; s++) {
+            int sid = g_axis[axis_idx].slave_ids[s];
+            uint16_t sw = axis_pdo_read_sw(sid);
+            if (!(sw & 0x1000)) {
+                all_done = 0;  // bit12 = homing attained
+            }
+            if (sw & 0x0008) {  // bit3 = SW_ERROR (CiA402 fault)
+                printf("[Homing] %s slave[%d] SW_ERROR (sw=0x%04X)\n",
+                       g_axis[axis_idx].axis_name, s, sw);
+                fault = 1;
+                break;
+            }
+        }
+        if (fault) break;
+        if (all_done) break;
+    }
+    if (timeout <= 0 && !fault) {
+        printf("[Homing] %s 超时 (%d ms)\n", g_axis[axis_idx].axis_name, timeout_ms);
+        EventLogger_Push(SEVERITY_ALARM, source, 0x0007, axis_idx,
+                         "homing timeout");
+        fault = 1;
+    }
+
+    // ⑦ FAULT 路径: 单轴回滚 + state=4
+    if (fault) {
+        for (int s = 0; s < slave_count; s++) {
+            g_axis[axis_idx].home_offset[s] = ho_snap[s];
+        }
+        g_axis[axis_idx].current_cmd_pos = ccp_snap;
+        g_interpolator.current_pos[axis_idx] = ccp_snap;
+        g_interpolator.homing_state = 4;
+        EventLogger_Push(SEVERITY_ALARM, source, 0x0008, axis_idx,
+                         "homing fault, single-axis rollback");
+        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+        printf("[Homing] %s FAULT, 已回滚单轴\n", g_axis[axis_idx].axis_name);
+        return;
+        // 注: HomeAll 模式下 axis_homing_multi 检测 state==4 后回滚前序已成功轴
+    }
+
+    // ⑧ 切回 CSP (双驱)
+    for (int s = 0; s < slave_count; s++) {
+        int slave_id = g_axis[axis_idx].slave_ids[s];
+        ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &csp_mode, EC_TIMEOUTRXM);
+        osal_usleep(100000);
+    }
+
+    // ⑨ home_offset 重新锚定 (v1 workaround, v2 改常量化)
+    // 与 ecat_core.c:315 首周期锚定同语义, Non-RT 写入
+    for (int s = 0; s < slave_count; s++) {
+        int slave_id = g_axis[axis_idx].slave_ids[s];
+        g_axis[axis_idx].home_offset[s] = axis_pdo_read_pos(slave_id);
+    }
+
+    // ⑩ current_cmd_pos 归零 (机械原点 = G53 原点)
+    g_axis[axis_idx].current_cmd_pos = 0.0;
+    g_interpolator.current_pos[axis_idx] = 0.0;
+    __sync_synchronize();
+
+    // ⑪ state=DONE
+    g_interpolator.homing_state = 3;
+    EventLogger_Push(SEVERITY_INFO, source, 0x0006, 3, "homing done");
+    printf("[Homing] %s DONE (home_offset re-anchored, pos reset to 0)\n",
+           g_axis[axis_idx].axis_name);
+}
+
+// P0-1: 多轴串行回零 + all-or-nothing 回滚 (补强点 #2)
+// @Context: Non-RealTime (parser_thread 或 SMC_HomeAll 触发路径)
+// 调用方: G28 parser (SOURCE_PARSER), SMC_HomeAll 异步路径 (SOURCE_MANUAL)
+//
+// 任一轴 FAULT → 回滚所有已成功轴 (home_offset + current_cmd_pos) 到快照值
+// 返回: 0=全部成功, -1=有轴 FAULT (已回滚)
+int axis_homing_multi(const int *axis_indices, int count, int source)
+{
+    if (axis_indices == NULL || count <= 0) return -1;
+
+    // ① 快照所有目标轴 (rollback 用)
+    HomingRollbackEntry_t snaps[AXIS_NUM];
+    for (int i = 0; i < count && i < AXIS_NUM; i++) {
+        int idx = axis_indices[i];
+        snaps[i].axis_idx = idx;
+        snaps[i].slave_count_snapshot = g_axis[idx].slave_count;
+        for (int s = 0; s < g_axis[idx].slave_count && s < MAX_SLAVES_PER_AXIS; s++) {
+            snaps[i].home_offset_snapshot[s] = g_axis[idx].home_offset[s];
+        }
+        snaps[i].current_cmd_pos_snapshot = g_axis[idx].current_cmd_pos;
+    }
+
+    g_interpolator.homing_source = source;
+
+    // ② 顺序回零 (Z → X → Y → B → C)
+    for (int i = 0; i < count; i++) {
+        int idx = axis_indices[i];
+        g_interpolator.homing_axis_idx = idx;
+
+        // P0-1 fix: 每轴开始前把 state 重置回 IDLE, 让 RT 重新走 pending_req 消费 +
+        //   PENDING(1)->RUNNING(2) 提升 (含 fresh 延迟一周期). 否则上一轴结束时
+        //   state=DONE(3), RT cycle 头 "if homing_state==0" 不成立 -> pending_req
+        //   被清但 state 不进 PENDING -> 下面 wait 超时 -> 每个后续轴 false FAULT
+        //   (现象: g28 只真回首轴, 其余 state 卡 3 + axis_idx 乱跳).
+        g_interpolator.homing_state = 0;
+        __sync_synchronize();
+
+        // 设 PENDING 让 RT 协同 (RT 检测后冻结 queue)
+        atomic_store_explicit(&g_interpolator.homing_pending_req, 1,
+                              memory_order_release);
+
+        // 等 RT 把 state 推到 RUNNING (axis_homing 入口设)
+        // 放宽到 2s: 含 fresh 延迟 1 cycle + promote, 且 wait 采样 1ms 有抖动.
+        int wait_t = 2000;  // 2s 超时
+        while (g_interpolator.homing_state != 2 && wait_t-- > 0) {
+            osal_usleep(1000);
+        }
+        if (g_interpolator.homing_state != 2) {
+            // RT 没及时启动 (异常), 立即 FAULT
+            g_interpolator.homing_state = 4;
+            EventLogger_Push(SEVERITY_ALARM, source, 0x0008, idx,
+                             "homing RT kickoff timeout");
+            // 触发全量回滚 (下面 fault 检测会处理)
+        }
+
+        // 调 axis_homing 同步阻塞
+        axis_homing(idx);
+
+        // ③ 任一轴 FAULT → 回滚所有已成功轴
+        if (g_interpolator.homing_state == 4) {
+            printf("[Homing] HomeAll 第 %d 轴 (%s) FAULT, 触发全量回滚\n",
+                   i, g_axis[idx].axis_name);
+            for (int j = 0; j <= i && j < AXIS_NUM; j++) {
+                int rb_idx = snaps[j].axis_idx;
+                for (int s = 0; s < snaps[j].slave_count_snapshot; s++) {
+                    g_axis[rb_idx].home_offset[s] = snaps[j].home_offset_snapshot[s];
+                }
+                g_axis[rb_idx].current_cmd_pos = snaps[j].current_cmd_pos_snapshot;
+                g_interpolator.current_pos[rb_idx] = snaps[j].current_cmd_pos_snapshot;
+            }
+            EventLogger_Push(SEVERITY_ALARM, source, 0x0008, idx,
+                             "homing fault, rolled back all axes");
+            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            // 把 homing_state 重置为 FAULT (axis_homing 内部已设)
+            // 注: time_scale 由 alarm_reset (报警清除) 路径恢复, 此处 alarm 已置位.
+            return -1;
+        }
+
+        // 该轴成功, 推进下一轴. 下一轮循环头会重置 state=0 让 RT 重新驱动.
+    }
+
+    // 全部成功: state 保持 DONE(3) 供 UI/RPC 查询; 但 RUNNING 期间 RT 已把
+    //   time_scale 冻结为 0, 手动 HomeAll (无报警伴随) 不会经过 alarm_reset 恢复,
+    //   若不在此恢复则机床后续 motion 永久冻结 (time_scale=0). 故显式恢复.
+    //   (G28 parser 路径同理受益: 回零后续段能正常插补.)
+    g_interpolator.time_scale = 1.0;
+    return 0;
 }

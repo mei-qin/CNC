@@ -97,6 +97,10 @@ int sim_engine_init(const char *output_path, int use_binary)
         // P0-Laser-Q: 状态查询闭环 4 列
         fprintf(g_sim_logger.fp,
                 ",pierce_count,laser_on_time_ms,current_seg_flags,is_piercing");
+        // P0-3 SafeLift: 抬升状态机 2 列
+        fprintf(g_sim_logger.fp, ",safe_lift_state,safe_lift_z_cmd");
+        // P0-1 Homing + JOG: 状态机 4 列
+        fprintf(g_sim_logger.fp, ",homing_state,homing_axis_idx,jog_active,jog_axis_idx");
         fprintf(g_sim_logger.fp, "\n");
         fflush(g_sim_logger.fp);
     }
@@ -145,8 +149,6 @@ void *sim_flush_thread_func(void *arg)
 
     while (1) {
         sem_wait(&L->flush_sem);
-
-        int did_flush = 0;
 
         for (int i = 0; i < 2; i++) {
             if (!atomic_load_explicit(&L->flush_pending[i], memory_order_acquire))
@@ -197,6 +199,13 @@ void *sim_flush_thread_func(void *arg)
                             (long long)r->laser_on_time_ms,
                             (unsigned)r->current_seg_flags,
                             r->is_piercing);
+                    // P0-3 SafeLift: 抬升状态机 2 列
+                    fprintf(L->fp, ",%d,%.3f",
+                            r->safe_lift_state, r->safe_lift_z_cmd);
+                    // P0-1 Homing + JOG: 状态机 4 列
+                    fprintf(L->fp, ",%d,%d,%d,%d",
+                            r->homing_state, r->homing_axis_idx,
+                            r->jog_active, r->jog_axis_idx);
                     fprintf(L->fp, "\n");
                 }
                 L->file_record_count += cnt;
@@ -204,11 +213,13 @@ void *sim_flush_thread_func(void *arg)
 
             fflush(L->fp);
             atomic_store_explicit(&L->flush_pending[i], 0, memory_order_release);
-            did_flush = 1;
         }
 
-        // 关闭条件: running=0 且本轮无数据可刷
-        if (!L->running && !did_flush) break;
+        // 关闭条件: running=0 即退出 (本轮已排空所有 pending 缓冲, 含 sim_engine_finish
+        //           标记的残余 active 缓冲)。注意: 必须仅判 running==0 即可退出,
+        //           不能在末次 flush 后绕回 sem_wait —— 否则落盘线程永久阻塞 -> SMC_Close
+        //           卡死 (pthread_join 永远等不到落盘线程退出)。
+        if (!L->running) break;
     }
 
     return NULL;

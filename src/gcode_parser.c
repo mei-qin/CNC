@@ -467,6 +467,7 @@ int parse_gcode_line(const char *gcode_line)
     int is_g52_block=0;       // P2': G52 局部坐标系设定块, 字母循环后捕获
     int is_g04_block=0;       // Phase B2: G04 dwell 块, 字母循环后捕获并 push M64 段
     double g04_dwell_ms=0.0;  // Phase B2: G04 P<ms> 捕获值
+    int is_g28_block=0;       // P0-1: G28 返回参考点, 字母循环后触发 axis_homing_multi
     int is_g65_block=0;       // P4': G65 用户宏调用, 字母循环后处理
     int is_g66_block=0;       // P4' Phase 2: G66 模态宏调用激活
     int is_g541_block=0;      // P5': G54.1 Pn 扩展 WCS, 字母循环后处理
@@ -801,7 +802,7 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==17.0) g_state.active_plane=17;
                 else if(value==18.0) g_state.active_plane=18;
                 else if(value==19.0) g_state.active_plane=19;
-                else if(value==28.0) is_non_motion_g=1;    // G28 返回参考点
+                else if(value==28.0) { is_non_motion_g=1; is_g28_block=1; }    // G28 返回参考点 (P0-1)
                 else if(value==40.0){
                     // G40: 取消刀具半径补偿
                     if(CutterComp_GetMode() != COMP_OFF){
@@ -848,9 +849,13 @@ int parse_gcode_line(const char *gcode_line)
                 // G61: 模态精准停开启 (后续所有段 v_end=0, 直到 G64 取消)
                 // G64: 模态连续切削 (默认, 拐角允许 G64 容差内过弯不归零)
                 // 工业用途: G09/G61 用于拐角清根/防过切/精密定位; G64 用于高速连续加工.
-                else if(value==9.0)  { g_state.exact_stop_this_block = 1; is_non_motion_g = 1; }
-                else if(value==61.0) { g_state.modal_exact_stop = 1; is_non_motion_g = 1; }
-                else if(value==64.0) { g_state.modal_exact_stop = 0; is_non_motion_g = 1; }
+                // P2-A-4: G09/G61/G64 是"运动修饰词", 必须与同行的 G00/G01 共存,
+                //   不能设 is_non_motion_g=1 (否则会拦截本行 G01 的段生成, 漏掉该段运动,
+                //   且 exact_stop_this_block 永不被消费而泄漏到下一行). G04/G10/G28/G92 等
+                //   才是真正的非运动指令, 保留 is_non_motion_g 锁.
+                else if(value==9.0)  { g_state.exact_stop_this_block = 1; }
+                else if(value==61.0) { g_state.modal_exact_stop = 1; }
+                else if(value==64.0) { g_state.modal_exact_stop = 0; }
                 else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
                 else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
                 else if(fabs(value - 54.1) < 0.05){
@@ -1343,6 +1348,29 @@ int parse_gcode_line(const char *gcode_line)
                (int)p_value, l_value, entry, g_call_stack_top,
                g_current_program->lines[g_pc].line_no);
         return 0;  // 不入 mcode 队列
+    }
+
+    // ---- P0-1: G28 返回参考点 (字母循环结束后处理) ----
+    // LinuxCNC 风格 v1: 直接 homing, 不解析 X_Y_Z_ 中间点 (Fanuc 风格留 v2)
+    // 调 axis_homing_multi 阻塞 parser_thread, 期间 RT 冻结 motion queue
+    // G28 后续段在 homing 完成后继续解析 (此时 home_offset 已重新锚定)
+    if(is_g28_block){
+        if(!g_homing_cfg.enabled || g_homing_cfg.order_count == 0){
+            printf("[Parser] G28: homing 未配置, 调 SMC_ConfigHomingAll 先\n");
+            atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+            return -1;
+        }
+        printf("[Parser] G28: 触发 axis_homing_multi (%d 轴顺序回零)\n",
+               g_homing_cfg.order_count);
+        int rc = axis_homing_multi(g_homing_cfg.order, g_homing_cfg.order_count,
+                                    SOURCE_PARSER);
+        if(rc < 0){
+            printf("[Parser] G28: axis_homing_multi FAULT, 已回滚\n");
+            // alarm_state 已由 axis_homing_multi 内部设置
+            return -1;
+        }
+        printf("[Parser] G28: homing 完成, 继续解析\n");
+        return 0;  // G28 本行结束, 不走 motion/mcode 路径
     }
 
     // ---- P4': G65 用户宏调用 (字母循环结束后处理) ----

@@ -795,3 +795,146 @@ bool SmcController::ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int
     }
     return invokeIntRet(SMC_CMD_CONFIG_LASER_COUPLE_TABLE, out_ret_code, &req, sizeof(req));
 }
+
+/* ============================================================
+ * P0-3: Safe Z Lift (紧急抬升避让)
+ * ============================================================ */
+bool SmcController::ConfigSafeLiftZ(char z_letter, double safe_z_mm,
+                                     double lift_speed_mm_s, bool auto_on_alarm,
+                                     int &out_ret_code)
+{
+    SmcConfigSafeLiftReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.z_letter        = (uint8_t)z_letter;
+    req.safe_z_mm       = safe_z_mm;
+    req.lift_speed_mm_s = lift_speed_mm_s;
+    req.auto_on_alarm   = auto_on_alarm ? 1 : 0;
+    return invokeIntRet(SMC_CMD_CONFIG_SAFE_LIFT, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::TriggerSafeLiftZ(int &out_ret_code)
+{
+    /* 无 Req, Res = SmcSafeLiftTriggerRes (仅 int32_t ret_code) */
+    return invokeIntRet(SMC_CMD_SAFE_LIFT_TRIGGER, out_ret_code);
+}
+
+bool SmcController::CancelSafeLiftZ(int &out_ret_code)
+{
+    /* 无 Req, Res = SmcSafeLiftCancelRes (仅 int32_t ret_code) */
+    return invokeIntRet(SMC_CMD_SAFE_LIFT_CANCEL, out_ret_code);
+}
+
+bool SmcController::GetSafeLiftState(int &out_state, double &out_progress_mm,
+                                     double &out_z_target_mm, double &out_z_current_mm,
+                                     int &out_enabled, int &out_ret_code)
+{
+    /* 无 Req, Res = SmcGetSafeLiftRes (~36B), 与 GetLaserState 同模式 */
+    std::lock_guard<std::mutex> lock(comm_mutex_);
+    if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
+    if (!sendRequest(SMC_CMD_GET_SAFE_LIFT, nullptr, 0)) return false;
+
+    SmcGetSafeLiftRes res;
+    std::memset(&res, 0, sizeof(res));
+    int32_t  err = 0;
+    uint32_t len = 0;
+    if (!recvResponse(err, &res, sizeof(res), len)) return false;
+    if (err != SMC_OK) { last_err_ = err; return false; }
+    if (len < sizeof(res)) { last_err_ = SMC_ERR_INTERNAL; return false; }
+
+    out_ret_code     = res.ret_code;
+    out_state        = res.state;
+    out_enabled      = res.enabled;
+    out_progress_mm  = res.progress_mm;
+    out_z_target_mm  = res.z_target_mm;
+    out_z_current_mm = res.z_current_mm;
+    return true;
+}
+
+/* ============================================================
+ * P0-1: Homing + JOG
+ * ============================================================ */
+bool SmcController::ConfigHomingAxis(char axis_letter, int method,
+                                      double search_speed, double creep_speed,
+                                      int direction, int timeout_ms,
+                                      int &out_ret_code)
+{
+    SmcConfigHomingAxisReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.z_letter          = (uint8_t)axis_letter;
+    req.method            = method;
+    req.search_speed_mm_s = search_speed;
+    req.creep_speed_mm_s  = creep_speed;
+    req.direction         = direction;
+    req.timeout_ms        = timeout_ms;
+    return invokeIntRet(SMC_CMD_CONFIG_HOMING_AXIS, out_ret_code,
+                        &req, sizeof(req));
+}
+
+bool SmcController::ConfigHomingAll(const std::string &order_letters,
+                                     int &out_ret_code)
+{
+    SmcConfigHomingOrderReq req;
+    std::memset(&req, 0, sizeof(req));
+    std::strncpy(req.order_letters, order_letters.c_str(),
+                 SMC_HOMING_ORDER_MAX_LEN - 1);
+    return invokeIntRet(SMC_CMD_CONFIG_HOMING_ORDER, out_ret_code,
+                        &req, sizeof(req));
+}
+
+bool SmcController::TriggerHoming(char axis_letter, int &out_ret_code)
+{
+    SmcHomingTriggerReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.z_letter = (uint8_t)axis_letter;  /* '\0' = HomeAll */
+    return invokeIntRet(SMC_CMD_HOMING_TRIGGER, out_ret_code,
+                        &req, sizeof(req));
+}
+
+bool SmcController::CancelHoming(int &out_ret_code)
+{
+    return invokeIntRet(SMC_CMD_HOMING_CANCEL, out_ret_code);
+}
+
+bool SmcController::GetHomingState(int &out_state, int &out_axis_idx,
+                                    double &out_progress_pct, int &out_enabled,
+                                    int &out_ret_code)
+{
+    /* 无 Req, Res = SmcGetHomingRes (~32B), 与 GetSafeLift 同模式 */
+    std::lock_guard<std::mutex> lock(comm_mutex_);
+    if (!IsConnected()) { last_err_ = SMC_ERR_SOCKET; return false; }
+    if (!sendRequest(SMC_CMD_GET_HOMING, nullptr, 0)) return false;
+
+    SmcGetHomingRes res;
+    std::memset(&res, 0, sizeof(res));
+    int32_t  err = 0;
+    uint32_t len = 0;
+    if (!recvResponse(err, &res, sizeof(res), len)) return false;
+    if (err != SMC_OK) { last_err_ = err; return false; }
+    if (len < sizeof(res)) { last_err_ = SMC_ERR_INTERNAL; return false; }
+
+    out_ret_code     = res.ret_code;
+    out_state        = res.state;
+    out_axis_idx     = res.axis_idx;
+    out_enabled      = res.enabled;
+    out_progress_pct = res.progress_pct;
+    return true;
+}
+
+bool SmcController::JogStart(char axis_letter, int direction, double speed_mm_s,
+                              int &out_ret_code)
+{
+    SmcJogStartReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.z_letter  = (uint8_t)axis_letter;
+    req.direction = direction;
+    req.speed_mm_s = speed_mm_s;
+    return invokeIntRet(SMC_CMD_JOG_START, out_ret_code, &req, sizeof(req));
+}
+
+bool SmcController::JogStop(char axis_letter, int &out_ret_code)
+{
+    SmcJogStopReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.z_letter = (uint8_t)axis_letter;  /* '*' = 全停 */
+    return invokeIntRet(SMC_CMD_JOG_STOP, out_ret_code, &req, sizeof(req));
+}

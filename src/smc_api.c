@@ -14,9 +14,18 @@
 #include <unistd.h>
 #include <ctype.h>
 #include <string.h>
+#include <pthread.h>            /* P0-1 fix: RPC 触发 homing 的 Non-RT worker 线程 */
 
 // 底层轴房间号自动分配计数器
 static int g_allocated_axis_count = 0;
+
+// P0-3: Safe Z Lift 配置 (非RT init 阶段单写者)
+// 默认 enabled=0, z_axis_idx=-1 (未配置), 调 SMC_ConfigSafeLiftZ 后激活
+SafeLiftConfig_t g_safe_lift_cfg = { 0, -1, 50.0, 20.0, 0 };
+
+// P0-1: Homing 配置 (非RT init 阶段单写者)
+// 默认 enabled=0, order_count=0; 默认 timeout_ms=10000 / home_switch=-1 在 SMC_ConfigHoming 设
+HomingGlobalConfig_t g_homing_cfg = {0};
 
 // 字母 → 底层索引查表（内部工具函数）
 // 返回 -1 表示轴未配置
@@ -40,6 +49,30 @@ int SMC_InitAndStart(const char *netif_name)
     g_interpolator.spindle_override_ratio = 1.0;
     g_interpolator.mode_flags             = 0;
     g_interpolator.current_motion_type_rt = 0;
+
+    // P0-3 SafeLift: RT 字段显式清零 (memset 已零初始化, 此处注释+可读性)
+    // enabled 默认 0: 必须调 SMC_ConfigSafeLiftZ 才激活
+    atomic_store_explicit(&g_interpolator.safe_lift_pending_req, 0,
+                          memory_order_release);
+    atomic_store_explicit(&g_interpolator.safe_lift_cancel_req, 0,
+                          memory_order_release);
+    g_interpolator.safe_lift_state       = 0;  /* IDLE */
+    g_interpolator.safe_lift_source      = 0;
+    g_interpolator.safe_lift_start_z     = 0.0;
+    g_interpolator.safe_lift_pulse_step  = 0.0;
+
+    // P0-1 Homing/JOG: RT 字段显式清零 (memset 已零初始化, 此处可读性)
+    atomic_store_explicit(&g_interpolator.homing_pending_req, 0, memory_order_release);
+    atomic_store_explicit(&g_interpolator.homing_cancel_req, 0, memory_order_release);
+    g_interpolator.homing_state          = 0;  /* IDLE */
+    g_interpolator.homing_axis_idx       = -1;
+    g_interpolator.homing_source         = 0;
+    g_interpolator.homing_method_in_use  = 0;
+    atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
+    g_interpolator.jog_axis_idx          = -1;
+    g_interpolator.jog_direction         = 0;
+    g_interpolator.jog_speed_mm_s        = 0.0;
+    g_interpolator.jog_step_mm           = 0.0;
 
     // sim 模式: sim_drive 必须在 RT 线程启动前初始化好
     // 否则 RT 主循环进入 dorun==1 后立即调 sim_drive_get_sw 会读到 cia_state=0,
@@ -124,16 +157,12 @@ void SMC_Close(void)
 {
     printf("\n[SMC_API] 收到关闭请求，触发优雅下电时序...\n");
 
-    // 先停止 B-Spline 平滑线程 (排空队列后退出)
-    BSpline_StopThread();
-
-    // 仿真模式: 停止双缓冲轨迹采集器 (排空残余数据后关闭文件)
-    if (g_sim_mode) {
-        sim_engine_finish();
-    }
-
-    // 停止轨迹探针落盘线程 (排空残余数据后退出)
-    TraceLogger_StopThread();
+    // === 关键修复: 必须先让 RT 线程完全停止, 再释放 SimEngine / TraceLogger 资源 ===
+    // 原顺序: 先 BSpline_StopThread + sim_engine_finish()(free bufs) + TraceLogger_StopThread,
+    //         再 dorun=2 等 RT 停。但 RT 线程在 dorun=2 期间仍每周期调用
+    //         sim_engine_push() 写 bufs[idx][count]; 此时 bufs 已被 free ->
+    //         use-after-free -> SIGSEGV (崩溃点: ecat_thread_rt -> sim_engine.h:214)。
+    // 故调整为: 先请求 RT 优雅下电并等待其真正退出(dorun==0), 再 tear down 采集器。
 
     // 请求 RT 线程进入优雅下电状态机（抱闸闭合 + CiA402 降级）
     dorun = 2;
@@ -151,6 +180,18 @@ void SMC_Close(void)
     } else {
         printf("[SMC_API] RT 线程优雅下电完成。\n");
     }
+
+    // 现在 RT 已停止, 不会再 push SimEngine / TraceLogger -> 安全 tear down
+    // 先停止 B-Spline 平滑线程 (排空队列后退出)
+    BSpline_StopThread();
+
+    // 仿真模式: 停止双缓冲轨迹采集器 (排空残余数据后关闭文件 + free)
+    if (g_sim_mode) {
+        sim_engine_finish();
+    }
+
+    // 停止轨迹探针落盘线程 (排空残余数据后退出)
+    TraceLogger_StopThread();
 
     // 降级 EtherCAT 状态机：OP → SAFE_OP → INIT (仅真实硬件模式)
     if (!g_sim_mode) {
@@ -708,6 +749,413 @@ int SMC_ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count)
     }
     g_laser_cfg.couple_table_len = count;
     return 0;
+}
+
+// ================== P0-3: Safe Z Lift ==================
+// @Context: Non-RealTime (init 阶段, SMC_InitAndStart 之前调)
+// @Thread-Safety: g_safe_lift_cfg 是 init 阶段单写者, RT 线程启动后只读
+// 设计: 配置时一次性解析 z_letter → z_axis_idx, RT 路径零字符串操作
+int SMC_ConfigSafeLiftZ(char z_letter, double safe_z_mm,
+                        double lift_speed_mm_s, int auto_on_alarm)
+{
+    int idx = axis_lookup(z_letter);
+    if (idx < 0) {
+        printf("[SMC_API] ConfigSafeLiftZ 轴 '%c' 未配置\n",
+               toupper((unsigned char)z_letter));
+        return -1;
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] ConfigSafeLiftZ 系统运行中, 禁止修改\n");
+        return -1;
+    }
+    // 旋转轴 (axis_type=1) 抬升语义无效, 拒绝
+    if (g_axis[idx].axis_type != 0) {
+        printf("[SMC_API] ConfigSafeLiftZ %s 是旋转轴, 仅线性 Z 轴合法\n",
+               g_axis[idx].axis_name);
+        return -1;
+    }
+    if (lift_speed_mm_s <= 0.0) {
+        printf("[SMC_API] ConfigSafeLiftZ lift_speed=%.2f 必须 > 0\n",
+               lift_speed_mm_s);
+        return -1;
+    }
+    // safe_z 超软限位正限: 拒绝 + 报警事件 (event 0x0044)
+    if (g_axis[idx].enable_soft_limit && safe_z_mm > g_axis[idx].soft_limit_pos) {
+        printf("[SMC_API] ConfigSafeLiftZ safe_z=%.2f 超过 Z 软限位正限 %.2f\n",
+               safe_z_mm, g_axis[idx].soft_limit_pos);
+        EventLogger_Push(SEVERITY_ALARM, SOURCE_MANUAL, 0x0044,
+                         (int32_t)(safe_z_mm * 100),
+                         "safe_lift config rejected (over soft limit)");
+        return -2;
+    }
+    if (auto_on_alarm != 0 && auto_on_alarm != 1) {
+        printf("[SMC_API] ConfigSafeLiftZ auto_on_alarm=%d 必须 0 或 1\n",
+               auto_on_alarm);
+        return -1;
+    }
+
+    g_safe_lift_cfg.z_axis_idx      = idx;
+    g_safe_lift_cfg.safe_z_target_mm = safe_z_mm;
+    g_safe_lift_cfg.lift_speed_mm_s  = lift_speed_mm_s;
+    g_safe_lift_cfg.auto_on_alarm    = auto_on_alarm;
+    __sync_synchronize();
+    g_safe_lift_cfg.enabled          = 1;  // 最后置 1, RT 看到时其他字段已就绪
+
+    printf("[SMC_API] SafeLift 配置: z=%s, target=%.2f mm, speed=%.1f mm/s, auto_on_alarm=%d\n",
+           g_axis[idx].axis_name, safe_z_mm, lift_speed_mm_s, auto_on_alarm);
+    return 0;
+}
+
+// @Context: Non-RealTime (HMI/CAM 通过 RPC 调用)
+// @Thread-Safety: 仅 atomic_store 1 个标志位, RT 在 cycle 头 atomic_load 后清
+// Idempotent: PENDING/RUNNING/DONE 中再调为 no-op, 返回 0
+int SMC_SafeLiftZ(void)
+{
+    if (!g_safe_lift_cfg.enabled) {
+        printf("[SMC_API] SafeLiftZ 未配置, 调 SMC_ConfigSafeLiftZ 先\n");
+        return -1;
+    }
+    atomic_store_explicit(&g_interpolator.safe_lift_pending_req, 1,
+                          memory_order_release);
+    return 0;
+}
+
+// @Context: Non-RealTime
+// 仅 PENDING/DONE 可取消, RUNNING 拒绝 (避免 Z 卡在工件与安全高度之间)
+// 返回: 0=已提交取消, -1=未配置或正在抬升拒绝
+int SMC_CancelSafeLiftZ(void)
+{
+    if (!g_safe_lift_cfg.enabled) return -1;
+    int st = g_interpolator.safe_lift_state;
+    if (st == 2) {
+        // RUNNING: 拒绝, 避免撞刀
+        return -1;
+    }
+    atomic_store_explicit(&g_interpolator.safe_lift_cancel_req, 1,
+                          memory_order_release);
+    return 0;
+}
+
+// @Context: Non-RealTime (HMI 用, 60Hz 安全)
+// @Thread-Safety: int/double 对齐天然原子; acquire 显式 happens-before 标注
+int SMC_GetSafeLiftState(int *out_state, double *out_progress_mm)
+{
+    if (!g_safe_lift_cfg.enabled) {
+        if (out_state)       *out_state       = 0;
+        if (out_progress_mm) *out_progress_mm = 0.0;
+        return -1;
+    }
+    int st = g_interpolator.safe_lift_state;
+    if (out_state) *out_state = st;
+    if (out_progress_mm) {
+        int z = g_safe_lift_cfg.z_axis_idx;
+        if (st == 2 || st == 3) {
+            *out_progress_mm = g_axis[z].current_cmd_pos
+                               - g_interpolator.safe_lift_start_z;
+        } else {
+            *out_progress_mm = 0.0;
+        }
+    }
+    return 0;
+}
+
+// ================== P0-1 Homing: 工业级回零 ==================
+// @Context: Non-RealTime (init 阶段, SMC_InitAndStart 之前调)
+int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
+                     double creep_speed, int direction, int timeout_ms)
+{
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) {
+        printf("[SMC_API] ConfigHoming 轴 '%c' 未配置\n",
+               toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] ConfigHoming 系统运行中, 禁止修改\n");
+        return -1;
+    }
+    // v1 仅支持 method 35; method 1-19 需硬件 home switch (未接入)
+    if (method != 35) {
+        printf("[SMC_API] ConfigHoming method=%d v1 不支持 (仅 35; 1-19 需 home switch)\n",
+               method);
+        EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x0009, method,
+                         "homing method not supported in v1");
+        return -3;
+    }
+    if (direction != 1 && direction != -1) {
+        printf("[SMC_API] ConfigHoming direction=%d 必须 +1 或 -1\n", direction);
+        return -1;
+    }
+    if (timeout_ms < 1000 || timeout_ms > 60000) {
+        printf("[SMC_API] ConfigHoming timeout_ms=%d 越界 [1000, 60000]\n", timeout_ms);
+        return -1;
+    }
+
+    HomingAxisCfg_t *cfg = &g_homing_cfg.axis[idx];
+    cfg->enabled            = 1;
+    cfg->method             = method;
+    cfg->search_speed_mm_s  = (search_speed > 0.0) ? search_speed : 10.0;
+    cfg->creep_speed_mm_s   = (creep_speed > 0.0) ? creep_speed : 1.0;
+    cfg->direction          = direction;
+    cfg->timeout_ms         = timeout_ms;
+    cfg->home_switch_pdo_bit = -1;  // v2 用
+
+    printf("[SMC_API] ConfigHoming %s: method=%d, timeout=%d ms\n",
+           g_axis[idx].axis_name, method, timeout_ms);
+    return 0;
+}
+
+int SMC_ConfigHomingAll(const char *order_letters)
+{
+    if (order_letters == NULL || order_letters[0] == '\0') {
+        printf("[SMC_API] ConfigHomingAll order_letters 为空\n");
+        return -1;
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] ConfigHomingAll 系统运行中, 禁止修改\n");
+        return -1;
+    }
+
+    g_homing_cfg.order_count = 0;
+    for (int i = 0; order_letters[i] != '\0' && g_homing_cfg.order_count < AXIS_NUM; i++) {
+        int idx = axis_lookup(order_letters[i]);
+        if (idx < 0) {
+            printf("[SMC_API] ConfigHomingAll 轴 '%c' 未配置\n",
+                   toupper((unsigned char)order_letters[i]));
+            return -2;
+        }
+        // 默认每轴 method 35, timeout 10000, direction +1
+        if (!g_homing_cfg.axis[idx].enabled) {
+            HomingAxisCfg_t *cfg = &g_homing_cfg.axis[idx];
+            cfg->enabled            = 1;
+            cfg->method             = 35;
+            cfg->search_speed_mm_s  = 10.0;
+            cfg->creep_speed_mm_s   = 1.0;
+            cfg->direction          = 1;
+            cfg->timeout_ms         = 10000;
+            cfg->home_switch_pdo_bit = -1;
+        }
+        g_homing_cfg.order[g_homing_cfg.order_count++] = idx;
+    }
+
+    __sync_synchronize();
+    g_homing_cfg.enabled = 1;
+    printf("[SMC_API] ConfigHomingAll: %d 轴顺序回零\n", g_homing_cfg.order_count);
+    return 0;
+}
+
+// 内部 helper: 互斥检查 (SafeLift / Homing / JOG 三者)
+static int homing_mutex_ok(void)
+{
+    if (g_interpolator.safe_lift_state != 0) return 0;
+    if (atomic_load_explicit(&g_interpolator.jog_active_req, memory_order_acquire) != 0) return 0;
+    return 1;
+}
+
+// ================== P0-1 fix: RPC homing worker ==================
+// @Context: Non-RealTime worker thread
+// 背景: SMC_HomeAxis/HomeAll 仅能设 pending_req (RT 消费 -> PENDING -> RUNNING),
+//       但 RUNNING(2) 的实际 SDO/轮询/DONE 收尾必须在 Non-RT 由 axis_homing 完成.
+//       G28 parser 路径由 parser_thread 充当此 worker; RPC 路径原本【缺】worker,
+//       导致 homing 永久卡在 RUNNING(2) + time_scale=0 -> 机床 DoS.
+// 方案: RPC 触发时 spawn 一个 detached worker 调 axis_homing_multi (单轴 count=1),
+//       统一走 "RT 协同 PENDING->RUNNING + fresh 延迟 + axis_homing 收尾" 路径.
+static pthread_t g_homing_worker_tid;
+static _Atomic int g_homing_worker_busy = 0;   // 1=worker 运行中 (防重入)
+static int         g_homing_worker_order[AXIS_NUM];
+static int         g_homing_worker_count = 0;
+
+static void *homing_worker_fn(void *arg)
+{
+    (void)arg;
+    // axis_homing_multi 内部逐轴驱动 pending_req + 等 RT RUNNING + axis_homing 收尾,
+    // 全部成功后恢复 time_scale; 任一轴 FAULT 则 all-or-nothing 回滚.
+    axis_homing_multi(g_homing_worker_order, g_homing_worker_count, SOURCE_MANUAL);
+    atomic_store_explicit(&g_homing_worker_busy, 0, memory_order_release);
+    return NULL;
+}
+
+// 启动 homing worker. order/count 拷入静态缓冲 (worker 生命周期内有效).
+// 返回 0=已 spawn, -1=上一个 worker 未结束 (拒绝重入).
+static int spawn_homing_worker(const int *order, int count)
+{
+    if (count <= 0 || count > AXIS_NUM) return -1;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_homing_worker_busy, &expected, 1,
+                                                 memory_order_acq_rel,
+                                                 memory_order_acquire)) {
+        printf("[SMC_API] homing worker 忙, 拒绝重入\n");
+        return -1;
+    }
+    for (int i = 0; i < count; i++) g_homing_worker_order[i] = order[i];
+    g_homing_worker_count = count;
+    if (pthread_create(&g_homing_worker_tid, NULL, homing_worker_fn, NULL) != 0) {
+        atomic_store_explicit(&g_homing_worker_busy, 0, memory_order_release);
+        printf("[SMC_API] homing worker pthread_create 失败\n");
+        return -1;
+    }
+    pthread_detach(g_homing_worker_tid);
+    return 0;
+}
+
+int SMC_HomeAxis(char axis_letter)
+{
+    if (!g_homing_cfg.enabled) {
+        printf("[SMC_API] HomeAxis 未配置, 调 SMC_ConfigHomingAll 先\n");
+        return -1;
+    }
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0 || !g_homing_cfg.axis[idx].enabled) {
+        printf("[SMC_API] HomeAxis 轴 '%c' 未配置回零\n",
+               toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] HomeAxis 系统运行中, 先 Abort\n");
+        return -1;
+    }
+    if (!homing_mutex_ok()) {
+        printf("[SMC_API] HomeAxis 与 SafeLift/JOG 冲突\n");
+        return -1;
+    }
+
+    g_interpolator.homing_source        = SOURCE_MANUAL;
+    g_interpolator.homing_method_in_use = g_homing_cfg.axis[idx].method;
+    // P0-1 fix: spawn Non-RT worker 执行实际回零 (axis_homing_multi 内部会设
+    //   pending_req 让 RT 协同 + axis_homing 收尾). 不再仅设 pending_req 后返回,
+    //   否则无 worker -> 永久卡 RUNNING(2).
+    int one[1] = { idx };
+    if (spawn_homing_worker(one, 1) != 0) {
+        printf("[SMC_API] HomeAxis worker 启动失败\n");
+        return -1;
+    }
+    return 0;
+}
+
+int SMC_HomeAll(void)
+{
+    if (!g_homing_cfg.enabled || g_homing_cfg.order_count == 0) {
+        printf("[SMC_API] HomeAll 未配置, 调 SMC_ConfigHomingAll 先\n");
+        return -1;
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] HomeAll 系统运行中, 先 Abort\n");
+        return -1;
+    }
+    if (!homing_mutex_ok()) {
+        printf("[SMC_API] HomeAll 与 SafeLift/JOG 冲突\n");
+        return -1;
+    }
+
+    g_interpolator.homing_source        = SOURCE_MANUAL;
+    g_interpolator.homing_method_in_use = 35;
+    // P0-1 fix: spawn Non-RT worker 按配置 order 顺序回零 (all-or-nothing 回滚在
+    //   axis_homing_multi 内). 原仅设 pending_req -> 无 worker -> 永久卡 RUNNING(2).
+    if (spawn_homing_worker(g_homing_cfg.order, g_homing_cfg.order_count) != 0) {
+        printf("[SMC_API] HomeAll worker 启动失败\n");
+        return -1;
+    }
+    return 0;
+}
+
+int SMC_CancelHoming(void)
+{
+    if (!g_homing_cfg.enabled) return -1;
+    int st = g_interpolator.homing_state;
+    if (st == 2) {
+        // RUNNING: 拒绝 (axis_homing 内部轮询 cancel_req 才能安全退出)
+        // v1 简化: 仅 PENDING/DONE 可 cancel; RUNNING 让 axis_homing 自己跑完
+        return -1;
+    }
+    atomic_store_explicit(&g_interpolator.homing_cancel_req, 1, memory_order_release);
+    return 0;
+}
+
+int SMC_GetHomingState(int *out_state, int *out_axis_idx, double *out_progress_pct)
+{
+    if (!g_homing_cfg.enabled) {
+        if (out_state)        *out_state        = 0;
+        if (out_axis_idx)     *out_axis_idx     = -1;
+        if (out_progress_pct) *out_progress_pct = 0.0;
+        return -1;
+    }
+    if (out_state)    *out_state    = g_interpolator.homing_state;
+    if (out_axis_idx) *out_axis_idx = g_interpolator.homing_axis_idx;
+    if (out_progress_pct) {
+        if (g_interpolator.homing_axis_idx >= 0) {
+            *out_progress_pct = (g_interpolator.homing_state == 3) ? 1.0 : 0.0;
+        } else {
+            // HomeAll 模式: 按 order_count 估算 (v1 简化)
+            *out_progress_pct = (g_interpolator.homing_state == 3) ? 1.0 : 0.0;
+        }
+    }
+    return 0;
+}
+
+// ================== P0-1 JOG: 手动定位 (method 35 前置) ==================
+// @Context: Non-RealTime (HMI/CAM 通过 RPC 调用)
+int SMC_JogStart(char axis_letter, int direction, double speed_mm_s)
+{
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) {
+        printf("[SMC_API] JogStart 轴 '%c' 未配置\n",
+               toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    if (direction != 1 && direction != -1) return -2;
+    if (speed_mm_s <= 0.0) {
+        printf("[SMC_API] JogStart speed=%.2f 必须 > 0\n", speed_mm_s);
+        return -1;
+    }
+    // 三功能互斥
+    if (g_interpolator.homing_state != 0
+        || g_interpolator.safe_lift_state != 0
+        || g_parser_ctrl.is_running) {
+        printf("[SMC_API] JogStart 与 Homing/SafeLift/parser 冲突\n");
+        return -1;
+    }
+    // 检查当前是否已 JOG (单轴 JOG 模式 v1)
+    if (atomic_load_explicit(&g_interpolator.jog_active_req, memory_order_acquire) != 0) {
+        printf("[SMC_API] JogStart 已有 JOG 进行中 (axis=%d)\n",
+               g_interpolator.jog_axis_idx);
+        return -1;
+    }
+
+    g_interpolator.jog_axis_idx   = idx;
+    g_interpolator.jog_direction  = direction;
+    g_interpolator.jog_speed_mm_s = speed_mm_s;
+    // step_mm 每 cycle 1ms 推进, 含方向
+    g_interpolator.jog_step_mm    = speed_mm_s * (double)direction / 1000.0;
+    __sync_synchronize();
+    atomic_store_explicit(&g_interpolator.jog_active_req, 1, memory_order_release);
+
+    EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x000A, idx, "jog start");
+    return 0;
+}
+
+int SMC_JogStop(char axis_letter)
+{
+    if (axis_letter == SMC_AXIS_ALL) {
+        atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
+        g_interpolator.jog_axis_idx = -1;
+        return 0;
+    }
+    if (atomic_load_explicit(&g_interpolator.jog_active_req, memory_order_acquire) == 0) {
+        return -1;
+    }
+    if (g_interpolator.jog_axis_idx != axis_lookup(axis_letter)) {
+        return -1;  // 不是这个轴在 JOG
+    }
+    atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
+    g_interpolator.jog_axis_idx = -1;
+    return 0;
+}
+
+double SMC_JogGetPos(char axis_letter)
+{
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) return 0.0;
+    return g_axis[idx].current_cmd_pos;
 }
 
 // ================== 辅助状态查询 API ==================

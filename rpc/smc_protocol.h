@@ -121,6 +121,23 @@ typedef enum {
     SMC_CMD_CONFIG_LASER_RANGE       = 0x0054,  /* 配置功率/频率量程 */
     SMC_CMD_CONFIG_LASER_COUPLING    = 0x0055,  /* 配置 P-v 耦合开关 + 低速阈值 */
     SMC_CMD_CONFIG_LASER_COUPLE_TABLE= 0x0056,  /* 配置 P-v 耦合查表 (固定 16 槽) */
+
+    /* --- Safe Z Lift 0x0057 ~ 0x005A (P0-3) --- */
+    SMC_CMD_CONFIG_SAFE_LIFT         = 0x0057,  /* 配置抬升参数 (init 阶段) */
+    SMC_CMD_SAFE_LIFT_TRIGGER        = 0x0058,  /* 手动触发抬升 (idempotent) */
+    SMC_CMD_SAFE_LIFT_CANCEL         = 0x0059,  /* 取消抬升 (仅 PENDING/DONE) */
+    SMC_CMD_GET_SAFE_LIFT            = 0x005A,  /* 查询抬升状态 */
+
+    /* --- Homing 0x005B ~ 0x005F (P0-1) --- */
+    SMC_CMD_CONFIG_HOMING_AXIS       = 0x005B,  /* 配置单轴回零参数 */
+    SMC_CMD_CONFIG_HOMING_ORDER      = 0x005C,  /* 配置回零顺序 "ZXYBC" */
+    SMC_CMD_HOMING_TRIGGER           = 0x005D,  /* 触发回零 (axis_letter 或 '\0'=All) */
+    SMC_CMD_HOMING_CANCEL            = 0x005E,  /* 取消回零 (仅 PENDING/DONE) */
+    SMC_CMD_GET_HOMING               = 0x005F,  /* 查询回零状态 */
+
+    /* --- JOG 0x0060 ~ 0x0061 (P0-1, method 35 前置) --- */
+    SMC_CMD_JOG_START                = 0x0060,  /* 启动 JOG (axis + direction + speed) */
+    SMC_CMD_JOG_STOP                 = 0x0061,  /* 停止 JOG (axis 或 '*') */
 } SmcCmdType;
 
 /* ============================================================
@@ -542,6 +559,109 @@ typedef struct {
     LaserCouplePoint_t points[LASER_COUPLE_TABLE_MAX];
 } SmcConfigLaserCoupleTableReq;
 typedef struct { int32_t ret_code; } SmcConfigLaserCoupleTableRes;
+
+/* ============================================================
+ * P0-3: Safe Z Lift
+ * ============================================================ */
+
+/* SMC_CONFIG_SAFE_LIFT (0x0057): 配置抬升参数 (init 阶段, InitAndStart 之前调)
+ *   z_letter:        Z 轴字母 ASCII ('Z'=0x5A, 大小写不敏感由 API 端 toupper 处理)
+ *   safe_z_mm:       G53 绝对目标 (mm)
+ *   lift_speed_mm_s: 抬升速度 (默认 20.0)
+ *   auto_on_alarm:   0/1 报警路径自动触发开关
+ * pack(1) 下 1 + 3(pad) + 8 + 8 + 4 = 24B
+ */
+typedef struct {
+    uint8_t z_letter;          /* 'Z' (大小写不敏感) */
+    uint8_t _pad[3];           /* 4B 对齐 */
+    double  safe_z_mm;
+    double  lift_speed_mm_s;
+    int32_t auto_on_alarm;
+} SmcConfigSafeLiftReq;
+typedef struct { int32_t ret_code; } SmcConfigSafeLiftRes;
+
+/* SMC_SAFE_LIFT_TRIGGER (0x0058): 手动触发抬升 (idempotent) — 无 payload */
+typedef struct { int32_t ret_code; } SmcSafeLiftTriggerRes;
+
+/* SMC_SAFE_LIFT_CANCEL (0x0059): 取消抬升 — 无 payload */
+typedef struct { int32_t ret_code; } SmcSafeLiftCancelRes;
+
+/* SMC_GET_SAFE_LIFT (0x005A): 查询抬升状态
+ *   state:      0=IDLE, 1=PENDING, 2=RUNNING, 3=DONE
+ *   progress_mm: 已抬升距离 (current_z - start_z), DONE 时 = 总抬升量
+ *   z_target_mm / z_current_mm: HMI 显示用
+ *   enabled: 0=未配置 (整个 SafeLift 禁用), 1=已配置
+ * pack(1) 实际 = 4×int32(ret_code,state,enabled,_pad=16B) + 3×double(progress,z_target,z_current=24B) = 40B
+ *   (旧注释误算为 36B, 漏算 state 字段; 客户端必须以 40B 解包, 否则 unpack 报 buffer too short)
+ */
+typedef struct {
+    int32_t ret_code;
+    int32_t state;
+    int32_t enabled;
+    int32_t _pad;
+    double  progress_mm;
+    double  z_target_mm;
+    double  z_current_mm;
+} SmcGetSafeLiftRes;
+
+/* ============================================================
+ * P0-1: Homing + JOG
+ * ============================================================ */
+
+/* SMC_CONFIG_HOMING_AXIS (0x005B): 单轴回零配置 (init 阶段) */
+typedef struct {
+    uint8_t z_letter;
+    uint8_t _pad[3];
+    int32_t method;           /* 35 (v1) / 1-19 (v2 预留, v1 拒绝 -3) */
+    double  search_speed_mm_s;
+    double  creep_speed_mm_s;
+    int32_t direction;        /* +1 / -1 */
+    int32_t timeout_ms;
+} SmcConfigHomingAxisReq;
+typedef struct { int32_t ret_code; } SmcConfigHomingAxisRes;
+
+/* SMC_CONFIG_HOMING_ORDER (0x005C): 全局回零顺序配置 */
+#define SMC_HOMING_ORDER_MAX_LEN  16  /* "ZXYBC" + 余量 */
+typedef struct {
+    char order_letters[SMC_HOMING_ORDER_MAX_LEN];
+} SmcConfigHomingOrderReq;
+typedef struct { int32_t ret_code; } SmcConfigHomingOrderRes;
+
+/* SMC_HOMING_TRIGGER (0x005D): 触发回零 */
+typedef struct {
+    uint8_t z_letter;   /* 轴字母, '\0' = HomeAll */
+    uint8_t _pad[3];
+} SmcHomingTriggerReq;
+typedef struct { int32_t ret_code; } SmcHomingTriggerRes;
+
+/* SMC_HOMING_CANCEL (0x005E): 无 Req */
+typedef struct { int32_t ret_code; } SmcHomingCancelRes;
+
+/* SMC_GET_HOMING (0x005F): 查询回零状态 */
+typedef struct {
+    int32_t ret_code;
+    int32_t state;        /* 0/1/2/3/4 */
+    int32_t axis_idx;     /* 当前回零轴 (-1=HomeAll) */
+    int32_t enabled;
+    int32_t _pad;
+    double  progress_pct; /* 0.0-1.0 */
+} SmcGetHomingRes;
+
+/* SMC_JOG_START (0x0060) */
+typedef struct {
+    uint8_t z_letter;
+    uint8_t _pad[3];
+    int32_t direction;    /* +1 / -1 */
+    double  speed_mm_s;
+} SmcJogStartReq;
+typedef struct { int32_t ret_code; } SmcJogStartRes;
+
+/* SMC_JOG_STOP (0x0061) */
+typedef struct {
+    uint8_t z_letter;   /* '*' = 全停 */
+    uint8_t _pad[3];
+} SmcJogStopReq;
+typedef struct { int32_t ret_code; } SmcJogStopRes;
 
 #pragma pack(pop)
 

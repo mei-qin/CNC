@@ -168,6 +168,57 @@ public:
     bool ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count, int &out_ret_code);
 
     /* =============================================================
+     * P0-3: Safe Z Lift (紧急抬升避让)
+     *
+     * 典型流程:
+     *   init 阶段: ConfigSafeLiftZ('Z', 50.0, 20.0, auto_on_alarm=true)
+     *   报警时:   RT 自动触发 (auto_on_alarm=1) 或操作员按 UI 按钮 TriggerSafeLiftZ
+     *   处理后:   GetSafeLiftState 看 state (0/1/2/3) + progress_mm
+     *   异常取消: CancelSafeLiftZ (仅 PENDING/DONE 可取消, RUNNING 拒绝)
+     *
+     * 返回: true=协议层成功 (业务结果在 out_ret_code)
+     * ============================================================= */
+    bool ConfigSafeLiftZ(char z_letter, double safe_z_mm,
+                         double lift_speed_mm_s, bool auto_on_alarm,
+                         int &out_ret_code);
+    bool TriggerSafeLiftZ(int &out_ret_code);
+    bool CancelSafeLiftZ(int &out_ret_code);
+    /* out_state: 0=IDLE, 1=PENDING, 2=RUNNING, 3=DONE
+     * out_progress_mm: 已抬升距离 (current_z - start_z)
+     * out_z_target_mm / out_z_current_mm: HMI 显示用 */
+    bool GetSafeLiftState(int &out_state, double &out_progress_mm,
+                          double &out_z_target_mm, double &out_z_current_mm,
+                          int &out_enabled, int &out_ret_code);
+
+    /* =============================================================
+     * P0-1: 工业级回零 (G28 / SMC_HomeAxis / SMC_HomeAll)
+     *
+     * 典型流程:
+     *   init 阶段: ConfigHomingAll("ZXYBC") 配置顺序
+     *   手动定位: JogStart/JogStop 把机器拖到参考位 (method 35 前置)
+     *   触发回零: TriggerHoming (axis='\0'=HomeAll 或单轴)
+     *   查询: GetHomingState
+     *   异常: CancelHoming (仅 PENDING/DONE)
+     *
+     * 返回: true=协议层成功 (业务结果在 out_ret_code)
+     * ============================================================= */
+    bool ConfigHomingAxis(char axis_letter, int method, double search_speed,
+                          double creep_speed, int direction, int timeout_ms,
+                          int &out_ret_code);
+    bool ConfigHomingAll(const std::string &order_letters, int &out_ret_code);
+    bool TriggerHoming(char axis_letter, int &out_ret_code);  /* '\0'=HomeAll */
+    bool CancelHoming(int &out_ret_code);
+    bool GetHomingState(int &out_state, int &out_axis_idx, double &out_progress_pct,
+                        int &out_enabled, int &out_ret_code);
+
+    /* =============================================================
+     * P0-1: JOG 模式 (method 35 前置依赖 — 手动定位参考位)
+     * ============================================================= */
+    bool JogStart(char axis_letter, int direction, double speed_mm_s,
+                  int &out_ret_code);
+    bool JogStop(char axis_letter, int &out_ret_code);  /* '*' 停所有 */
+
+    /* =============================================================
      * P2-A: 实时倍率系统 (Feed/Rapid/Spindle Override + Mode Flags)
      *
      * 典型流程: HMI 滑条/旋钮 onChange → SetOverride (mask/value 模式, 允许部分修改)

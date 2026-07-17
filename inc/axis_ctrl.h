@@ -37,6 +37,8 @@ void axis_read_txpdo(int axis_idx);
 int32 axis_pdo_read_pos(int slave_id);
 int32_t axis_pdo_read_follow_err(int slave_id);
 void axis_homing(int axis_idx);
+// P0-1: 多轴串行回零 + all-or-nothing 回滚 (HomeAll/G28 用)
+int axis_homing_multi(const int *axis_indices, int count, int source);
 
 void api_set_zero(int axis_idx);
 void api_go_zero(int axis_idx,double speed);
