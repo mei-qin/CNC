@@ -70,6 +70,11 @@ typedef struct {
     int      homing_axis_idx;             // 当前回零轴 (-1=HomeAll)
     int      jog_active;                  // 0/1
     int      jog_axis_idx;                // JOG 中的轴 (-1=未激活)
+    // ---- v2 home_offset 常量化 (2026-07-20): CSV 暴露 home_offset + homing_shift ----
+    // 用途: T1 验证 home_offset 首周期后不变; T2 验证 homing 后 homing_shift 变化
+    // 取每轴主站 [0] (双驱从站 [1] 不暴露, 避免列爆炸; 必要时另起 dump)
+    int32_t  home_offset_dump[AXIS_NUM];  // v2 NEW: 每轴 home_offset[0] (安装时常量)
+    int32_t  homing_shift_dump[AXIS_NUM]; // v2 NEW: 每轴 homing_shift[0] (homing 后变量)
 } sim_trace_record_t;
 
 // 二进制文件头 (固定 512 bytes, record_count 在关闭时回填)
@@ -172,7 +177,10 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int homing_state,
                                      int homing_axis_idx,
                                      int jog_active,
-                                     int jog_axis_idx);
+                                     int jog_axis_idx,
+                                     // v2 (2026-07-20): home_offset 常量化 CSV 暴露
+                                     const int32_t home_offset_dump[AXIS_NUM],
+                                     const int32_t homing_shift_dump[AXIS_NUM]);
 
 // ================== inline 实现 ==================
 
@@ -203,7 +211,9 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int homing_state,
                                      int homing_axis_idx,
                                      int jog_active,
-                                     int jog_axis_idx)
+                                     int jog_axis_idx,
+                                     const int32_t home_offset_dump[AXIS_NUM],
+                                     const int32_t homing_shift_dump[AXIS_NUM])
 {
     sim_logger_t *L = &g_sim_logger;
     int idx = atomic_load_explicit(&L->active_idx, memory_order_relaxed);
@@ -259,6 +269,11 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
     r->homing_axis_idx      = homing_axis_idx;
     r->jog_active           = jog_active;
     r->jog_axis_idx         = jog_axis_idx;
+    // v2 (2026-07-20): home_offset 常量化 CSV 暴露 (T1/T2 验证用)
+    for (int i = 0; i < AXIS_NUM; i++) {
+        r->home_offset_dump[i]  = home_offset_dump[i];
+        r->homing_shift_dump[i] = homing_shift_dump[i];
+    }
 
     atomic_store_explicit(&L->counts[idx], count + 1, memory_order_release);
     atomic_fetch_add_explicit(&L->total_records, 1, memory_order_relaxed);

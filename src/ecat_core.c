@@ -1104,6 +1104,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 for (int i = 0; i < 3; i++) local_off[i] = g_coord_mgr.active_offset[i];
                 int x_idx = g_axis_map['X' - 'A'];
                 double off_g54_x = (x_idx >= 0) ? g_coord_mgr.work_offsets[0][x_idx] : 0.0;
+                // v2 (2026-07-20): gather home_offset / homing_shift 到栈数组
+                //   供 sim_engine_push CSV 暴露 (T1/T2 验证用)
+                int32_t ho_dump[AXIS_NUM];
+                int32_t hs_dump[AXIS_NUM];
+                for (int i = 0; i < AXIS_NUM; i++) {
+                    ho_dump[i] = (g_axis[i].slave_count > 0)
+                                 ? g_axis[i].home_offset[0] : 0;
+                    hs_dump[i] = (g_axis[i].slave_count > 0)
+                                 ? g_axis[i].homing_shift[0] : 0;
+                }
                 sim_engine_push((uint64_t)cycle,
                                 g_interpolator.virtual_time_ms,
                                 g_interpolator.current_pos,
@@ -1143,7 +1153,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_interpolator.homing_axis_idx,
                                 atomic_load_explicit(&g_interpolator.jog_active_req,
                                                       memory_order_acquire),
-                                g_interpolator.jog_axis_idx);
+                                g_interpolator.jog_axis_idx,
+                                // v2 (2026-07-20): home_offset + homing_shift 暴露
+                                ho_dump, hs_dump);
             }
 
             // ---- P0-a: 状态快照推送 (所有模式, 无条件) ----

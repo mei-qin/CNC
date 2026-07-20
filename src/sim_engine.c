@@ -101,6 +101,14 @@ int sim_engine_init(const char *output_path, int use_binary)
         fprintf(g_sim_logger.fp, ",safe_lift_state,safe_lift_z_cmd");
         // P0-1 Homing + JOG: 状态机 4 列
         fprintf(g_sim_logger.fp, ",homing_state,homing_axis_idx,jog_active,jog_axis_idx");
+        // v2 (2026-07-20): home_offset 常量化 CSV 暴露 10 列
+        //   5 轴 home_offset_dump (安装时常量, T1 验证首周期后不变)
+        //   5 轴 homing_shift_dump (homing 后变量, T2 验证变化量 = cur_pulse - home_offset)
+        fprintf(g_sim_logger.fp,
+                ",home_offset_dump_X,home_offset_dump_Y,home_offset_dump_Z,"
+                "home_offset_dump_B,home_offset_dump_C"
+                ",homing_shift_dump_X,homing_shift_dump_Y,homing_shift_dump_Z,"
+                "homing_shift_dump_B,homing_shift_dump_C");
         fprintf(g_sim_logger.fp, "\n");
         fflush(g_sim_logger.fp);
     }
@@ -206,6 +214,16 @@ void *sim_flush_thread_func(void *arg)
                     fprintf(L->fp, ",%d,%d,%d,%d",
                             r->homing_state, r->homing_axis_idx,
                             r->jog_active, r->jog_axis_idx);
+                    // v2 (2026-07-20): home_offset 常量化 10 列
+                    // AXIS_NUM=5 顺序: X(0), Y(1), Z(2), B(3), C(4)
+                    fprintf(L->fp, ",%d,%d,%d,%d,%d",
+                            r->home_offset_dump[0], r->home_offset_dump[1],
+                            r->home_offset_dump[2], r->home_offset_dump[3],
+                            r->home_offset_dump[4]);
+                    fprintf(L->fp, ",%d,%d,%d,%d,%d",
+                            r->homing_shift_dump[0], r->homing_shift_dump[1],
+                            r->homing_shift_dump[2], r->homing_shift_dump[3],
+                            r->homing_shift_dump[4]);
                     fprintf(L->fp, "\n");
                 }
                 L->file_record_count += cnt;
