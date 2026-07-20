@@ -1164,6 +1164,16 @@ int SMC_JogStop(char axis_letter)
     if (axis_letter == SMC_AXIS_ALL) {
         atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
         g_interpolator.jog_axis_idx = -1;
+        // P0-1 hotfix (2026-07-20): 恢复 time_scale=1.0
+        // 背景: RT JOG 子状态机 (ecat_core.c L778) ACTIVE 期间每 cycle 强制 time_scale=0
+        //   冻结段消费 (while gate 屏蔽 motion queue). jog_active_req=0 后 RT 不再写
+        //   time_scale=0, 但**也没人恢复 time_scale=1.0**, 导致后续段消费永久屏蔽
+        //   (ms_budget=0). 现象: 首次增量 MoveRelative 工作, 切连续 JogStart 后切回增量
+        //   坐标不变 (增量段入队但 RT 不消费).
+        // 修复: 与 axis_homing_multi (axis_ctrl.c L1614) / SafeLift (ecat_core.c L487)
+        //   同 pattern — Non-RT 显式恢复 time_scale. x86_64 8B 对齐 double 天然原子,
+        //   下一 cycle RT 读到新值, 无 race.
+        g_interpolator.time_scale = 1.0;
         return 0;
     }
     if (atomic_load_explicit(&g_interpolator.jog_active_req, memory_order_acquire) == 0) {
@@ -1174,6 +1184,7 @@ int SMC_JogStop(char axis_letter)
     }
     atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
     g_interpolator.jog_axis_idx = -1;
+    g_interpolator.time_scale = 1.0;  // P0-1 hotfix: 同 ALL 路径, 恢复段消费
     return 0;
 }
 
