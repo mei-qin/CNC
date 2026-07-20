@@ -1525,6 +1525,12 @@ void axis_homing(int axis_idx)
     g_axis[axis_idx].current_cmd_pos = 0.0;
     g_interpolator.current_pos[axis_idx] = 0.0;
     __sync_synchronize();
+    // P0-1 hotfix (2026-07-20): 同步 plan_cursor[axis_idx] = 0
+    // 背景: homing 后 current_cmd_pos=0, 但 plan_cursor 残留 homing 前的旧值.
+    //   后续 api_move_relative 基于 plan_cursor 计算 target, 位置基准错位.
+    //   (与 SMC_JogStop api_sync_planner_cursor 同一类 bug — "绕过 parser 的运动"
+    //   漏同步 plan_cursor.)
+    plan_cursor[axis_idx] = 0.0;
 
     // ⑪ state=DONE
     g_interpolator.homing_state = 3;

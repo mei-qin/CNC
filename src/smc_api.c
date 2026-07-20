@@ -1174,6 +1174,14 @@ int SMC_JogStop(char axis_letter)
         //   同 pattern — Non-RT 显式恢复 time_scale. x86_64 8B 对齐 double 天然原子,
         //   下一 cycle RT 读到新值, 无 race.
         g_interpolator.time_scale = 1.0;
+        // P0-1 hotfix #2 (2026-07-20): 同步 plan_cursor = current_cmd_pos
+        // 背景: RT JOG 子状态机只改 current_cmd_pos, 不动 plan_cursor. 切回增量模式
+        //   api_move_relative 基于 plan_cursor 计算 target, 用了 JOG 前的旧位置.
+        //   现象: 增量到 16 → 切连续 JOG 走到 100 → 切回增量按 + → target=16+1=17
+        //   (期望 101, 工业增量模式应基于当前实际位置).
+        // 修复: JOG 停止时把 plan_cursor 强制同步到 RT 实际位置, 后续 MoveRelative
+        //   基于正确基准.
+        api_sync_planner_cursor();
         return 0;
     }
     if (atomic_load_explicit(&g_interpolator.jog_active_req, memory_order_acquire) == 0) {
@@ -1185,6 +1193,7 @@ int SMC_JogStop(char axis_letter)
     atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
     g_interpolator.jog_axis_idx = -1;
     g_interpolator.time_scale = 1.0;  // P0-1 hotfix: 同 ALL 路径, 恢复段消费
+    api_sync_planner_cursor();         // P0-1 hotfix #2: 同步 plan_cursor
     return 0;
 }
 
