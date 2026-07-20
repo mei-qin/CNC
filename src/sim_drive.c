@@ -104,7 +104,13 @@ void sim_drive_init_all(void)
 {
     memset(g_sim_axis, 0, sizeof(g_sim_axis));
     for (int i = 0; i < AXIS_NUM; i++) {
-        g_sim_axis[i].alpha = 0.2;
+        /* alpha=0.5 (2026-07-20 调优, 原 0.2):
+         * 一阶低通响应速度, 决定 sim 模型对 target_pos 跳跃的跟随快慢.
+         * 0.2 太保守: 连按按钮 + 反向运动时 motion queue 累积多段, RT 快速消费
+         * 让 target 大幅跳跃, sim_drive 跟不上 → 跟随误差突破 FOLLOW_ERR_MAX_PULSE
+         * (5000 脉冲) 触发假阳性报警, 后续 motion 全部被 api_push_trajectory 拒绝.
+         * 0.5 响应快 2.5 倍, 减少假阳性; 真实伺服响应更快, alpha 仅 sim_mode 用. */
+        g_sim_axis[i].alpha = 0.5;
         for (int s = 0; s < MAX_SLAVES_PER_AXIS; s++) {
             g_sim_axis[i].motor[s].cia_state = SIM_CIA_SWITCH_ON_DISABLED;
             g_sim_axis[i].motor[s].last_cw   = 0x0000;
