@@ -315,7 +315,15 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     for(int s=0;s<g_axis[i].slave_count;s++){
                         int slave_id=g_axis[i].slave_ids[s];
                         g_axis[i].home_offset[s]=axis_pdo_read_pos(slave_id);
+                        // v2 (2026-07-20): homing_shift 显式清零 (虽然 g_axis 全局零初始化,
+                        //   此处显式 = 0 保证可读性 + 防首周期前 Non-RT 抢跑读到旧值).
+                        g_axis[i].homing_shift[s]=0;
                     }
+                    // v2: 首周期锚定完成标志置位. 必须在所有 home_offset[s]/homing_shift[s]
+                    //   写入完成后才置 1 (memory_order_release 保证顺序可见性).
+                    //   Non-RT (SMC_HomeAxis 等) acquire 读此标志, 0 时拒绝执行防抢跑.
+                    atomic_store_explicit(&g_axis[i].home_offset_anchored, 1,
+                                          memory_order_release);
                 }
                 // P0 修复: is_first_run=0 必须在 if 块内, 只有 wkc>0 锚定成功才置 0.
                 // 原 BUG: is_first_run=0 在 if 块外, 首周期 wkc=0 (EtherCAT 刚启动 PDO 未交换)
@@ -494,8 +502,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     // 同步插补器位置到驱动器实际位置，防止故障恢复后位置偏差
                     for(int j=0;j<AXIS_NUM;j++){
                         if(g_axis[j].slave_count < 1 || g_axis[j].slave_ids[0] <= 0) continue;
+                        // v2 (2026-07-20): 公式加 - homing_shift[0] (与 PDO 写入对称)
                         int64_t raw_pulse_j = (int64_t)axis_pdo_read_pos(g_axis[j].slave_ids[0])
-                                            - (int64_t)g_axis[j].home_offset[0];
+                                            - (int64_t)g_axis[j].home_offset[0]
+                                            - (int64_t)g_axis[j].homing_shift[0];
                         double ppu = g_axis[j].pulse_per_unit;
                         g_axis[j].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse_j / ppu : 0.0;
                         g_interpolator.current_pos[j] = g_axis[j].current_cmd_pos;
@@ -1150,8 +1160,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         int slave_1=g_axis[i].slave_ids[0];
                         int slave_2=g_axis[i].slave_ids[1];
 
-                        int32_t act_1=axis_pdo_read_pos(slave_1)-g_axis[i].home_offset[0];
-                        int32_t act_2=axis_pdo_read_pos(slave_2)-g_axis[i].home_offset[1];
+                        // v2 (2026-07-20): gantry 同步检测公式加 - homing_shift
+                        int32_t act_1=axis_pdo_read_pos(slave_1)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
+                        int32_t act_2=axis_pdo_read_pos(slave_2)-g_axis[i].home_offset[1]-g_axis[i].homing_shift[1];
 
                         int32_t diff=abs(act_1-act_2);
                         if(diff>g_axis[i].sync_max_err_pulse){
@@ -1248,7 +1259,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     case 0:
                     output_cw=CW_SHUTDOWN;
                     if(g_axis[i].cia_step_delay==1){
-                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
                         double ppu=g_axis[i].pulse_per_unit;
                         g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                     }
@@ -1262,7 +1273,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     case 1:
                     output_cw=CW_SWITCH_ON;
                     if(g_axis[i].cia_step_delay==1){
-                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
                         double ppu=g_axis[i].pulse_per_unit;
                         g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                     }
@@ -1278,7 +1289,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     case 2:
                     output_cw=CW_ENABLE_OP;
                     if(g_axis[i].cia_step_delay==1){
-                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
                         double ppu=g_axis[i].pulse_per_unit;
                         g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                     }
@@ -1288,7 +1299,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             g_axis[i].cia_step_delay=0;
                             g_axis[i].cia_step++;
 
-                            int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0];
+                            int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
                             double ppu=g_axis[i].pulse_per_unit;
                             g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
                             api_sync_planner_cursor();
@@ -1318,7 +1329,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
                     if(g_axis[i].cia_step_delay==1){
                         int64_t primary_pulse = (int64_t)axis_pdo_read_pos(g_axis[i].slave_ids[0])
-                                              - (int64_t)g_axis[i].home_offset[0];
+                                              - (int64_t)g_axis[i].home_offset[0]
+                                              - (int64_t)g_axis[i].homing_shift[0];
 
                         double ppu = g_axis[i].pulse_per_unit;
                         g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)primary_pulse / ppu : 0.0;
@@ -1367,7 +1379,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         output_cw = CW_FAULT_RESET;
                         // 故障期间：命令位置死咬实际位置，防止恢复瞬间飞车追位
                         if(g_axis[i].slave_count >= 1 && g_axis[i].slave_ids[0] > 0){
-                            int32_t raw_pulse = axis_pdo_read_pos(g_axis[i].slave_ids[0]) - g_axis[i].home_offset[0];
+                            int32_t raw_pulse = axis_pdo_read_pos(g_axis[i].slave_ids[0]) - g_axis[i].home_offset[0] - g_axis[i].homing_shift[0];
                             double ppu = g_axis[i].pulse_per_unit;
                             g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse / ppu : 0.0;
                         }
@@ -1393,7 +1405,12 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     /* round-half-away-from-zero 不走 libm: 硬 RT 线程禁止 round()/math.h (libcall → 上下文切换) */
                     double _pos_pulse=g_axis[i].current_cmd_pos*g_axis[i].pulse_per_unit;
                     int32_t logical_pulse=(int32_t)(_pos_pulse>=0.0?_pos_pulse+0.5:_pos_pulse-0.5);
-                    int32_t phys_pos_to_send=logical_pulse+g_axis[i].home_offset[s];
+                    /* v2 (2026-07-20): home_offset 严格常量化, homing 后偏移独立到 homing_shift.
+                     * 公式: phys = logical + home_offset (常量) + homing_shift (可变)
+                     * 数学等价 v1 (改 home_offset), 但消除 RT/Non-RT race (Non-RT 改 homing_shift
+                     * 时, current_cmd_pos 已 = 0, PDO 输出连续无跳变). */
+                    int32_t phys_pos_to_send=logical_pulse+g_axis[i].home_offset[s]
+                                                      +g_axis[i].homing_shift[s];
                     axis_pdo_write(slave_id,output_cw,phys_pos_to_send);
                 }
             }

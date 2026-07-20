@@ -952,6 +952,22 @@ static int homing_mutex_ok(void)
     return 1;
 }
 
+// v2 (2026-07-20): 首周期锚定检查. 防止 Non-RT (SMC_HomeAxis/HomeAll) 在 RT 首周期
+// 锚定完成前抢跑 - 否则会读到 home_offset=0 + homing_shift=0 的旧值, homing 重新锚定时
+// homing_shift = cur_pulse - 0 = cur_pulse (而非 cur_pulse - home_offset), 错位.
+// acquire 读 home_offset_anchored, RT 端 release 写保证 home_offset/homing_shift 已就绪.
+static int axis_anchored_ok(void)
+{
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (g_axis[i].slave_count > 0
+            && atomic_load_explicit(&g_axis[i].home_offset_anchored,
+                                    memory_order_acquire) == 0) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 // ================== P0-1 fix: RPC homing worker ==================
 // @Context: Non-RealTime worker thread
 // 背景: SMC_HomeAxis/HomeAll 仅能设 pending_req (RT 消费 -> PENDING -> RUNNING),
@@ -1018,6 +1034,11 @@ int SMC_HomeAxis(char axis_letter)
         printf("[SMC_API] HomeAxis 与 SafeLift/JOG 冲突\n");
         return -1;
     }
+    // v2 (2026-07-20): 防 Non-RT 抢跑 - 等首周期锚定完成, 否则拒绝.
+    if (!axis_anchored_ok()) {
+        printf("[SMC_API] HomeAxis 等待 RT 首周期锚定完成\n");
+        return -1;
+    }
 
     g_interpolator.homing_source        = SOURCE_MANUAL;
     g_interpolator.homing_method_in_use = g_homing_cfg.axis[idx].method;
@@ -1044,6 +1065,11 @@ int SMC_HomeAll(void)
     }
     if (!homing_mutex_ok()) {
         printf("[SMC_API] HomeAll 与 SafeLift/JOG 冲突\n");
+        return -1;
+    }
+    // v2 (2026-07-20): 防 Non-RT 抢跑 - 等首周期锚定完成, 否则拒绝.
+    if (!axis_anchored_ok()) {
+        printf("[SMC_API] HomeAll 等待 RT 首周期锚定完成\n");
         return -1;
     }
 

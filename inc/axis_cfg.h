@@ -160,7 +160,18 @@ typedef struct {
     int32_t target_pos;    // 目标位置（脉冲），由上层命令或轨迹生成器设置
     int32_t actual_pos;    // 实际位置（脉冲），从驱动器或编码器反馈
 
-    int32_t home_offset[MAX_SLAVES_PER_AXIS]; // 归零/原点偏移（每个从站）
+    // v2 home_offset 常量化重构 (2026-07-20):
+    //   home_offset[s]:  安装时常量, 首周期锚定一次, 之后严格只读 (CLAUDE.md 红线)
+    //                    物理含义: 驱动器编码器零点 ↔ G53 机械原点的固定偏移
+    //   homing_shift[s]: 运行时变量, 每次 homing 后改 (Non-RT 写)
+    //                    物理含义: 本次回零引入的偏移量 = cur_pulse - home_offset
+    //   公式: phys_pulse = logical_pulse + home_offset[s] + homing_shift[s]
+    //   数学等价 v1 (改 home_offset), 但 home_offset 严格常量化消除 RT/Non-RT race
+    int32_t home_offset[MAX_SLAVES_PER_AXIS];  // v2: 安装时常量 (首周期锚定, 之后 RT 只读)
+    int32_t homing_shift[MAX_SLAVES_PER_AXIS]; // v2 NEW: homing 后偏移 (初始 0)
+    // v2: 首周期锚定完成标志. 0=未锚定 (RT 首周期前), 1=已锚定.
+    //   Non-RT (SMC_HomeAxis 等) 入口检查此标志, 防止抢跑读到 home_offset=0 旧值.
+    _Atomic int home_offset_anchored;          // v2 NEW: 首周期锚定完成标志 (atomic)
     double current_cmd_pos; // 当前命令位置（以工程单位表示，用于UI/控制）
     double pulse_per_unit; // 脉冲/单位（如 脉冲/mm 或 脉冲/度），用于位置/速度换算
 
@@ -243,10 +254,12 @@ typedef struct {
 extern HomingGlobalConfig_t g_homing_cfg;  // 定义在 smc_api.c
 
 // Homing 部分成功 all-or-nothing 回滚快照 (axis_homing_multi 内部用)
+// v2 (2026-07-20): home_offset 常量化后, 快照只需 homing_shift + current_cmd_pos.
+//   home_offset 是安装时常量, homing 不会修改, 无需 snapshot.
 typedef struct {
     int     axis_idx;
     int     slave_count_snapshot;
-    int32_t home_offset_snapshot[MAX_SLAVES_PER_AXIS];
+    int32_t homing_shift_snapshot[MAX_SLAVES_PER_AXIS];  // v2: 改名 (原 home_offset_snapshot)
     double  current_cmd_pos_snapshot;
 } HomingRollbackEntry_t;
 

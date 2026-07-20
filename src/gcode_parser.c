@@ -1353,7 +1353,7 @@ int parse_gcode_line(const char *gcode_line)
     // ---- P0-1: G28 返回参考点 (字母循环结束后处理) ----
     // LinuxCNC 风格 v1: 直接 homing, 不解析 X_Y_Z_ 中间点 (Fanuc 风格留 v2)
     // 调 axis_homing_multi 阻塞 parser_thread, 期间 RT 冻结 motion queue
-    // G28 后续段在 homing 完成后继续解析 (此时 home_offset 已重新锚定)
+    // G28 后续段在 homing 完成后继续解析 (v2: homing_shift 已重新锚定, home_offset 常量不动)
     if(is_g28_block){
         if(!g_homing_cfg.enabled || g_homing_cfg.order_count == 0){
             printf("[Parser] G28: homing 未配置, 调 SMC_ConfigHomingAll 先\n");

@@ -1383,7 +1383,7 @@ int32_t axis_pdo_read_follow_err(int slave_id)
 //
 // v1 仅 method 35 (软件法): 把当前位置标为零, 需 JOG 前置定位
 // 双驱同步: 主从 motor 同时触发 CiA402 homing
-// 错误恢复: FAULT 时单轴回滚 home_offset + current_cmd_pos 到快照值
+// 错误恢复: FAULT 时单轴回滚 homing_shift + current_cmd_pos 到快照值 (v2: home_offset 常量不动)
 //   (HomeAll 串行回滚由 axis_homing_multi 管理)
 //
 // sim_mode: 直接 state=DONE 不调 SDO (让状态机逻辑可验证)
@@ -1417,11 +1417,12 @@ void axis_homing(int axis_idx)
         return;
     }
 
-    // ③ 单轴快照 (FAULT 时回滚)
+    // ③ 单轴快照 (FAULT 时回滚). v2 (2026-07-20): home_offset 常量化后, 只需 snapshot
+    //   homing_shift (home_offset 是安装时常量, 不会变).
     int32_t ho_snap[MAX_SLAVES_PER_AXIS];
     int slave_count = g_axis[axis_idx].slave_count;
     for (int s = 0; s < slave_count; s++) {
-        ho_snap[s] = g_axis[axis_idx].home_offset[s];
+        ho_snap[s] = g_axis[axis_idx].homing_shift[s];
     }
     double ccp_snap = g_axis[axis_idx].current_cmd_pos;
 
@@ -1484,10 +1485,10 @@ void axis_homing(int axis_idx)
         fault = 1;
     }
 
-    // ⑦ FAULT 路径: 单轴回滚 + state=4
+    // ⑦ FAULT 路径: 单轴回滚 + state=4. v2: 回滚 homing_shift (home_offset 不变).
     if (fault) {
         for (int s = 0; s < slave_count; s++) {
-            g_axis[axis_idx].home_offset[s] = ho_snap[s];
+            g_axis[axis_idx].homing_shift[s] = ho_snap[s];
         }
         g_axis[axis_idx].current_cmd_pos = ccp_snap;
         g_interpolator.current_pos[axis_idx] = ccp_snap;
@@ -1507,11 +1508,17 @@ void axis_homing(int axis_idx)
         osal_usleep(100000);
     }
 
-    // ⑨ home_offset 重新锚定 (v1 workaround, v2 改常量化)
-    // 与 ecat_core.c:315 首周期锚定同语义, Non-RT 写入
+    // ⑨ homing_shift 重新锚定 (v2, 2026-07-20): home_offset 严格常量化后,
+    //   Non-RT 改 homing_shift (而非 home_offset). 数学等价:
+    //     v1 PDO 输出 = 0 + home_offset(新值=cur_pulse) = cur_pulse
+    //     v2 PDO 输出 = 0 + home_offset(不变) + (cur_pulse - home_offset) = cur_pulse
+    //   v2 优势: home_offset 严格只读, RT/Non-RT race 消除 (CLAUDE.md 红线合规).
+    //   与 ecat_core.c:317 首周期锚定不同 — 首周期是 home_offset 一次性写入 (常量定值),
+    //   此处是 homing_shift 每次回零重写 (运行时变量).
     for (int s = 0; s < slave_count; s++) {
         int slave_id = g_axis[axis_idx].slave_ids[s];
-        g_axis[axis_idx].home_offset[s] = axis_pdo_read_pos(slave_id);
+        int32_t cur_pulse = axis_pdo_read_pos(slave_id);
+        g_axis[axis_idx].homing_shift[s] = cur_pulse - g_axis[axis_idx].home_offset[s];
     }
 
     // ⑩ current_cmd_pos 归零 (机械原点 = G53 原点)
@@ -1522,7 +1529,7 @@ void axis_homing(int axis_idx)
     // ⑪ state=DONE
     g_interpolator.homing_state = 3;
     EventLogger_Push(SEVERITY_INFO, source, 0x0006, 3, "homing done");
-    printf("[Homing] %s DONE (home_offset re-anchored, pos reset to 0)\n",
+    printf("[Homing] %s DONE (homing_shift re-anchored, home_offset constant, pos reset to 0)\n",
            g_axis[axis_idx].axis_name);
 }
 
@@ -1530,20 +1537,20 @@ void axis_homing(int axis_idx)
 // @Context: Non-RealTime (parser_thread 或 SMC_HomeAll 触发路径)
 // 调用方: G28 parser (SOURCE_PARSER), SMC_HomeAll 异步路径 (SOURCE_MANUAL)
 //
-// 任一轴 FAULT → 回滚所有已成功轴 (home_offset + current_cmd_pos) 到快照值
+// 任一轴 FAULT → 回滚所有已成功轴 (homing_shift + current_cmd_pos) 到快照值 (v2: home_offset 常量不动)
 // 返回: 0=全部成功, -1=有轴 FAULT (已回滚)
 int axis_homing_multi(const int *axis_indices, int count, int source)
 {
     if (axis_indices == NULL || count <= 0) return -1;
 
-    // ① 快照所有目标轴 (rollback 用)
+    // ① 快照所有目标轴 (rollback 用). v2: snapshot homing_shift (home_offset 是常量, 无需 snapshot).
     HomingRollbackEntry_t snaps[AXIS_NUM];
     for (int i = 0; i < count && i < AXIS_NUM; i++) {
         int idx = axis_indices[i];
         snaps[i].axis_idx = idx;
         snaps[i].slave_count_snapshot = g_axis[idx].slave_count;
         for (int s = 0; s < g_axis[idx].slave_count && s < MAX_SLAVES_PER_AXIS; s++) {
-            snaps[i].home_offset_snapshot[s] = g_axis[idx].home_offset[s];
+            snaps[i].homing_shift_snapshot[s] = g_axis[idx].homing_shift[s];
         }
         snaps[i].current_cmd_pos_snapshot = g_axis[idx].current_cmd_pos;
     }
@@ -1591,7 +1598,8 @@ int axis_homing_multi(const int *axis_indices, int count, int source)
             for (int j = 0; j <= i && j < AXIS_NUM; j++) {
                 int rb_idx = snaps[j].axis_idx;
                 for (int s = 0; s < snaps[j].slave_count_snapshot; s++) {
-                    g_axis[rb_idx].home_offset[s] = snaps[j].home_offset_snapshot[s];
+                    // v2: 回滚 homing_shift (home_offset 是常量, 不需要回滚)
+                    g_axis[rb_idx].homing_shift[s] = snaps[j].homing_shift_snapshot[s];
                 }
                 g_axis[rb_idx].current_cmd_pos = snaps[j].current_cmd_pos_snapshot;
                 g_interpolator.current_pos[rb_idx] = snaps[j].current_cmd_pos_snapshot;
