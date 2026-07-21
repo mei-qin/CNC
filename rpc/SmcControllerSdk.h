@@ -219,6 +219,22 @@ public:
     bool JogStop(char axis_letter, int &out_ret_code);  /* '*' 停所有 */
 
     /* =============================================================
+     * P0-A: 软急停 (Emergency Stop) — ISO 13850 软件层
+     *
+     * 一站式触发: 内核原子序列清队列 + 设 alarm + 关激光 + 抬刀 + 推事件.
+     * UI 一键调用, 无需串调多个 API. 复位走 ClearAlarm 路径.
+     *
+     * reason_code: 0=UI 手动, 1=外部系统(SDK/脚本), 2-9 保留
+     * message: UTF-8 简短描述 (≤63 字节), null 终结, 内核 EventLogger 推送
+     *
+     * 返回语义 (与 invokeIntRet 一致): true=协议成功.
+     * 失败也建议 UI 视为急停已请求 (网络故障不应掩盖急停意图, 内核最终一致).
+     * 急停不可拒, out_ret_code 恒为 0.
+     * ============================================================= */
+    bool EmergencyStop(int reason_code, int &out_ret_code,
+                       const std::string &message = "");
+
+    /* =============================================================
      * P2-A: 实时倍率系统 (Feed/Rapid/Spindle Override + Mode Flags)
      *
      * 典型流程: HMI 滑条/旋钮 onChange → SetOverride (mask/value 模式, 允许部分修改)

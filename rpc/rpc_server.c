@@ -637,6 +637,20 @@ static int handle_client_request(int client_fd)
         break;
     }
 
+    /* ===== P0-A: Emergency Stop (2026-07-21, 软急停一站式触发) ===== */
+    case SMC_CMD_EMERGENCY_STOP: {
+        if (req_hdr.data_len < sizeof(SmcEmergencyStopReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcEmergencyStopReq *req = (SmcEmergencyStopReq *)payload;
+        printf("[rpc] 急停: reason=%d msg='%s'\n", req->reason_code, req->message);
+        SmcEmergencyStopRes *res = (SmcEmergencyStopRes *)resp_buf;
+        res->ret_code = SMC_EmergencyStop(req->reason_code, req->message);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcEmergencyStopRes);
+        break;
+    }
+
     /* ===== P0-3: Safe Z Lift ===== */
     case SMC_CMD_CONFIG_SAFE_LIFT: {
         if (req_hdr.data_len < sizeof(SmcConfigSafeLiftReq)) {

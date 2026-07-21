@@ -604,6 +604,35 @@ int SMC_ClearAlarm(void) {
     return 0;
 }
 
+// ================== P0-A: EmergencyStop (2026-07-21) ==================
+// 软急停一站式入口 (ISO 13850 软件层, MVP 阶段物理急停待硬件接入).
+// 原子序列 (顺序敏感): abort 队列 → alarm 阻止重启 → 关激光 → 抬刀 → 推事件.
+// 急停不可拒, 恒返回 0; UI 调用方据此立即红屏反馈, 内核最终一致.
+int SMC_EmergencyStop(int reason_code, const char *message)
+{
+    /* ① 清 parser 队列, 防 RT 继续推段 (g_parser_ctrl.abort_request=1) */
+    SMC_AbortProcessing();
+
+    /* ② 设系统报警, 触发 RT HOLD_BRAKING 平滑刹车 (防 RT 重启运动) */
+    atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+
+    /* ③ 关激光: laser_rt_safety_gate 在 RT 同周期响应 (关光闸/DO/气阀/alarm_lamp) */
+    g_laser_rt.emergency_kill = 1;
+
+    /* ④ SafeLift 抬刀 (若 auto_on_alarm=1): Z 抬升防撞工件, idempotent */
+    if (g_safe_lift_cfg.enabled && g_safe_lift_cfg.auto_on_alarm) {
+        SMC_SafeLiftZ();
+    }
+
+    /* ⑤ 推事件: LASER/0x0011 "急停软线" (EVENT_CODES.md §4.2 已预留) */
+    EventLogger_Push(SEVERITY_ALARM, SOURCE_LASER, 0x0011, reason_code,
+                     message ? message : "software E-STOP triggered");
+
+    printf("[SMC_API] EmergencyStop triggered (reason=%d msg='%s')\n",
+           reason_code, message ? message : "");
+    return 0;
+}
+
 // ================== 仿真驱动器 API (仅 sim 模式) ==================
 
 int SMC_InjectAxisFault(char axis_letter, int slave_subidx)

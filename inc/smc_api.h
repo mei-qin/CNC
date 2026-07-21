@@ -171,6 +171,19 @@ int SMC_GetProgramStructure(SmcGetProgramStructureRes *out);
 // 返回: 0=请求已提交, -1=parser 正在跑 (先 AbortProcessing), -2=轴未就绪
 int SMC_ClearAlarm(void);
 
+// P0-A (2026-07-21): 软急停一站式 API (ISO 13850 软件层).
+// @Context: Non-RealTime (RPC server / UI 通过 SDK)
+// @Thread-Safety: rpc_server 单线程消费 socket, 调用自然序列化
+// 原子序列 (顺序敏感):
+//   1. SMC_AbortProcessing - 清 parser 队列
+//   2. g_sys_alarm_state=1 - 触发 RT HOLD_BRAKING 平滑刹车
+//   3. g_laser_rt.emergency_kill=1 - laser_rt_safety_gate 关光闸/DO
+//   4. SMC_SafeLiftZ() (若 auto_on_alarm=1) - Z 抬升防撞工件
+//   5. EventLogger LASER/0x0011 "急停软线"
+// reason_code: 0=UI 手动, 1=外部系统(SDK/脚本), 2-9 保留
+// 返回 0=已触发 (急停不可拒, 恒返回 0)
+int SMC_EmergencyStop(int reason_code, const char *message);
+
 // 配置轴的脉冲/单位 (例如 脉冲/mm 或 脉冲/度)，用于位置/速度换算
 void SMC_ConfigPulsePerUnit(char axis_letter, double pulse_per_unit);
 

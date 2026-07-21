@@ -138,6 +138,9 @@ typedef enum {
     /* --- JOG 0x0060 ~ 0x0061 (P0-1, method 35 前置) --- */
     SMC_CMD_JOG_START                = 0x0060,  /* 启动 JOG (axis + direction + speed) */
     SMC_CMD_JOG_STOP                 = 0x0061,  /* 停止 JOG (axis 或 '*') */
+
+    /* --- Emergency Stop 0x0062 (P0-A, ISO 13850 软件层) --- */
+    SMC_CMD_EMERGENCY_STOP           = 0x0062,  /* 软急停一站式触发 (原子序列) */
 } SmcCmdType;
 
 /* ============================================================
@@ -662,6 +665,17 @@ typedef struct {
     uint8_t _pad[3];
 } SmcJogStopReq;
 typedef struct { int32_t ret_code; } SmcJogStopRes;
+
+/* SMC_EMERGENCY_STOP (0x0062) — P0-A 软急停 */
+/* reason_code: 0=UI 手动, 1=外部系统, 2-9 保留 */
+/* message: UTF-8 null 终结, 超长截断, 64B */
+typedef struct {
+    int32_t reason_code;
+    char    message[64];
+} SmcEmergencyStopReq;
+typedef struct {
+    int32_t ret_code;   /* 恒 0=已触发 (急停不可拒) */
+} SmcEmergencyStopRes;
 
 #pragma pack(pop)
 

@@ -938,3 +938,18 @@ bool SmcController::JogStop(char axis_letter, int &out_ret_code)
     req.z_letter = (uint8_t)axis_letter;  /* '*' = 全停 */
     return invokeIntRet(SMC_CMD_JOG_STOP, out_ret_code, &req, sizeof(req));
 }
+
+/* P0-A (2026-07-21): 软急停一站式触发
+ * message 处理: std::string → char[64] 定长, 截断保护 + null 终结 */
+bool SmcController::EmergencyStop(int reason_code, int &out_ret_code,
+                                   const std::string &message)
+{
+    SmcEmergencyStopReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.reason_code = reason_code;
+    /* 截断保护: 取 min(message.size(), 63), memset 已保证 null 终结 */
+    size_t copy_len = message.size() < sizeof(req.message) - 1
+                      ? message.size() : sizeof(req.message) - 1;
+    std::memcpy(req.message, message.data(), copy_len);
+    return invokeIntRet(SMC_CMD_EMERGENCY_STOP, out_ret_code, &req, sizeof(req));
+}
