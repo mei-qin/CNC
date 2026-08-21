@@ -73,3 +73,12 @@ __pycache__/
 # ==== 仿真运行时产物 (Sim Runtime Output) ====
 # 控制台 stdout 重定向文件, 团队成员本地各自生成
 tests/output/scenario_log/
+
+# ==== 2026-08-21: 仅核心代码策略 (拉取即可 make) ====
+# 编译产物
+/opcua_probe
+# 运行时事件持久化数据
+/event_logs/
+# 验收/调试脚本与本地文档: 新文件一律不跟踪 (已跟踪文件的修改不受影响)
+/scripts/
+/docs/

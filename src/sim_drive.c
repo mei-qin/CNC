@@ -202,6 +202,35 @@ int sim_drive_config_alpha(int axis_idx, double alpha)
     return 0;
 }
 
+int sim_drive_inject_gantry_offset(int axis_idx, int32_t offset_pulse)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return -1;
+    /* 仅双驱轴的 motor[1] (slave) 注入; 单驱轴无意义 */
+    if (g_axis[axis_idx].slave_count < 2) return -1;
+    /* 直接给 slave motor pos 加 offset, 模拟"主从机械静态差"
+     * 一次性写入: pos 立即偏移, 后续 step_axis 围绕 target 收敛
+     * 模拟龙门梁安装误差 / 双驱 encoder 零点漂移导致的初始 pos 差
+     * pre-align 算法 (axis_ctrl.c): Non-RT 设 homing_shift[1]=delta 补偿,
+     * RT 周期让 slave pos 收敛到 master pos, 消除静态差 */
+    g_sim_axis[axis_idx].motor[1].pos += offset_pulse;
+    return 0;
+}
+
+int sim_drive_step_toward(int axis_idx, int slave_subidx, int32_t target, double alpha)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return -1;
+    if (slave_subidx < 0 || slave_subidx >= MAX_SLAVES_PER_AXIS) return -1;
+    if (!(alpha > 0.0) || !(alpha < 1.0)) return -1;
+    SimMotor_t *m = &g_sim_axis[axis_idx].motor[slave_subidx];
+    /* 与 sim_drive_step_axis 同款整数一阶低通: pos += (target - pos) * alpha */
+    int64_t err = (int64_t)target - (int64_t)m->pos;
+    int64_t scaled = (int64_t)(alpha * 65536.0);
+    int32_t delta = (int32_t)((err * scaled) >> 16);
+    m->pos += delta;
+    m->target = target;
+    return 0;
+}
+
 int sim_drive_lookup_slave(int slave_id, int *axis_idx_out, int *subidx_out)
 {
     for (int i = 0; i < AXIS_NUM; i++) {

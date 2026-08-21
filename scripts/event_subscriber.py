@@ -56,6 +56,8 @@ EVENT_CODE_DESC = {
     (4, 0x0008): "homing FAULT",      # P0-1: value=axis_idx (含 all-or-nothing 回滚)
     (4, 0x0009): "homing method N/A", # P0-1: value=method (v1 仅 35)
     (4, 0x000B): "jog soft limit",    # P0-1: value=axis_idx
+    (4, 0x000C): "gantry pre-align triggered",  # B2 (2026-07-23): value=delta_pulse
+    (4, 0x000D): "gantry pre-align timeout",    # B2 (2026-07-23): value=axis_idx FAULT
     # LASER
     (3, 0x0010): "laser safety door",
     (3, 0x0011): "estop soft",

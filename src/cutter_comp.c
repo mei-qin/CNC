@@ -242,11 +242,40 @@ static int line_arc_tangent(const double line_p0[2], const double line_dir[2],
 // 这样 process_corner / flush_last_segment 中的 10+ 个 output_fn 调用点
 // 自动获得统一的管线探针埋点,不会漏掉任何偏置输出。
 // speed 单位: 调用方传 mm/s,trace 字段 v_target 期望 mm/ms,做 /1000.0 换算。
+//
+// C3 (2026-07-27): cutter_emit 签名不变 (caller 仍传 4 参数),
+// 内部从 g_comp 读取 G93 上下文 (g93_strict_pending/g93_dt_sec_pending),
+// 透传到 output_fn. PushPoint/PushArc 入口负责缓存 G93 上下文.
 static int cutter_emit(const double pos[AXIS_NUM], double speed,
                        double acc, double dec)
 {
     TraceLogger_PushPipeline(STAGE_CUTTER_COMP, pos, speed / 1000.0);
-    return g_comp.output_fn(pos, speed, acc, dec);
+    // C3-fix2: 记录实际刀位 (圆弧离散化入口对齐用)
+    memcpy(g_comp.last_emit_pos, pos, sizeof(double) * AXIS_NUM);
+    g_comp.last_emit_valid = 1;
+    return g_comp.output_fn(pos, speed, acc, dec,
+                             g_comp.g93_strict_pending,
+                             g_comp.g93_dt_sec_pending);
+}
+
+// C3-fix (2026-07-28): 显式 G93 上下文版本 —— 圆弧离散化微段时间均分专用.
+//
+// 为什么不能用 cutter_emit (全局 pending):
+//   ARC 本体离散化被推迟到"下一段 push 时"才发生 (滑动窗口延迟输出),
+//   彼时 PushPoint/PushArc 入口已把 g_comp.g93_dt_sec_pending 覆盖为
+//   新段的整段预算 (如 6s), 且从未按微段均分 →
+//   每个微段各拿整弧 6s, 整弧耗时膨胀 num_seg 倍 (实测 N×6000ms)。
+// 修复: 圆弧微段一律显式传"段自身 g93_dt_sec 均分后的 seg_T"。
+static int cutter_emit_dt(const double pos[AXIS_NUM], double speed,
+                          double acc, double dec,
+                          int is_g93_strict, double g93_dt_sec)
+{
+    TraceLogger_PushPipeline(STAGE_CUTTER_COMP, pos, speed / 1000.0);
+    // C3-fix2: 记录实际刀位 (圆弧离散化入口对齐用)
+    memcpy(g_comp.last_emit_pos, pos, sizeof(double) * AXIS_NUM);
+    g_comp.last_emit_valid = 1;
+    return g_comp.output_fn(pos, speed, acc, dec,
+                             is_g93_strict, g93_dt_sec);
 }
 
 // ================== 核心：拐角分类与轨迹重构 ==================
@@ -418,6 +447,8 @@ static int process_corner_line_line(const CompSegment_t *segA,
         double angle_step = sweep / (double)num_seg;
 
         // ③ 生成圆弧微段: 最后一微段强制对齐理论终点 footB，消除浮点累积
+        // C3-fix (2026-07-28): 过渡弧是刀补插入的非编程几何, 不占 G93 时间预算
+        // → 显式走非 strict 路径 (dt=0), 防止微段各拿整块 6s 导致 N×6s 膨胀
         for(int i = 1; i <= num_seg; i++) {
             double pt[AXIS_NUM];
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
@@ -429,7 +460,7 @@ static int process_corner_line_line(const CompSegment_t *segA,
                 pt[ax1] = curr[ax1] + R * cos(theta);
                 pt[ax2] = curr[ax2] + R * sin(theta);
             }
-            cutter_emit(pt, speed, acc, dec);
+            cutter_emit_dt(pt, speed, acc, dec, 0, 0.0);
         }
     }
 
@@ -640,6 +671,7 @@ static int process_corner_line_arc(const CompSegment_t *segA,
         if(num_seg < 1) num_seg = 1;
         double angle_step = sweep / (double)num_seg;
 
+        // C3-fix (2026-07-28): 过渡弧非编程几何, 不占 G93 预算 (dt=0)
         for(int i = 1; i <= num_seg; i++) {
             double pt[AXIS_NUM];
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
@@ -651,7 +683,7 @@ static int process_corner_line_arc(const CompSegment_t *segA,
                 pt[ax1] = curr[ax1] + R * cos(theta);
                 pt[ax2] = curr[ax2] + R * sin(theta);
             }
-            cutter_emit(pt, speed, acc, dec);
+            cutter_emit_dt(pt, speed, acc, dec, 0, 0.0);
         }
     }
 
@@ -675,12 +707,57 @@ static void discretize_offset_arc(const CompSegment_t *arc,
                                    int ax1, int ax2,
                                    double speed, double acc, double dec)
 {
+    // C3-fix2 (2026-07-28): 入口对齐 —— 消除"回程过切"。
+    // 场景: segA(上段) 与本弧为内拐角时, 实际入刀点已被剪裁到偏置弧内
+    // 某角度 (如 165.5°), 但调用方仍传理论起点 (180°)。若不对齐, 第一个
+    // 微段会回退重切已剪裁的楔形区 (几何过切), 且该微段长度异常
+    // (实测 4.55mm vs 正常 0.5mm) → G93 均分时间下 v 尖峰 9 倍。
+    // 对齐条件: 最后 emit 刀位落在偏置圆上 (|dist-R_off|<10µm) 且沿扫向
+    // 领先理论起点不超过 |s_end| → 前移 start_angle, 缩短 s_end
+    // (时间随 sweep_ratio 自动按占比缩短, 保持匀速)。
+    if(g_comp.last_emit_valid) {
+        double ldx = g_comp.last_emit_pos[ax1] - arc->center[0];
+        double ldy = g_comp.last_emit_pos[ax2] - arc->center[1];
+        double lr  = hypot(ldx, ldy);
+        if(fabs(lr - R_off) < 0.01) {
+            double la = atan2(ldy, ldx);
+            double delta = la - start_angle;
+            if(s_end >= 0.0) {
+                while(delta < 0.0)          delta += 2.0 * M_PI;
+                while(delta >= 2.0 * M_PI)  delta -= 2.0 * M_PI;
+                if(delta > COMP_PARALLEL_TOL && delta <= s_end + COMP_PARALLEL_TOL) {
+                    start_angle += delta;
+                    s_end -= delta;
+                    if(s_end < 0.0) s_end = 0.0;
+                }
+            } else {
+                while(delta > 0.0)           delta -= 2.0 * M_PI;
+                while(delta <= -2.0 * M_PI)  delta += 2.0 * M_PI;
+                if(delta < -COMP_PARALLEL_TOL && delta >= s_end - COMP_PARALLEL_TOL) {
+                    start_angle += delta;
+                    s_end -= delta;
+                    if(s_end > 0.0) s_end = 0.0;
+                }
+            }
+        }
+    }
+
     double arc_len = fabs(s_end) * R_off;
     int num_seg = (int)ceil(arc_len / COMP_ARC_STEP_MM);
     if(num_seg < 1) num_seg = 1;
     double angle_step = s_end / (double)num_seg;
     double sweep_ratio = (fabs(arc->sweep) > COMP_PARALLEL_TOL)
                          ? (s_end / arc->sweep) : 1.0;
+
+    // C3-fix (2026-07-28): G93 时间均分 —— 用"段自身" arc->g93_dt_sec
+    // (不能用 g_comp.g93_dt_sec_pending: ARC 延迟输出时已被下一段覆盖)。
+    // 部分离散化 (内角剪裁 s_end < sweep) 时, 时间按扫角占比缩放:
+    //   T_portion = T_total × |s_end / sweep|
+    // 再按 strategy-A 同款累计差分法均分到 num_seg 个微段 (浮点稳定):
+    //   seg_T(i) = T_portion×i/N − T_portion×(i−1)/N
+    double T_portion = (arc->g93_dt_sec > 1e-9)
+                       ? arc->g93_dt_sec * fabs(sweep_ratio) : 0.0;
+    int is_g93_arc = (T_portion > 1e-9) ? 1 : 0;
 
     for(int i = 1; i <= num_seg; i++) {
         double pt[AXIS_NUM];
@@ -704,7 +781,11 @@ static void discretize_offset_arc(const CompSegment_t *arc,
             pt[ax1] = arc->center[0] + R_off * cos(theta);
             pt[ax2] = arc->center[1] + R_off * sin(theta);
         }
-        cutter_emit(pt, speed, acc, dec);
+        double seg_T = is_g93_arc
+                       ? (T_portion * (double)i / (double)num_seg
+                          - T_portion * (double)(i - 1) / (double)num_seg)
+                       : 0.0;
+        cutter_emit_dt(pt, speed, acc, dec, is_g93_arc, seg_T);
     }
 }
 
@@ -914,6 +995,7 @@ static int process_corner_arc_line(const CompSegment_t *segA,
         if(num_seg < 1) num_seg = 1;
         double angle_step = sweep_t / (double)num_seg;
 
+        // C3-fix (2026-07-28): 过渡弧非编程几何, 不占 G93 预算 (dt=0)
         for(int i = 1; i <= num_seg; i++) {
             double pt[AXIS_NUM];
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
@@ -925,7 +1007,7 @@ static int process_corner_arc_line(const CompSegment_t *segA,
                 pt[ax1] = curr[ax1] + R * cos(theta);
                 pt[ax2] = curr[ax2] + R * sin(theta);
             }
-            cutter_emit(pt, speed, acc, dec);
+            cutter_emit_dt(pt, speed, acc, dec, 0, 0.0);
         }
     }
 
@@ -1165,6 +1247,7 @@ static int process_corner_arc_arc(const CompSegment_t *segA,
         if(num_seg < 1) num_seg = 1;
         double angle_step = sweep_t / (double)num_seg;
 
+        // C3-fix (2026-07-28): 过渡弧非编程几何, 不占 G93 预算 (dt=0)
         for(int i = 1; i <= num_seg; i++) {
             double pt[AXIS_NUM];
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
@@ -1176,7 +1259,7 @@ static int process_corner_arc_arc(const CompSegment_t *segA,
                 pt[ax1] = curr[ax1] + R * cos(theta);
                 pt[ax2] = curr[ax2] + R * sin(theta);
             }
-            cutter_emit(pt, speed, acc, dec);
+            cutter_emit_dt(pt, speed, acc, dec, 0, 0.0);
         }
     }
 
@@ -1289,38 +1372,15 @@ static void flush_last_segment(void)
         }
 
         // 离散化偏置弧 (全 sweep)
+        // C3-fix / C3-fix2 (2026-07-28): 复用 discretize_offset_arc ——
+        //   1) G93 时间均分用段自身 g93_dt_sec (G40 flush 时全局 pending 已不可信)
+        //   2) 入口对齐消除回程过切 (LINE→ARC 内角剪裁后 G40 直接 flush 场景)
         double start_angle = atan2(rad_sy, rad_sx);
-        double sweep = seg_curr->sweep;
-        double arc_len = fabs(sweep) * R_off;
-        int num_seg = (int)ceil(arc_len / COMP_ARC_STEP_MM);
-        if(num_seg < 1) num_seg = 1;
-        double angle_step = sweep / (double)num_seg;
-
-        for(int i = 1; i <= num_seg; i++) {
-            double pt[AXIS_NUM];
-            memcpy(pt, seg_curr->start_pos, sizeof(double) * AXIS_NUM);
-            double ratio = (double)i / (double)num_seg;
-
-            // 非平面轴线性跟随 (螺旋)
-            for(int j = 0; j < AXIS_NUM; j++) {
-                if(j != ax1 && j != ax2) {
-                    pt[j] = seg_curr->start_pos[j]
-                          + (seg_curr->end_pos[j] - seg_curr->start_pos[j]) * ratio;
-                }
-            }
-
-            // 平面两轴
-            if(i == num_seg) {
-                // 末点强制对齐理论偏置终点
-                pt[ax1] = seg_curr->center[0] + R_off * rad_ex * inv_R_orig;
-                pt[ax2] = seg_curr->center[1] + R_off * rad_ey * inv_R_orig;
-            } else {
-                double theta = start_angle + (double)i * angle_step;
-                pt[ax1] = seg_curr->center[0] + R_off * cos(theta);
-                pt[ax2] = seg_curr->center[1] + R_off * sin(theta);
-            }
-            cutter_emit(pt, speed, acc, dec);
-        }
+        double end_off_ax1 = seg_curr->center[0] + R_off * rad_ex * inv_R_orig;
+        double end_off_ax2 = seg_curr->center[1] + R_off * rad_ey * inv_R_orig;
+        discretize_offset_arc(seg_curr, R_off, start_angle, seg_curr->sweep,
+                              end_off_ax1, end_off_ax2, ax1, ax2,
+                              speed, acc, dec);
 
         // 退刀点: 从偏置终点垂直回到编程 end_pos, 距离恰好为 R 或 (R-r 内偏时)
         // 确保后续无补偿指令从编程位置开始
@@ -1449,6 +1509,7 @@ void CutterComp_Enable(int mode, double radius)
     }
     g_comp.window_count = 1;  // P0 已就位，下一条 PushPoint(P1) 将填入 window_seg[1]
     g_comp.first_seg_pending = 1;
+    g_comp.last_emit_valid = 0;  // C3-fix2: 清陈旧刀位, 防误触发弧入口对齐
 
     printf("[CutterComp] %s 已启用, 半径=%.3f mm, 平面=G%d\n",
            mode == COMP_LEFT ? "左补偿(G41)" : "右补偿(G42)",
@@ -1487,13 +1548,22 @@ void CutterComp_SetOutput(CutterOutputCB fn)
 //
 // 阶段 2 重构: PushPoint 把单点包装为 LINE segment 后, 走统一的"段入队"路径
 // 与阶段 3 的 PushArc 共用滑动窗口 + process_segment_pair 流程
+//
+// C3 (2026-07-27): 签名扩展 4→6 参数, 透传 G93 强一致性上下文.
+//   入口缓存 G93 到 g_comp, cutter_emit / 直通路径 读取后透传到 output_fn.
 int CutterComp_PushPoint(double pos[AXIS_NUM], double speed,
-                         double acc, double dec)
+                         double acc, double dec,
+                         int is_g93_strict, double g93_dt_sec)
 {
+    // C3: 缓存 G93 上下文 (cutter_emit / 后续 cutter_emit 调用读取)
+    g_comp.g93_strict_pending = is_g93_strict;
+    g_comp.g93_dt_sec_pending = g93_dt_sec;
+
     // 补偿关闭: 直通到输出回调
     if(g_comp.mode == COMP_OFF) {
         if(g_comp.output_fn) {
-            return g_comp.output_fn(pos, speed, acc, dec);
+            return g_comp.output_fn(pos, speed, acc, dec,
+                                     is_g93_strict, g93_dt_sec);
         }
         return -1;
     }
@@ -1592,7 +1662,18 @@ static int push_arc_strategy_a_discretize(const CompSegment_t *arc,
         pt[ax1] = arc->center[0] + R_off * cos(theta);
         pt[ax2] = arc->center[1] + R_off * sin(theta);
 
-        if(CutterComp_PushPoint(pt, arc->speed, arc->acc, arc->dec) < 0) return -1;
+        // C3 (2026-07-27): 圆弧 G93 时间均分到每个微段 (seg_T = T_total / num_seg)
+        // 浮点累积风险: 用 i/num_seg 比例算累计时间, 避免均除累积误差
+        // seg_T_at_i = T_total × i / num_seg - T_total × (i-1) / num_seg
+        //            = T_total / num_seg (理论上), 但浮点累减法更稳定
+        double total_T = arc->g93_dt_sec;
+        double seg_T = (total_T > 1e-9)
+                       ? (total_T * (double)i / (double)num_seg
+                          - total_T * (double)(i - 1) / (double)num_seg)
+                       : 0.0;
+        int is_g93_seg = (seg_T > 1e-9) ? 1 : 0;
+        if(CutterComp_PushPoint(pt, arc->speed, arc->acc, arc->dec,
+                                  is_g93_seg, seg_T) < 0) return -1;
     }
     return 0;
 }
@@ -1600,10 +1681,16 @@ static int push_arc_strategy_a_discretize(const CompSegment_t *arc,
 
 int CutterComp_PushArc(const CompSegment_t *arc)
 {
+    // C3 (2026-07-27): 缓存 G93 上下文 (cutter_emit / 直通路径读取)
+    int is_g93_arc = (arc->g93_dt_sec > 1e-9) ? 1 : 0;
+    g_comp.g93_strict_pending = is_g93_arc;
+    g_comp.g93_dt_sec_pending = arc->g93_dt_sec;
+
     // 补偿关闭: 直通终点 (与 PushPoint 同语义)
     if(g_comp.mode == COMP_OFF) {
         if(g_comp.output_fn) {
-            return g_comp.output_fn(arc->end_pos, arc->speed, arc->acc, arc->dec);
+            return g_comp.output_fn(arc->end_pos, arc->speed, arc->acc, arc->dec,
+                                     is_g93_arc, arc->g93_dt_sec);
         }
         return -1;
     }

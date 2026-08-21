@@ -248,6 +248,29 @@ int api_push_trajectory_g93_wcs(double target_pos[AXIS_NUM],
                                      wcs, wcs_offset_snap);
 }
 
+// @Context: Non-RealTime Background Thread (刀补引擎专用, parser_thread 调用)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// C3 (2026-07-27): 刀补输出统一入队, 透传 G93 强一致性上下文 + 强制 is_fillet=1.
+//   - WCS+G52+ext WCS 快照在入队瞬间从 g_state 冻结 (parser_thread 单写者, 安全)
+//   - is_fillet=1: 刀补输出禁抹圆, planner 反/正扫描加屏障
+//   - is_rtcp_active=0: 刀补是 2D 路径, RTCP 直通
+//   - is_g93_strict + g93_dt_sec: G93 模式下保时间绝对守恒, 否则常规 G94 路径
+// 作为 CutterOutputCB 函数指针类型, 由 CutterComp_SetOutput 注册
+int api_push_trajectory_cutter(double target_pos[AXIS_NUM],
+                                double speed_sec_mm, double acc_sec_mm,
+                                double dec_sec_mm,
+                                int is_g93_strict, double g93_dt_sec)
+{
+    double snap[AXIS_NUM];
+    snapshot_wcs_offset(g_state.modal_wcs, snap);
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm,
+                                     is_g93_strict, g93_dt_sec,
+                                     1,  // is_fillet
+                                     0,  // is_rtcp_active
+                                     g_state.modal_wcs, snap);
+}
+
 // @Context: Non-RealTime Background Thread (RTCP 路径专用)
 // @Thread-Safety: queue_spinlock 互斥,与其他 push 函数共享。
 // RTCP 包装器: 入队时设置 is_rtcp_active=1 元数据。
@@ -1407,6 +1430,137 @@ void axis_homing(int axis_idx)
 
     printf("[Homing] %s 开始回零 (method=%d, timeout=%d ms)\n",
            g_axis[axis_idx].axis_name, method, timeout_ms);
+
+    // ①.5 B2 (2026-07-23): 双驱龙门 pre-align (axis_homing 入口, state 已 == RUNNING)
+    //   仅 slave_count==2 且 gantry_align_tol_pulse>0 时执行
+    //   触发条件: |p_master - p_slave| > tol_pulse
+    //
+    //   算法 (主从对称对中到中点, 物理正确, 实机避免单边撞限位):
+    //     p_center = (p_m + p_s) / 2
+    //     设临时 homing_shift 让 master_target_pulse == slave_target_pulse == p_center
+    //       master_target = logical + home_offset[0] + homing_shift[0] = p_center
+    //       slave_target  = logical + home_offset[1] + homing_shift[1] = p_center
+    //     其中 logical = current_cmd_pos * pulse_per_unit (Non-RT 当前位置)
+    //     RT 周期写 PDO (理想路径), sim_drive/真伺服让 master/slave motor pos
+    //     各自从 p_m/p_s 收敛到 p_center (各走 |delta|/2 距离, 对称)
+    //     收敛后 method 35 锚定时 p_m_new ≈ p_s_new, homing_shift 锚定正确
+    //
+    //   注: 旧版 (homing_shift[1]=delta) 假设 home_offset 锚定时主从 pos 已有差,
+    //       但 sim_drive_inject_gantry_offset 只改 pos 不改 home_offset, 假设不成立.
+    //       对称对中算法不依赖该假设, sim 和实机都正确.
+    //
+    //   ⚠️ 架构限制 (实机上线前必须解决, v3 PRE_ALIGN state):
+    //     axis_homing_multi:1708 等 homing_state==2 (RUNNING) 才调本函数, 入口已 RUNNING.
+    //     ecat_core.c:744 RUNNING 时 RT 跳过该轴 PDO 写 (CiA402 homing 接管设计).
+    //     → 实机 homing_shift[0/1] 不会通过 PDO 下发, master/slave pos 不收敛到 p_center.
+    //     → sim 路径用 sim_drive_step_toward 手动推进 pos 作为 workaround (见 line ~1487).
+    //     → 实机无等价机制, pre-align 当前在实机不工作!
+    //   v3 方案: 新增 state=5 PRE_ALIGN, RT 在此 state 正常写 PDO (与 SafeLift 子状态机同构).
+    //            axis_homing_multi 在 PENDING→RUNNING 之间插 PRE_ALIGN, pre-align 完成后 Non-RT
+    //            设 RUNNING. 详见 memory cnc-p01-homing-jog.md B2 实机架构债.
+    //
+    //   sim_mode 也走此路径 (验证 mock 不需要真实 SDO, 但需 sim_drive_step_toward 推进 pos)
+    int slave_count_pre = g_axis[axis_idx].slave_count;
+    if (slave_count_pre == 2 && cfg->gantry_align_tol_pulse > 0) {
+        int sid_m = g_axis[axis_idx].slave_ids[0];
+        int sid_s = g_axis[axis_idx].slave_ids[1];
+        int32_t p_m = axis_pdo_read_pos(sid_m);
+        int32_t p_s = axis_pdo_read_pos(sid_s);
+        int32_t delta = p_m - p_s;
+        int32_t abs_delta = (delta >= 0) ? delta : -delta;
+
+        if (abs_delta > cfg->gantry_align_tol_pulse) {
+            EventLogger_Push(SEVERITY_INFO, source, 0x000C, delta,
+                             "gantry pre-align triggered");
+            printf("[Homing] %s pre-align: delta=%d pulse > tol=%d, 对中...\n",
+                   g_axis[axis_idx].axis_name, delta,
+                   cfg->gantry_align_tol_pulse);
+
+            // 算中点 pulse (int32 算术: p_m+p_s 各 ~1e7 量级, 安全)
+            int32_t p_center = (p_m + p_s) / 2;
+
+            // 算 logical_pulse (Non-RT current_cmd_pos → pulse)
+            // 防御: pulse_per_unit <= 0 视为异常配置, 跳过 pre-align
+            double ppu = g_axis[axis_idx].pulse_per_unit;
+            if (!(ppu > 0.0)) {
+                printf("[Homing] %s pre-align 跳过: pulse_per_unit=%.3f 非法\n",
+                       g_axis[axis_idx].axis_name, ppu);
+            } else {
+                int32_t logical_pulse = (int32_t)(g_axis[axis_idx].current_cmd_pos * ppu);
+
+                // 读 home_offset (首周期锚定后严格只读, Non-RT 安全)
+                int32_t ho_m = g_axis[axis_idx].home_offset[0];
+                int32_t ho_s = g_axis[axis_idx].home_offset[1];
+
+                // 设临时 homing_shift (method 35 锚定会自动覆盖)
+                int32_t shift_m = p_center - logical_pulse - ho_m;
+                int32_t shift_s = p_center - logical_pulse - ho_s;
+                g_axis[axis_idx].homing_shift[0] = shift_m;
+                g_axis[axis_idx].homing_shift[1] = shift_s;
+                __sync_synchronize();
+
+                printf("[Homing] %s pre-align: p_m=%d p_s=%d p_center=%d "
+                       "logical=%d ho_m=%d ho_s=%d shift_m=%d shift_s=%d\n",
+                       g_axis[axis_idx].axis_name,
+                       p_m, p_s, p_center, logical_pulse, ho_m, ho_s,
+                       shift_m, shift_s);
+
+                // 轮询等 RT 收敛 (与现有 homing bit12 轮询同模式)
+                int align_timeout = cfg->gantry_align_timeout_ms / 100;
+                int aligned = 0;
+                while (align_timeout-- > 0) {
+                    osal_usleep(100000);  // 100ms
+                    // sim 模式: homing RUNNING 期间 RT 冻结该轴 PDO 写, 实际电机位置
+                    // 不更新, 真实收敛轮询读不到. 这里手动按一阶模型把实际位置推向
+                    // p_center, 模拟实机伺服在 homing 期间跟随命令的收敛 (固定健康速率
+                    // 0.1/100ms, 与 ConfigSimDynamics 的 gap 衰减解耦). 这样 sim 下
+                    // pre-align 成功路径可收敛到中点 (T3/T5), 而收敛慢于 timeout 时
+                    // 仍走超时 FAULT 路径 (T4).
+                    if (g_sim_mode) {
+                        sim_drive_step_toward(axis_idx, 0, p_center, 0.1);
+                        sim_drive_step_toward(axis_idx, 1, p_center, 0.1);
+                    }
+                    int32_t p_m_new = axis_pdo_read_pos(sid_m);
+                    int32_t p_s_new = axis_pdo_read_pos(sid_s);
+                    int32_t delta_new = p_m_new - p_s_new;
+                    int32_t abs_delta_new = (delta_new >= 0) ? delta_new : -delta_new;
+                    if (abs_delta_new <= cfg->gantry_align_tol_pulse) {
+                        aligned = 1;
+                        break;
+                    }
+                    // cancel 检测 (复用现有 homing_cancel_req)
+                    if (atomic_load_explicit(&g_interpolator.homing_cancel_req,
+                                              memory_order_acquire) != 0) {
+                        printf("[Homing] %s pre-align 用户取消\n",
+                               g_axis[axis_idx].axis_name);
+                        g_axis[axis_idx].homing_shift[0] = 0;  // 回滚临时补偿
+                        g_axis[axis_idx].homing_shift[1] = 0;
+                        g_interpolator.homing_state = 4;
+                        EventLogger_Push(SEVERITY_ALARM, source, 0x0008, axis_idx,
+                                         "homing cancelled during pre-align");
+                        return;
+                    }
+                }
+                if (!aligned) {
+                    printf("[Homing] %s pre-align 超时 (%d ms)\n",
+                           g_axis[axis_idx].axis_name, cfg->gantry_align_timeout_ms);
+                    EventLogger_Push(SEVERITY_ALARM, source, 0x000D, axis_idx,
+                                     "gantry pre-align timeout");
+                    // 与同函数其他 FAULT 路径 (用户取消 line1497 / 非sim fault line1604)
+                    // 保持一致: FAULT(state=4) 必发 0x0008 homing FAULT.
+                    EventLogger_Push(SEVERITY_ALARM, source, 0x0008, axis_idx,
+                                     "homing fault (pre-align timeout)");
+                    g_axis[axis_idx].homing_shift[0] = 0;  // 回滚临时补偿
+                    g_axis[axis_idx].homing_shift[1] = 0;
+                    g_interpolator.homing_state = 4;
+                    atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                    return;
+                }
+                printf("[Homing] %s pre-align 完成, 继续回零\n",
+                       g_axis[axis_idx].axis_name);
+            }
+        }
+    }
 
     // ② sim_mode: 直接 DONE 不调 SDO
     if (g_sim_mode) {

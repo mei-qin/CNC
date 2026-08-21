@@ -43,6 +43,9 @@ typedef struct {
     double start_pos[AXIS_NUM];   // 起点 (机械绝对坐标)
     double end_pos[AXIS_NUM];     // 终点 (机械绝对坐标)
     double speed, acc, dec;       // 运动参数 (与 api_push_trajectory 同单位)
+    // C3 (2026-07-27): G93 强一致性时间预算 (与 api_push_trajectory_g93 同语义)
+    // 0 = 常规 G94 路径; >0 = G93 强一致性, 段时间严格 = g93_dt_sec
+    double g93_dt_sec;            // 整段时间预算 (秒), 仅 G93 模式下非 0
     // ARC 专属
     double center[2];             // 圆心在激活平面两主轴上的坐标 (ax1, ax2)
     double radius;                // 圆弧半径 (mm)
@@ -68,9 +71,12 @@ typedef struct {
 
 // ---- 输出回调函数类型 ----
 // 补偿引擎将偏置后的点通过此回调下发到 B-Spline 或 Planner。
-// 参数与 api_push_trajectory 保持一致，便于直接替换。
+// C3 (2026-07-27): 签名扩展 4→6 参数, 透传 G93 强一致性上下文.
+//   is_g93_strict: 0=常规路径 (G94 或非 G93), 1=G93 强一致性 (豁免 planner 限幅)
+//   g93_dt_sec: G93 段时间预算 (秒), 仅 is_g93_strict=1 时生效
 typedef int (*CutterOutputCB)(double pos[AXIS_NUM], double speed,
-                              double acc, double dec);
+                              double acc, double dec,
+                              int is_g93_strict, double g93_dt_sec);
 
 // ---- 补偿引擎状态结构体 ----
 typedef struct {
@@ -86,6 +92,15 @@ typedef struct {
 
     int      first_seg_pending;  // 首段标志: 尚未输出偏置起始点
     CutterOutputCB output_fn;    // 输出回调函数
+    // C3 (2026-07-27): G93 上下文缓存 (PushPoint 入口写, output_fn 调用时读)
+    // 用于让 cutter_emit / 直通路径 / PushArc 离散化 都能透传 G93 到 output_fn
+    int      g93_strict_pending; // 当前 PushPoint 缓存的 G93 标志
+    double   g93_dt_sec_pending; // 当前 PushPoint 缓存的 G93 时间预算
+    // C3-fix2 (2026-07-28): 最后一次 emit 的实际刀位 (机械绝对坐标)。
+    // 用途: 圆弧离散化入口对齐 —— 内角剪裁后实际入刀点已推进到弧内某角度,
+    // 若仍从理论起点离散化会回退重切已剪裁楔形区 (回程过切 + G93 v 尖峰)。
+    double   last_emit_pos[AXIS_NUM];
+    int      last_emit_valid;    // 1=last_emit_pos 有效 (Enable 时清零)
 } CutterCompState_t;
 
 // ================== 公共 API ==================
@@ -123,9 +138,12 @@ void CutterComp_SetOutput(CutterOutputCB fn);
 // speed: 合成速度 (mm/s)
 // acc:   加速度 (mm/s^2)
 // dec:   减速度 (mm/s^2)
+// is_g93_strict: 0=常规 G94 路径, 1=G93 强一致性 (C3 2026-07-27)
+// g93_dt_sec: G93 段时间预算 (秒), 仅 is_g93_strict=1 时生效
 // 返回 0=成功, -1=输出回调失败
 int  CutterComp_PushPoint(double pos[AXIS_NUM], double speed,
-                          double acc, double dec);
+                          double acc, double dec,
+                          int is_g93_strict, double g93_dt_sec);
 
 // @Context: Non-RealTime Background Thread (parser 调用)
 // @Thread-Safety: 由 parser 线程独占调用。

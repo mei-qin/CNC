@@ -1351,7 +1351,12 @@ int parse_gcode_line(const char *gcode_line)
     }
 
     // ---- P0-1: G28 返回参考点 (字母循环结束后处理) ----
-    // LinuxCNC 风格 v1: 直接 homing, 不解析 X_Y_Z_ 中间点 (Fanuc 风格留 v2)
+    // Fanuc 风格 v2 (B4, 2026-07-23): 若 G28 带 X_Y_Z_ 中间点, 先入队运动段到中间点,
+    //   wait_motion_done 后再 axis_homing_multi. 中间点用于避免回零路径撞夹具/压板.
+    //   无中间点时退化为 LinuxCNC 风格 v1 (直接 axis_homing_multi).
+    //
+    // 中间点坐标系: 当前模态 WCS (G54-G59) 或 G53 (本行带 G53), 与普通运动段一致
+    // 中间点速度: 用 g_state.feedrate_mm_min (last_F), 与 Fanuc 行为一致
     // 调 axis_homing_multi 阻塞 parser_thread, 期间 RT 冻结 motion queue
     // G28 后续段在 homing 完成后继续解析 (v2: homing_shift 已重新锚定, home_offset 常量不动)
     if(is_g28_block){
@@ -1360,6 +1365,94 @@ int parse_gcode_line(const char *gcode_line)
             atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
             return -1;
         }
+
+        // B4 (2026-07-23): 检查是否带中间点 (has_axis[] 任一字母)
+        int has_intermediate = 0;
+        for(int i = 0; i < AXIS_NUM; i++){
+            if(has_axis[i]) { has_intermediate = 1; break; }
+        }
+
+        if(has_intermediate){
+            // WCS 偏置查询 (复用 line 1636-1683 逻辑)
+            int wcs_idx = (g_state.modal_wcs >= COORD_G54 &&
+                           g_state.modal_wcs <= COORD_G59)
+                          ? (g_state.modal_wcs - 1) : -1;
+
+            double target_pos[AXIS_NUM];
+            double machine_target_pos[AXIS_NUM];
+            for(int i = 0; i < AXIS_NUM; i++){
+                double w;
+                if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+                    w = g_coord_mgr.work_offsets_ext[g_state.modal_ext_wcs_p - 1][i];
+                } else {
+                    w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
+                }
+                if(g_state.local_offset_active && wcs_idx >= 0) w += g_state.local_offset[i];
+
+                double start_pos = g_state.current_pos[i];
+                double machine_start = start_pos + w;
+                double machine_target;
+
+                if(is_G53_this_block){
+                    // G53 非模态: val_axis 是机械绝对坐标, 强制 G90
+                    machine_target = has_axis[i] ? val_axis[i] : machine_start;
+                    target_pos[i] = machine_target - w;
+                } else if(g_state.is_absolute){
+                    // G90: val_axis 是 WCS 逻辑坐标
+                    target_pos[i] = has_axis[i] ? val_axis[i] : start_pos;
+                    machine_target = target_pos[i] + w;
+                } else {
+                    // G91: val_axis 是增量
+                    target_pos[i] = start_pos + (has_axis[i] ? val_axis[i] : 0);
+                    machine_target = target_pos[i] + w;
+                }
+                machine_target_pos[i] = machine_target;
+            }
+
+            // 软限位检查 (与 axis_ctrl.c:check_soft_limits 同语义, 但该函数 static 不可直接调)
+            for(int i = 0; i < AXIS_NUM; i++){
+                if(g_axis[i].enable_soft_limit){
+                    if(machine_target_pos[i] > g_axis[i].soft_limit_pos ||
+                       machine_target_pos[i] < g_axis[i].soft_limit_neg){
+                        printf("[Parser] G28 中间点 %s=%.3f 超软限位 [%.2f, %.2f]\n",
+                               g_axis[i].axis_name, machine_target_pos[i],
+                               g_axis[i].soft_limit_neg, g_axis[i].soft_limit_pos);
+                        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                        return -1;
+                    }
+                }
+            }
+
+            printf("[Parser] G28 中间点:");
+            for(int i = 0; i < AXIS_NUM; i++){
+                if(has_axis[i]) printf(" %s=%.3f", g_axis[i].axis_name, target_pos[i]);
+            }
+            double speed = (g_state.feedrate_mm_min > 0.0)
+                           ? g_state.feedrate_mm_min : 1000.0;
+            printf(" (speed=%.1f mm/min)\n", speed);
+
+            // 入队中间点运动段 (复用现有 api_push_trajectory, 内部处理 WCS 入队)
+            int rc = api_push_trajectory(target_pos, speed, DEFAULT_ACC, DEFAULT_DEC);
+            if(rc < 0){
+                printf("[Parser] G28 中间点入队失败 (rc=%d)\n", rc);
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                return -1;
+            }
+
+            // 同步等待运动段完成 (parser_thread 阻塞, RT 持续消费 queue)
+            // 与 axis_homing_multi 同模式, Non-RT 安全
+            while(atomic_load_explicit(&g_interpolator.is_moving, memory_order_acquire)){
+                osal_usleep(10000);  // 10ms
+            }
+            // 同步 plan_cursor (避免后续段基于过期位置, 与 JOG/SafeLift 同模式)
+            api_sync_planner_cursor();
+            // 更新 parser current_pos (中间点已到达, 后续 G28 homing 不影响 current_pos)
+            for(int i = 0; i < AXIS_NUM; i++){
+                g_state.current_pos[i] = target_pos[i];
+            }
+            printf("[Parser] G28 中间点运动完成, 触发回零\n");
+        }
+
         printf("[Parser] G28: 触发 axis_homing_multi (%d 轴顺序回零)\n",
                g_homing_cfg.order_count);
         int rc = axis_homing_multi(g_homing_cfg.order, g_homing_cfg.order_count,
@@ -1799,6 +1892,8 @@ int parse_gcode_line(const char *gcode_line)
                 arc_seg.speed = run_speed_mm / 60.0;
                 arc_seg.acc = DEFAULT_ACC;
                 arc_seg.dec = DEFAULT_DEC;
+                // C3 (2026-07-27): G93 强一致性时间预算 (PushArc 内部均分到离散微段)
+                arc_seg.g93_dt_sec = (g_state.feed_mode == FEED_MODE_G93) ? g93_T_sec : 0.0;
 
                 if(CutterComp_PushArc(&arc_seg) < 0){
                     printf("[Parser] 刀补圆弧入队失败(报警)，中止当前文件！\n");
@@ -1831,8 +1926,11 @@ int parse_gcode_line(const char *gcode_line)
             //         RTCP 路径仍直通 (旋转轴参与偏置复杂度超出 2D 范围)
             if(CutterComp_GetMode() != COMP_OFF && g_state.motion_mode <= 1){
                 // 刀补模式: 通过补偿引擎入队 (引擎内部已设置输出回调)
+                // C3 (2026-07-27): 透传 G93 强一致性上下文, 保时间绝对守恒
+                int is_g93_here = (g_state.feed_mode == FEED_MODE_G93) ? 1 : 0;
                 if(CutterComp_PushPoint(machine_target_pos, speed_mm_sec,
-                                        DEFAULT_ACC, DEFAULT_DEC) < 0){
+                                        DEFAULT_ACC, DEFAULT_DEC,
+                                        is_g93_here, g93_T_sec) < 0){
                     printf("[Parser] 刀补引擎入队失败(报警)，中止当前文件！\n");
                     return -1;
                 }

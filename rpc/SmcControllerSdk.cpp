@@ -881,6 +881,19 @@ bool SmcController::ConfigHomingAll(const std::string &order_letters,
                         &req, sizeof(req));
 }
 
+/* B4 (2026-07-23): v2 wrapper, 加 auto_on_init 参数 */
+bool SmcController::ConfigHomingAllEx(const std::string &order_letters,
+                                        int auto_on_init, int &out_ret_code)
+{
+    SmcConfigHomingOrderExReq req;
+    std::memset(&req, 0, sizeof(req));
+    std::strncpy(req.order_letters, order_letters.c_str(),
+                 SMC_HOMING_ORDER_MAX_LEN - 1);
+    req.auto_on_init = auto_on_init;
+    return invokeIntRet(SMC_CMD_CONFIG_HOMING_ORDER_EX, out_ret_code,
+                        &req, sizeof(req));
+}
+
 bool SmcController::TriggerHoming(char axis_letter, int &out_ret_code)
 {
     SmcHomingTriggerReq req;
@@ -952,4 +965,16 @@ bool SmcController::EmergencyStop(int reason_code, int &out_ret_code,
                       ? message.size() : sizeof(req.message) - 1;
     std::memcpy(req.message, message.data(), copy_len);
     return invokeIntRet(SMC_CMD_EMERGENCY_STOP, out_ret_code, &req, sizeof(req));
+}
+
+/* B2 (2026-07-23): 双驱龙门 pre-align 配置 */
+bool SmcController::ConfigGantryAlign(char axis_letter, int32_t tol_pulse,
+                                       int timeout_ms, int &out_ret_code)
+{
+    SmcConfigGantryAlignReq req;
+    std::memset(&req, 0, sizeof(req));
+    req.z_letter   = (uint8_t)axis_letter;
+    req.tol_pulse  = tol_pulse;
+    req.timeout_ms = timeout_ms;
+    return invokeIntRet(SMC_CMD_CONFIG_GANTRY_ALIGN, out_ret_code, &req, sizeof(req));
 }

@@ -60,6 +60,11 @@ int  api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,dou
 int  api_push_trajectory_g93(double target_pos[AXIS_NUM],
                               double speed,double acc,double dec,
                               double g93_dt_sec);
+// C3 (2026-07-27): 刀补输出统一入队 (作为 CutterOutputCB 注册).
+//   透传 G93 强一致性 + 强制 is_fillet=1 + parser_thread 读 g_state 冻结 WCS 快照
+int  api_push_trajectory_cutter(double target_pos[AXIS_NUM],
+                                 double speed,double acc,double dec,
+                                 int is_g93_strict, double g93_dt_sec);
 // 免抹圆透传入队: 写入 is_fillet=1 标记,planner_fillet_preprocess 跳过本段。
 // 用于 B-Spline 引擎在锐角切批后直接透传的段,防止底层二次抹圆。
 int  api_push_trajectory_passthrough(double target_pos[AXIS_NUM],

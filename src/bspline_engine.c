@@ -339,20 +339,33 @@ static void bspline_drain_queue(int count)
 
     if (actual == 0) return;
 
-    // ---- 2. 尖角分割 + 逐子批处理 ----
+    // ---- 2. 尖角分割 + 逐子批处理 (C4 2026-07-27 加固) ----
+    // 旧版: 锐角点 i 作为子批边界共享点, 被 B-Spline 拟合平滑掉, 实际几何变圆角.
+    // C4: 锐角点单独走 api_push_trajectory_passthrough_wcs 透传 (is_fillet=1 防 planner
+    //      二次抹圆), 子批范围 [sub_start, i-1] 不含锐角点, B-Spline 仅拟合非锐角段.
+    //      几何精度: 锐角严格保留; B-Spline 拟合质量: 仅平滑段, 无锐角点干扰.
     int sub_start = 0;
     for (int i = 1; i < actual - 1; i++) {
         if (is_sharp_corner(batch_ctrl[i - 1], batch_ctrl[i], batch_ctrl[i + 1],
                             g_bspline_config.sharp_angle_rad)) {
-            // 尖角点: 将 [sub_start, i] (含) 作为一个子批处理
-            int sub_count = i - sub_start + 1;
+            // (a) 子批 [sub_start, i-1] 做 B-Spline (不含锐角点)
+            int sub_count = i - sub_start;
             if (sub_count > 0) {
                 bspline_process_batch_from(sub_start, sub_count);
             }
-            sub_start = i; // 新子批从尖角点开始
+            // (b) 锐角点 i 单独透传, 保留锐角几何
+            //     passthrough_wcs 内部设 is_fillet=1, planner 反/正扫描加屏障,
+            //     与 B-Spline 段衔接处速度自动归零过渡, 不撕裂.
+            {
+                double v = batch_speeds[i] > 1e-6 ? batch_speeds[i] : 1e-6;
+                api_push_trajectory_passthrough_wcs(batch_ctrl[i], v,
+                                                     DEFAULT_ACC, DEFAULT_DEC,
+                                                     batch_wcs[i], batch_offsets[i]);
+            }
+            sub_start = i + 1;  // 新批从锐角点之后开始 (不再共享锐角点)
         }
     }
-    // 处理尾部剩余
+    // (c) 处理尾部剩余 [sub_start, actual-1] 做 B-Spline
     {
         int sub_count = actual - sub_start;
         if (sub_count > 0) {

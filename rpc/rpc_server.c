@@ -37,6 +37,7 @@
 #include "rpc_preview_server.h" /* P0-b v1: rpc_preview_server_start */
 #include "event_logger.h"      /* P1-b: EventLogger_Init */
 #include "rpc_event_server.h"  /* P1-b: rpc_event_server_start */
+#include "opcua_server.h"      /* 契约 P4: opcua_server_start (OPC UA 4840 对外通道) */
 
 #define SMC_RPC_PORT      9527
 #define SMC_RPC_BACKLOG   8
@@ -651,6 +652,39 @@ static int handle_client_request(int client_fd)
         break;
     }
 
+    /* ===== B2 (2026-07-23): Gantry Pre-Align 配置 ===== */
+    case SMC_CMD_CONFIG_GANTRY_ALIGN: {
+        if (req_hdr.data_len < sizeof(SmcConfigGantryAlignReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigGantryAlignReq *req = (SmcConfigGantryAlignReq *)payload;
+        SmcConfigGantryAlignRes *res = (SmcConfigGantryAlignRes *)resp_buf;
+        res->ret_code = SMC_ConfigGantryAlign((char)req->z_letter,
+                                              req->tol_pulse,
+                                              req->timeout_ms);
+        printf("[rpc] ConfigGantryAlign: z=%c tol=%d timeout=%d ret=%d\n",
+               (char)req->z_letter, req->tol_pulse, req->timeout_ms, res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigGantryAlignRes);
+        break;
+    }
+
+    /* ===== B2 (2026-07-23): Gantry Mock 注入 (sim-only) ===== */
+    case SMC_CMD_INJECT_GANTRY_OFFSET: {
+        if (req_hdr.data_len < sizeof(SmcInjectGantryOffsetReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcInjectGantryOffsetReq *req = (SmcInjectGantryOffsetReq *)payload;
+        SmcInjectGantryOffsetRes *res = (SmcInjectGantryOffsetRes *)resp_buf;
+        res->ret_code = SMC_InjectGantryOffset((char)req->z_letter,
+                                                req->offset_pulse);
+        printf("[rpc] InjectGantryOffset: z=%c offset=%d ret=%d\n",
+               (char)req->z_letter, req->offset_pulse, res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcInjectGantryOffsetRes);
+        break;
+    }
+
     /* ===== P0-3: Safe Z Lift ===== */
     case SMC_CMD_CONFIG_SAFE_LIFT: {
         if (req_hdr.data_len < sizeof(SmcConfigSafeLiftReq)) {
@@ -733,6 +767,21 @@ static int handle_client_request(int client_fd)
                req->order_letters, res->ret_code);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcConfigHomingOrderRes);
+        break;
+    }
+    /* ===== B4 (2026-07-23): Homing Order v2 (order + auto_on_init) ===== */
+    case SMC_CMD_CONFIG_HOMING_ORDER_EX: {
+        if (req_hdr.data_len < sizeof(SmcConfigHomingOrderExReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigHomingOrderExReq *req = (SmcConfigHomingOrderExReq *)payload;
+        req->order_letters[SMC_HOMING_ORDER_MAX_LEN - 1] = '\0';
+        SmcConfigHomingOrderExRes *res = (SmcConfigHomingOrderExRes *)resp_buf;
+        res->ret_code = SMC_ConfigHomingAllEx(req->order_letters, req->auto_on_init);
+        printf("[rpc] ConfigHomingAllEx order=%s auto_on_init=%d ret=%d\n",
+               req->order_letters, req->auto_on_init, res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigHomingOrderExRes);
         break;
     }
     case SMC_CMD_HOMING_TRIGGER: {
@@ -907,23 +956,268 @@ static int kernel_init(const char *iface)
 }
 
 /* =====================================================================
+ *  kernel_init_hw —— 实机参数 profile (IBN 填空模板, 2026-08-21)
+ *
+ *  用法: sudo ./rpc_server <EtherCAT网卡名|sim> hw
+ *    · 与 kernel_init (sim 默认值) 并存, 互不影响
+ *    · "sim hw" 组合 = sim 运动 + hw 参数 (先在仿真里验证参数表本身)
+ *
+ *  填空规则:
+ *    A 级 (不配对就失控/撞机): 留 HW_TODO 哨兵时启动被拒绝, 并打印清单 —
+ *      拓扑从站 ID / 脉冲当量 / 软限位 / SafeLiftZ 安全高度
+ *    B 级 (精度与功能): 留哨兵则该项跳过配置走系统默认, 启动时警告 —
+ *      轴动力学 / 五轴运动学
+ *    C 级 (工艺): 保守默认值写死 — 规划器; 激光 IO 首测不配 (slave_id<0
+ *      自动安全跳过, 接入后补 SMC_ConfigLaserIO 等调用)
+ *
+ *  对应市场标准: 此文件 = 机床厂 IBN (装配调试) 阶段的参数快照;
+ *  后续演进为参数文件持久化 + 上位 Pr 参数读写 (Syntec 模式)。
+ * =====================================================================
+ */
+
+/* ---- HW 参数区 (实机上机前逐项填空) -------------------------------- */
+
+#define HW_TODO_D   (-999999.0)   /* 未填哨兵: double */
+#define HW_TODO_I   (-999999)     /* 未填哨兵: int */
+
+/* A1. 轴拓扑 (数组顺序 = 房间号分配顺序, 与 sim 一致: X,Y,Z,C,B)
+ * 从站 ID 按 EtherCAT 物理接线顺序 (SOEM 上电扫描打印确认, 从 1 起编)
+ * is_dual: 0=单驱, 1=双驱龙门 (slave_id 填第二驱动器, 单驱填 -1)
+ * [来源: 前期实机开发测试参数, kernel_init 原值] */
+static const struct {
+    const char *name;  int is_dual;  int master_id;  int slave_id;
+} g_hw_topo[AXIS_NUM] = {
+    /*  name  is_dual  master_id  slave_id */
+    {  "X",   0,  5,  -1 },
+    {  "Y",   1,  3,   4 },
+    {  "Z",   0,  6,  -1 },
+    {  "C",   0,  1,  -1 },
+    {  "B",   0,  2,  -1 },
+};
+
+/* A2. 脉冲当量 (pulse per unit)
+ *   线性轴: ppu = 编码器 cnt/rev × 减速比 ÷ 丝杠导程(mm)
+ *   旋转轴: ppu = 编码器 cnt/rev × 减速比 ÷ 360
+ * [来源: 前期实机开发测试参数] */
+static const double g_hw_ppu[AXIS_NUM] = {
+    10000.0,     /* X (pulse/mm) */
+    10000.0,     /* Y */
+    1000.0,      /* Z */
+    2777.7778,   /* C (pulse/deg) */
+    2777.7778,   /* B (pulse/deg) */
+};
+
+/* A3. 软限位 (G53 机械坐标, 相对回零零点, 留 ≥10mm 安全裕量)
+ * [来源: 前期实机仅 Z 标定 (-500,+200); X/Y/C/B 沿用不启用,
+ *  待实机行程标定后改 enable=1 并填值] */
+static const struct { int enable; double neg; double pos; } g_hw_softlimit[AXIS_NUM] = {
+    /*  enable   neg(mm)     pos(mm)  */
+    {  0,        0.0,        0.0     },  /* X TODO: 行程标定后启用 */
+    {  0,        0.0,        0.0     },  /* Y TODO */
+    {  1,        -500.0,     200.0   },  /* Z (实机原值) */
+    {  0,        0.0,        0.0     },  /* C (deg) TODO */
+    {  0,        0.0,        0.0     },  /* B (deg) TODO */
+};
+
+/* A4. Z 安全抬升 (激光头防撞; safe_z 必须 ≤ Z 软限位正限)
+ * [来源: kernel_init 无此项 (前期实机未启用)。取 Z 正限 200 内推荐值 50;
+ *  不想报警自动抬升把下发处的 auto_on_alarm 改 0] */
+static const double g_hw_safe_z_mm    = 50.0;
+static const double g_hw_lift_speed   = 20.0;       /* mm/s, 默认即可 */
+
+/* B1. 轴动力学 (max_v = 电机额定rpm ÷60 × 导程 ÷ 减速比;
+ *   r = 旋转轴等效半径 mm, RTCP 弧长换算用)
+ * [来源: 前期实机开发测试参数, kernel_init 原值] */
+static const struct { int type; double v, a, d, r; } g_hw_dyn[AXIS_NUM] = {
+    /*  type(0线/1旋)  max_v   max_a   max_d   eq_radius */
+    {  0,  50.0,  200.0, 200.0, 0.0  },  /* X mm/s  */
+    {  0,  50.0,  200.0, 200.0, 0.0  },  /* Y */
+    {  0,  30.0,  100.0, 100.0, 0.0  },  /* Z */
+    {  1,  18.0,  72.0,  72.0, 50.0  },  /* C deg/s */
+    {  1,  18.0,  72.0,  72.0, 80.0  },  /* B */
+};
+
+/* B2. 五轴运动学 (Head-Head 双摆头; tool_len/pivot 打表或干涉仪实测)
+ * [来源: 前期实机开发测试参数, kernel_init 原值] */
+static const double g_hw_tool_len        = 150.0;
+static const double g_hw_pivot_x         = 0.0;
+static const double g_hw_pivot_y         = 0.0;
+static const double g_hw_pivot_z         = 200.0;
+
+/* B3. 双驱龙门同步报警 (Y 双驱实机原值; kernel_init 原值)
+ *   tol: 同步容差 pulse / max: 硬停阈值 pulse / time: 持续 ms */
+static const int32_t g_hw_gantry_tol_pulse  = 1000;
+static const int32_t g_hw_gantry_max_pulse  = 8000;
+static const int     g_hw_gantry_time_ms    = 100;
+
+/* ---- 校验: A 级哨兵拒绝启动, B 级警告跳过 -------------------------- */
+static int kernel_init_hw_check(void)
+{
+    int fatal = 0;
+
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (g_hw_topo[i].master_id == HW_TODO_I ||
+            (g_hw_topo[i].is_dual == 1 && g_hw_topo[i].slave_id == HW_TODO_I)) {
+            printf("[hw][A?] 拓扑未填: %s (master/slave 从站 ID)\n", g_hw_topo[i].name);
+            fatal = 1;
+        }
+        if (g_hw_ppu[i] == HW_TODO_D) {
+            printf("[hw][A?] 脉冲当量未填: %s\n", g_hw_topo[i].name);
+            fatal = 1;
+        }
+        if (g_hw_softlimit[i].enable && (g_hw_softlimit[i].neg == HW_TODO_D ||
+                                         g_hw_softlimit[i].pos == HW_TODO_D)) {
+            printf("[hw][A?] 软限位未填: %s\n", g_hw_topo[i].name);
+            fatal = 1;
+        }
+        if (g_hw_dyn[i].v == HW_TODO_D)
+            printf("[hw][B?] 动力学未填: %s (将用系统默认, 保守)\n", g_hw_topo[i].name);
+    }
+    if (g_hw_safe_z_mm == HW_TODO_D) {
+        printf("[hw][A?] SafeLiftZ 安全高度未填 (激光头防撞, 必填)\n");
+        fatal = 1;
+    }
+    if (g_hw_tool_len == HW_TODO_D || g_hw_pivot_z == HW_TODO_D)
+        printf("[hw][B?] 五轴运动学未填 (RTCP 将失真, 仅限非 RTCP 测试)\n");
+
+    if (fatal) {
+        fprintf(stderr, "[hw] A 级参数存在未填项, 拒绝启动 (防 sim 值上实机)\n");
+        return -1;
+    }
+    printf("[hw] 参数表校验通过 (A 级已填满)\n");
+    return 0;
+}
+
+/* @Context: Non-RealTime (main 启动早期, RT 线程创建前)
+ * 与 kernel_init 同序列, 数据源换为上方 HW 参数区 */
+static int kernel_init_hw(const char *iface)
+{
+    /* 仿真模式检测 (允许 "sim hw": sim 运动 + hw 参数联调) */
+    if (strcmp(iface, "sim") == 0) {
+        g_sim_mode = 1;
+        printf("[rpc] ### 仿真模式 + 实机参数 profile ###\n");
+    }
+
+    printf("\n==============================================\n");
+    printf("     SMC 五轴高端数控系统内核 (V2.0-HW)\n");
+    if (g_sim_mode) printf("     [SIMULATION MOTION + HW PARAMS]\n");
+    printf("==============================================\n");
+
+    if (kernel_init_hw_check() != 0)
+        return -1;
+
+    /* 1. 底层初始化 (与 kernel_init 一致) */
+    axis_sys_init();
+    Macro_Init();
+    SnapshotHub_Init();
+    PreviewStreamer_Init();
+    EventLogger_Init();
+
+    /* 2. A1 轴拓扑 (HW 参数区) */
+    for (int i = 0; i < AXIS_NUM; i++)
+        SMC_ConfigAxisTopology(g_hw_topo[i].name, g_hw_topo[i].is_dual,
+                               g_hw_topo[i].master_id, g_hw_topo[i].slave_id);
+
+    /* 3. A2 脉冲当量 */
+    for (int i = 0; i < AXIS_NUM; i++)
+        SMC_ConfigPulsePerUnit(g_hw_topo[i].name[0], g_hw_ppu[i]);
+
+    /* 4. B1 轴动力学 (未填跳过, 系统默认保守) */
+    for (int i = 0; i < AXIS_NUM; i++)
+        if (g_hw_dyn[i].v != HW_TODO_D)
+            SMC_ConfigAxisDynamics(g_hw_topo[i].name[0], g_hw_dyn[i].type,
+                                   g_hw_dyn[i].v, g_hw_dyn[i].a, g_hw_dyn[i].d,
+                                   g_hw_dyn[i].r);
+
+    /* 5. B2 五轴运动学 (Head-Head; 未填跳过 → RTCP 不可用) */
+    if (g_hw_tool_len != HW_TODO_D && g_hw_pivot_z != HW_TODO_D) {
+        double tool_off[3]  = {0.0, 0.0, g_hw_tool_len};
+        double pivot_off[3] = {g_hw_pivot_x, g_hw_pivot_y, g_hw_pivot_z};
+        SMC_ConfigKinematicsOffset(g_hw_tool_len, g_hw_pivot_x,
+                                   g_hw_pivot_y, g_hw_pivot_z);
+        SMC_ConfigKinematics(KIN_HEAD_HEAD,
+                             g_axis_map['B'-'A'], 1,
+                             g_axis_map['C'-'A'], 2,
+                             tool_off, pivot_off);
+    }
+
+    /* 6. C 级规划器 (保守默认, 工艺迭代再调) */
+    SMC_ConfigPlannerParams(0.05, 500.0);
+
+    /* 7. A3 软限位 (每轴必配) */
+    for (int i = 0; i < AXIS_NUM; i++)
+        if (g_hw_softlimit[i].enable)
+            SMC_ConfigSoftLimit(g_hw_topo[i].name[0], 1,
+                                g_hw_softlimit[i].neg, g_hw_softlimit[i].pos);
+
+    /* 8. 双驱龙门 (按拓扑自动发现双驱轴; sync 为实机原值,
+     *    align 是 B2 新功能 — kernel_init 未配, 按 ppu 折算 0.05mm,
+     *    不想要预对中把 tol_pulse 改 0 即跳过) */
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (g_hw_topo[i].is_dual != 1) continue;
+        char letter = g_hw_topo[i].name[0];
+        SMC_ConfigGantrySyncAlarm(letter, 1,
+                                   g_hw_gantry_tol_pulse,
+                                   g_hw_gantry_max_pulse,
+                                   g_hw_gantry_time_ms);
+        SMC_ConfigGantryAlign(letter, (int32_t)(g_hw_ppu[i] * 0.05), 3000);
+        printf("[hw] 双驱轴 %c: 龙门同步 (实机原值) + 预对中 (ppu 折算)\n", letter);
+    }
+
+    /* 9. A4 Z 安全抬升 (auto_on_alarm=1: 报警自动抬, 激光头防撞) */
+    SMC_ConfigSafeLiftZ('Z', g_hw_safe_z_mm, g_hw_lift_speed, 1);
+
+    /* 10. B 级回零 (v1 method 35 软件法: 手动 JOG 到参考位 → HomeAll;
+     *     auto_on_init=0 手动触发, 失败要人看见。硬件开关接入后切 1-19) */
+    for (int i = 0; i < AXIS_NUM; i++)
+        SMC_ConfigHoming(g_hw_topo[i].name[0], 35, 0, 0, 1, 10000);
+    SMC_ConfigHomingAllEx("ZXYBC", 0);
+
+    /* 11. 启动内核 (实机 = EtherCAT 组态 + CiA402 使能; sim = 软件驱动) */
+    if (SMC_InitAndStart(iface) != 0) {
+        fprintf(stderr, "[rpc] 内核启动失败\n");
+        return -1;
+    }
+    while (!g_all_axis_op_ready) {
+        usleep(100000);
+    }
+    printf("[rpc][hw] 内核就绪 (实机参数 profile)\n");
+
+    /* 注意: 与 sim 不同, 这里【不】自动 SetZero —
+     * 实机坐标基准由回零 (Home.All) 建立, 而非上电位置 */
+    printf("[rpc][hw] 等待回零建立 G53 基准 (movecontrol: CNC.Home.All)\n");
+
+    return 0;
+}
+/* =====================================================================
  * main — rpc_server 的唯一入口
- *   $ sudo ./rpc_server enp7s0
- *   $ sudo ./rpc_server sim
+ *   $ sudo ./rpc_server enp7s0            (实机, sim 默认参数)
+ *   $ sudo ./rpc_server enp7s0 hw         (实机, 实机参数 profile)
+ *   $ sudo ./rpc_server sim               (纯软件仿真)
+ *   $ sudo ./rpc_server sim hw            (仿真运动 + 实机参数联调)
  * ================================================================== */
 int main(int argc, char *argv[])
 {
     if (argc < 2) {
-        printf("用法: sudo %s <EtherCAT网卡名|sim>\n", argv[0]);
+        printf("用法: sudo %s <EtherCAT网卡名|sim> [hw]\n", argv[0]);
         printf("      sudo %s sim                 (纯软件仿真, 无硬件)\n", argv[0]);
+        printf("      sudo %s enp7s0              (实机, sim 默认参数, 调试用)\n", argv[0]);
+        printf("      sudo %s enp7s0 hw           (实机, 实机参数 profile, 上机用)\n", argv[0]);
         return 1;
     }
+
+    /* argv[2]=="hw": 选实机参数 profile (kernel_init_hw) */
+    const int use_hw_profile = (argc >= 3 && strcmp(argv[2], "hw") == 0);
 
     /* 客户端断开时忽略 SIGPIPE */
     signal(SIGPIPE, SIG_IGN);
 
     /* 初始化内核 */
-    if (kernel_init(argv[1]) != 0) {
+    if (use_hw_profile) {
+        if (kernel_init_hw(argv[1]) != 0) {
+            return 1;
+        }
+    } else if (kernel_init(argv[1]) != 0) {
         return 1;
     }
 
@@ -963,6 +1257,12 @@ int main(int argc, char *argv[])
     /* P1-b: 启动事件流推送通道 (9530, 独立线程, 多客户端)。失败不 fatal */
     if (rpc_event_server_start() < 0) {
         fprintf(stderr, "[event] 事件流通道启动失败, 仅 RPC + push + preview 可用\n");
+    }
+
+    /* 契约 P4: OPC UA Server (4840, 独立线程, movecontrol 标准对外通道)。
+     * 失败不 fatal — 四端口 RPC 通道继续可用 */
+    if (opcua_server_start() < 0) {
+        fprintf(stderr, "[opcua] OPC UA 服务启动失败, 仅 RPC/push/preview/event 可用\n");
     }
 
     /* 接受连接主循环 */

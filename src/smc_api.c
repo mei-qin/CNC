@@ -96,10 +96,11 @@ int SMC_InitAndStart(const char *netif_name)
         printf("[SMC_API] B-Spline平滑线程启动失败！\n"); return -1;
     }
 
-    // 刀补引擎初始化: 设置输出回调为 api_push_trajectory
-    // 当刀补激活时，偏置后的点直接发往规划器 (不经过 B-Spline)
+    // 刀补引擎初始化: 设置输出回调为 api_push_trajectory_cutter (C3, 2026-07-27)
+    // C3 加固: 刀补输出统一走 api_push_trajectory_cutter, 透传 G93 强一致性上下文
+    //   is_fillet=1 (禁抹圆) + is_rtcp_active=0 (刀补是 2D) + parser_thread 读 g_state 冻结 WCS
     CutterComp_Init();
-    CutterComp_SetOutput(api_push_trajectory);
+    CutterComp_SetOutput(api_push_trajectory_cutter);
 
     TraceLogger_Init();
     if (!g_sim_mode) {
@@ -150,6 +151,34 @@ int SMC_InitAndStart(const char *netif_name)
     // 给系统时钟收敛留时间
     osal_usleep(1000000);
     printf("[SMC_API] 内核启动完毕，伺服就绪！\n");
+
+    // C1 (2026-07-24): 启动事件持久化 (在 auto-on-init 之前, 让 homing events 也能落盘)
+    // 默认目录 EVENT_PERSIST_DIR (相对工作路径). 失败时降级内存 only, 不影响系统.
+    {
+        uint64_t boot_id = 0;
+        int rc = EventLogger_StartPersistThread(NULL, &boot_id);
+        if (rc < 0) {
+            printf("[SMC_API] 事件持久化启动失败 (rc=%d), 降级内存 only\n", rc);
+        }
+    }
+
+    // B4 (2026-07-23): 开机自动回零钩子
+    // 仅当 SMC_ConfigHomingAllEx(order, auto_on_init=1) 已配置时触发
+    // 调 axis_homing_multi 阻塞当前 init 线程, 完成或 FAULT 后返回
+    // 失败时进 alarm (axis_homing_multi 内部已设), SMC_InitAndStart 仍返回 0
+    //   (上电成功 ≠ 回零成功, 操作员据 alarm 状态判断是否介入)
+    if (g_homing_cfg.enabled && g_homing_cfg.auto_on_init == 1) {
+        printf("[SMC_API] auto_on_init=1, 触发自动回零 (%d 轴顺序)\n",
+               g_homing_cfg.order_count);
+        int rc = axis_homing_multi(g_homing_cfg.order, g_homing_cfg.order_count,
+                                    SOURCE_MANUAL);
+        if (rc < 0) {
+            printf("[SMC_API] auto_on_init 回零失败 (进入 alarm, 操作员需手动介入)\n");
+        } else {
+            printf("[SMC_API] auto_on_init 回零完成, 系统就绪\n");
+        }
+    }
+
     return 0;
 }
 
@@ -192,6 +221,9 @@ void SMC_Close(void)
 
     // 停止轨迹探针落盘线程 (排空残余数据后退出)
     TraceLogger_StopThread();
+
+    // C1 (2026-07-24): 停止事件持久化线程 (flush 最后一批 events 后关闭文件)
+    EventLogger_StopPersistThread();
 
     // 降级 EtherCAT 状态机：OP → SAFE_OP → INIT (仅真实硬件模式)
     if (!g_sim_mode) {
@@ -652,6 +684,28 @@ int SMC_InjectAxisFault(char axis_letter, int slave_subidx)
     return sim_drive_inject_fault(idx, slave_subidx);
 }
 
+// B2 (2026-07-23): sim 模式注入双驱龙门静态差 (pre-align 验证用)
+int SMC_InjectGantryOffset(char axis_letter, int32_t offset_pulse)
+{
+    if (!g_sim_mode) {
+        printf("[SMC_API] InjectGantryOffset 仅 sim 模式有效\n");
+        return -2;
+    }
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) {
+        printf("[SMC_API] 轴 '%c' 未配置\n", toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    if (g_axis[idx].slave_count < 2) {
+        printf("[SMC_API] %s 非双驱轴, 无法注入 gantry offset\n",
+               g_axis[idx].axis_name);
+        return -1;
+    }
+    printf("[SMC_API] 注入 gantry offset: 轴 %c offset=%d pulse\n",
+           toupper((unsigned char)axis_letter), offset_pulse);
+    return sim_drive_inject_gantry_offset(idx, offset_pulse);
+}
+
 int SMC_ConfigSimDynamics(char axis_letter, double alpha)
 {
     if (!g_sim_mode) {
@@ -928,20 +982,72 @@ int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
     cfg->direction          = direction;
     cfg->timeout_ms         = timeout_ms;
     cfg->home_switch_pdo_bit = -1;  // v2 用
+    // B2 (2026-07-23): pre-align 默认关闭, 单独 SMC_ConfigGantryAlign API 启用
+    cfg->gantry_align_tol_pulse  = 0;
+    cfg->gantry_align_timeout_ms = 3000;
 
     printf("[SMC_API] ConfigHoming %s: method=%d, timeout=%d ms\n",
            g_axis[idx].axis_name, method, timeout_ms);
     return 0;
 }
 
-int SMC_ConfigHomingAll(const char *order_letters)
+// B2 (2026-07-23): 配置双驱龙门轴 pre-align 预对中参数
+int SMC_ConfigGantryAlign(char axis_letter, int32_t tol_pulse, int timeout_ms)
 {
-    if (order_letters == NULL || order_letters[0] == '\0') {
-        printf("[SMC_API] ConfigHomingAll order_letters 为空\n");
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) {
+        printf("[SMC_API] ConfigGantryAlign 轴 '%c' 未配置\n",
+               toupper((unsigned char)axis_letter));
         return -1;
     }
     if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
-        printf("[SMC_API] ConfigHomingAll 系统运行中, 禁止修改\n");
+        printf("[SMC_API] ConfigGantryAlign 系统运行中, 禁止修改\n");
+        return -1;
+    }
+    if (g_axis[idx].slave_count < 2) {
+        printf("[SMC_API] ConfigGantryAlign %s 非双驱轴 (slave_count=%d)\n",
+               g_axis[idx].axis_name, g_axis[idx].slave_count);
+        return -1;
+    }
+    if (tol_pulse < 0) {
+        printf("[SMC_API] ConfigGantryAlign tol_pulse=%d 必须 >=0 (0=跳过)\n", tol_pulse);
+        return -1;
+    }
+    if (timeout_ms < 500 || timeout_ms > 30000) {
+        printf("[SMC_API] ConfigGantryAlign timeout_ms=%d 越界 [500, 30000]\n", timeout_ms);
+        return -1;
+    }
+    HomingAxisCfg_t *cfg = &g_homing_cfg.axis[idx];
+    cfg->gantry_align_tol_pulse  = tol_pulse;
+    cfg->gantry_align_timeout_ms = timeout_ms;
+
+    printf("[SMC_API] ConfigGantryAlign %s: tol=%d pulse, timeout=%d ms\n",
+           g_axis[idx].axis_name, tol_pulse, timeout_ms);
+    return 0;
+}
+
+int SMC_ConfigHomingAll(const char *order_letters)
+{
+    // v1 wrapper: 不改 auto_on_init (保持现状, 默认 0)
+    return SMC_ConfigHomingAllEx(order_letters,
+                                  g_homing_cfg.auto_on_init);
+}
+
+// B4 (2026-07-23): v2 wrapper, 加 auto_on_init 参数
+// auto_on_init: 0=不自动回零 (v1 默认), 1=SMC_InitAndStart 末尾自动调 axis_homing_multi
+//   注: auto_on_init 仅在 SMC_InitAndStart 时检查, 此后修改无效 (与 enabled 同语义)
+int SMC_ConfigHomingAllEx(const char *order_letters, int auto_on_init)
+{
+    if (order_letters == NULL || order_letters[0] == '\0') {
+        printf("[SMC_API] ConfigHomingAllEx order_letters 为空\n");
+        return -1;
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] ConfigHomingAllEx 系统运行中, 禁止修改\n");
+        return -1;
+    }
+    if (auto_on_init != 0 && auto_on_init != 1) {
+        printf("[SMC_API] ConfigHomingAllEx auto_on_init=%d 必须 0 或 1\n", auto_on_init);
         return -1;
     }
 
@@ -949,7 +1055,7 @@ int SMC_ConfigHomingAll(const char *order_letters)
     for (int i = 0; order_letters[i] != '\0' && g_homing_cfg.order_count < AXIS_NUM; i++) {
         int idx = axis_lookup(order_letters[i]);
         if (idx < 0) {
-            printf("[SMC_API] ConfigHomingAll 轴 '%c' 未配置\n",
+            printf("[SMC_API] ConfigHomingAllEx 轴 '%c' 未配置\n",
                    toupper((unsigned char)order_letters[i]));
             return -2;
         }
@@ -967,9 +1073,12 @@ int SMC_ConfigHomingAll(const char *order_letters)
         g_homing_cfg.order[g_homing_cfg.order_count++] = idx;
     }
 
+    g_homing_cfg.auto_on_init = auto_on_init;
+
     __sync_synchronize();
     g_homing_cfg.enabled = 1;
-    printf("[SMC_API] ConfigHomingAll: %d 轴顺序回零\n", g_homing_cfg.order_count);
+    printf("[SMC_API] ConfigHomingAllEx: %d 轴顺序回零, auto_on_init=%d\n",
+           g_homing_cfg.order_count, auto_on_init);
     return 0;
 }
 

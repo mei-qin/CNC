@@ -206,6 +206,16 @@ public:
                           double creep_speed, int direction, int timeout_ms,
                           int &out_ret_code);
     bool ConfigHomingAll(const std::string &order_letters, int &out_ret_code);
+
+    /* =============================================================
+     * B4 (2026-07-23): Homing Order v2 — order + auto_on_init
+     *
+     * auto_on_init: 0=不自动回零 (默认), 1=SMC_InitAndStart 末尾自动调 axis_homing_multi
+     *   失败时进 alarm, 操作员手动介入 (不自动重试, 防掩盖硬件问题)
+     * 与 ConfigHomingAll v1 区别: 仅加 auto_on_init 参数, 顺序解析逻辑相同
+     * ============================================================= */
+    bool ConfigHomingAllEx(const std::string &order_letters, int auto_on_init,
+                           int &out_ret_code);
     bool TriggerHoming(char axis_letter, int &out_ret_code);  /* '\0'=HomeAll */
     bool CancelHoming(int &out_ret_code);
     bool GetHomingState(int &out_state, int &out_axis_idx, double &out_progress_pct,
@@ -233,6 +243,23 @@ public:
      * ============================================================= */
     bool EmergencyStop(int reason_code, int &out_ret_code,
                        const std::string &message = "");
+
+    /* =============================================================
+     * B2 (2026-07-23): 双驱龙门轴 pre-align 锚定前预对中
+     *
+     * 仅对 slave_count==2 双驱轴生效. method 35 软件法把当前位置标为零,
+     * 若主从存在静态机械差, 该差会被永久固化到 homing_shift, 导致龙门梁
+     * "先天歪斜" + gantry_sync 持续误报 + 机械应力累积.
+     * pre-align 在 CiA402 homing 触发前先走 CSP 临时对中到 (p_m+p_s)/2,
+     * 收敛到 tol_pulse 内再触发 homing, 从源头消除静态差.
+     *
+     * 配置时序: SMC_InitAndStart 之前 (与 ConfigHomingAxis 同语义)
+     * tol_pulse: 0=跳过 pre-align (默认); 推荐 pulse_per_mm × 0.05mm
+     * timeout_ms: [500, 30000], 默认 3000
+     * 超时则 homing 走 FAULT 路径 (event 0x000D)
+     * ============================================================= */
+    bool ConfigGantryAlign(char axis_letter, int32_t tol_pulse, int timeout_ms,
+                           int &out_ret_code);
 
     /* =============================================================
      * P2-A: 实时倍率系统 (Feed/Rapid/Spindle Override + Mode Flags)

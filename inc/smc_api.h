@@ -219,6 +219,14 @@ void SMC_ConfigKinematics(int type,
 // 返回: 0=成功, -1=参数越界/轴未配置, -2=非 sim 模式
 int SMC_InjectAxisFault(char axis_letter, int slave_subidx);
 
+// B2 (2026-07-23): sim 模式注入双驱龙门静态差
+// 仅 g_sim_mode==1 时有效, 用于 B2 pre-align 算法 sim 验证
+// 直接给 slave motor pos 加 offset_pulse, 模拟机械梁倾斜 / encoder 零点漂移
+// axis_letter:   轴字母 (必须是 slave_count==2 双驱轴)
+// offset_pulse:  加到 slave motor pos 的偏移量 (正/负)
+// 返回: 0=成功, -1=非双驱/参数越界, -2=非 sim 模式
+int SMC_InjectGantryOffset(char axis_letter, int32_t offset_pulse);
+
 // 配置 sim 一阶伺服模型的滞后系数 alpha
 // alpha: (0, 1) 范围, 默认 0.2; 越小跟随误差越大 (alpha=0.05 时易触发硬停)
 // 返回: 0=成功, -1=参数越界/轴未配置, -2=非 sim 模式
@@ -342,7 +350,28 @@ int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
 // 配置回零顺序 (init 阶段)
 // order_letters: 轴字母字符串, 如 "ZXYBC" (Z 先, C 后)
 // 返回: 0=ok, -1=参数非法, -2=未配置的轴
+// v1 wrapper: 不改 auto_on_init (保持 g_homing_cfg.auto_on_init 现状, 默认 0)
 int SMC_ConfigHomingAll(const char *order_letters);
+
+// B4 (2026-07-23): v2 wrapper, 加 auto_on_init 参数
+// auto_on_init: 0=不自动回零 (默认), 1=SMC_InitAndStart 末尾自动调 axis_homing_multi
+//   注: auto_on_init 仅在 SMC_InitAndStart 时检查, 此后修改无效 (与 enabled 同语义)
+//   失败时进 alarm, 操作员手动介入 (不自动重试, 防掩盖硬件问题)
+// 返回: 0=ok, -1=参数非法/运行中, -2=未配置的轴
+int SMC_ConfigHomingAllEx(const char *order_letters, int auto_on_init);
+
+// B2 (2026-07-23): 配置双驱龙门轴 pre-align 锚定前预对中参数
+// 触发条件: axis_homing 双驱分支 step⑤ 前, 若 |p_master - p_slave| > tol_pulse
+//          则先走 CSP 临时对中运动到 (p_m+p_s)/2, 收敛后再触发 CiA402 homing
+// 解决痛点: method 35 软件法把当前位置标为零, 若主从存在静态机械差,
+//          该差会被永久固化到 homing_shift, 导致龙门梁"先天歪斜" + gantry_sync 误报
+// 配置时序: 必须在 SMC_InitAndStart 之前调 (与 SMC_ConfigHoming 同语义)
+//
+// axis_letter:  轴字母 (必须是 slave_count==2 双驱轴)
+// tol_pulse:    触发阈值脉冲数 (0=跳过 pre-align; 推荐值 = pulse_per_mm × 0.05mm)
+// timeout_ms:   pre-align 收敛超时 [500, 30000], 默认 3000; 超时则 FAULT + event 0x000D
+// 返回: 0=ok, -1=轴未配置/单驱轴/运行中/参数非法
+int SMC_ConfigGantryAlign(char axis_letter, int32_t tol_pulse, int timeout_ms);
 
 // 单轴回零 (异步, 立即返回)
 // 返回: 0=已提交, -1=未配置/parser 正在跑/与其他子状态机冲突

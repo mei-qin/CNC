@@ -35,6 +35,14 @@ extern "C" {
 #define EVENT_READ_MAX         32     /* 单次 ReadSince 最多事件数 (server 单帧 ≤32) */
 #define SMC_EVENT_MSG_LEN      64     /* message 字段定长 */
 
+/* ---- C1 (2026-07-24) 故障持久化 ---- */
+#define EVENT_PERSIST_MAGIC      0x474C5645u   /* "EVLG" little-endian */
+#define EVENT_PERSIST_VERSION    1u
+#define EVENT_PERSIST_PERIOD_MS  100           /* 落盘线程周期 */
+#define EVENT_PERSIST_DIR        "event_logs"  /* 默认目录 (相对工作路径) */
+#define EVENT_PERSIST_FILENAME   "event_log_%Y%m%d_%H%M%S.bin"
+#define EVENT_PERSIST_MAX_AGE_D  7             /* 清理超过 7 天的旧文件 */
+
 /* ---- 帧标识 ---- */
 #define SMC_EVENT_MAGIC        0x45564E54u   /* "EVNT" little-endian */
 #define SMC_EVENT_ACK_MAGIC    0x45564E4Bu   /* "EVNK" - Event Ack */
@@ -75,6 +83,21 @@ typedef struct {
 } SmcEvent_t;   /* 88B packed */
 #pragma pack(pop)
 
+/* ---- C1 (2026-07-24) 故障持久化文件头 ----
+ * 文件布局: EventLogFileHeader_t (32B) + SmcEvent_t × CAP (90112B) ≈ 88KB 固定
+ * ring 结构: 文件 slot [seq % CAP] 与内存 ring 同构, 落盘/回放共用偏移公式
+ * 多会话隔离: 每次启动新建带时间戳文件, 旧文件保留 EVENT_PERSIST_MAX_AGE_D 天 */
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic;            /* EVENT_PERSIST_MAGIC = "EVLG" */
+    uint32_t version;          /* EVENT_PERSIST_VERSION = 1 */
+    uint32_t capacity;         /* EVENT_RING_CAPACITY = 1024 */
+    uint32_t reserved;         /* 0, 未来扩展 */
+    uint64_t write_seq;        /* 当前总写入事件数 (与 g_event_write_seq 同语义) */
+    uint64_t boot_id;          /* 启动 ID (每次启动递增, UI 区分不同会话) */
+} EventLogFileHeader_t;        /* 32B packed */
+#pragma pack(pop)
+
 /* =====================================================================
  *  API
  * ===================================================================== */
@@ -110,6 +133,39 @@ int  EventLogger_ReadSince(uint64_t from_seq,
 /* @Context: 任意线程
  * @return 当前总写入事件数 (= 下一事件将分配的 seq) */
 uint64_t EventLogger_GetWriteSeq(void);
+
+/* =====================================================================
+ *  C1 (2026-07-24) 故障持久化
+ *
+ *  设计:
+ *    1. Init 时扫描 EVENT_PERSIST_DIR 下所有 event_log_*.bin, 按时间戳取最新
+ *       → 回放最后 CAP 条到内存 ring + 设 atomic write_seq
+ *    2. 新建带时间戳文件作为本次会话写入目标
+ *    3. 后台落盘线程 (100ms 周期) 增量 fwrite + fsync
+ *    4. StopPersistThread flush 最后一批 + 关闭文件
+ *
+ *  RT 安全:
+ *    - 落盘线程独立 Non-RT, 不影响 RT/parser
+ *    - 读 ring 用 atomic seq + memcpy 88B (与 ReadSince 同模式)
+ *    - 落盘失败 (磁盘满/权限) 降级为内存 only + warn 日志, 不阻塞系统
+ *
+ *  文件管理:
+ *    - 每次启动新建文件 (时间戳路径), 不覆盖旧文件
+ *    - Init 时清理超过 EVENT_PERSIST_MAX_AGE_D (7) 天的旧文件
+ *    - 文件大小固定 ~88KB (header 32B + 1024 × 88B)
+ * ===================================================================== */
+
+/* @Context: Non-RealTime (SMC_InitAndStart 内调用)
+ * @Safe: 文件 I/O + 线程创建. 调用前 EventLogger_Init 必须已完成 (回放逻辑在 Init 内).
+ * dir_path: 持久化目录 (NULL=用默认 EVENT_PERSIST_DIR; 不存在则创建)
+ * out_boot_id: 返回本次启动的 boot_id (UI 可用于区分会话)
+ * 返回: 0=成功, -1=目录创建失败, -2=文件打开失败 (降级内存 only) */
+int  EventLogger_StartPersistThread(const char *dir_path, uint64_t *out_boot_id);
+
+/* @Context: Non-RealTime (SMC_Close 内调用)
+ * @Safe: 阻塞 flush 最后一批 + join 落盘线程 + fclose. 必须在 RT 线程退出后调.
+ * 返回: 0=成功, -1=未启动 */
+int  EventLogger_StopPersistThread(void);
 
 #ifdef __cplusplus
 } /* extern "C" */

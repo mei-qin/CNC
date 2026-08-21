@@ -242,6 +242,13 @@ typedef struct {
     int    direction;           // +1 / -1 (method 1-19 寻零方向)
     int    timeout_ms;          // 默认 10000
     int    home_switch_pdo_bit; // method 1-19 DI bit 偏移 (v2 用)
+    // B2 (2026-07-23): 双驱龙门 pre-align 锚定前预对中
+    // 仅对 slave_count==2 双驱轴生效; 单驱轴天然跳过
+    // 触发条件: |p_master - p_slave| > tol_pulse 时, 先走 CSP 临时对中运动到 (p_m+p_s)/2
+    // 解决痛点: method 35 软件法把当前位置标为零, 若主从存在静态机械差, 该差会被永久
+    //          固化到 homing_shift, 导致龙门梁"先天歪斜" + gantry_sync 误报 + 机械应力
+    int32_t gantry_align_tol_pulse;    // 0=跳过 pre-align (默认); >0=触发阈值 (单位:脉冲)
+    int    gantry_align_timeout_ms;    // 默认 3000; pre-align 超时则 state=FAULT + event 0x000D
 } HomingAxisCfg_t;
 
 typedef struct {
@@ -249,6 +256,11 @@ typedef struct {
     int             order[AXIS_NUM]; // 回零轴顺序 (axis_idx 数组, 默认 {Z,X,Y,B,C})
     int             order_count;    // 实际有效轴数
     HomingAxisCfg_t axis[AXIS_NUM];
+    // B4 (2026-07-23): 开机自动回零开关
+    // 0=默认, 上电后操作员手动调 SMC_HomeAll 或写 G28
+    // 1=SMC_InitAndStart 末尾伺服就绪后自动调 axis_homing_multi
+    //   失败 (任一轴 FAULT) 进 alarm, 操作员手动介入 (不自动重试, 防掩盖硬件问题)
+    int             auto_on_init;
 } HomingGlobalConfig_t;
 
 extern HomingGlobalConfig_t g_homing_cfg;  // 定义在 smc_api.c

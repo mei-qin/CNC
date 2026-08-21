@@ -2,8 +2,11 @@
 """homing_rpc.py  ——  P0-1 Homing RPC 客户端 (config / trigger / cancel / get)
 
 用法:
-    # 配置回零顺序 (init 阶段)
+    # 配置回零顺序 v1 (init 阶段, auto_on_init 不变)
     python3 homing_rpc.py config_order --order=ZXYBC
+
+    # 配置回零顺序 v2 (B4, 加 auto_on_init 参数)
+    python3 homing_rpc.py config_order_ex --order=ZXYBC --auto_init=1
 
     # 配置单轴回零参数 (可选, 默认 method=35 timeout=10000)
     python3 homing_rpc.py config_axis --z=Z --method=35 --timeout=10000
@@ -27,6 +30,10 @@ WSL2 联调:
     Win:  python3 scripts/homing_rpc.py config_order --order=ZXYBC
           python3 scripts/homing_rpc.py trigger --z=
           python3 scripts/homing_rpc.py get
+
+    # B4 auto_on_init 测试 (T6):
+    python3 scripts/homing_rpc.py config_order_ex --order=ZXYBC --auto_init=1
+    # 然后 SMC_InitAndStart 末尾自动触发 axis_homing_multi
 """
 import socket
 import struct
@@ -37,6 +44,8 @@ CMD_CONFIG_HOMING_ORDER = 0x005C
 CMD_HOMING_TRIGGER      = 0x005D
 CMD_HOMING_CANCEL       = 0x005E
 CMD_GET_HOMING          = 0x005F
+# B4 (2026-07-23): v2 wrapper
+CMD_CONFIG_HOMING_ORDER_EX = 0x0065
 
 STATE_NAMES = {0: "IDLE", 1: "PENDING", 2: "RUNNING", 3: "DONE", 4: "FAULT"}
 
@@ -56,7 +65,7 @@ def parse_args():
     port = 9527
     cmd = None
     p = {"z": "", "order": "ZXYBC", "method": 35, "timeout": 10000,
-         "search": 10.0, "creep": 1.0, "direction": 1}
+         "search": 10.0, "creep": 1.0, "direction": 1, "auto_init": 0}
     args = sys.argv[1:]
     if not args:
         print(__doc__)
@@ -81,6 +90,8 @@ def parse_args():
             p["creep"] = float(a.split("=", 1)[1])
         elif a.startswith("--direction="):
             p["direction"] = int(a.split("=", 1)[1])
+        elif a.startswith("--auto_init="):
+            p["auto_init"] = int(a.split("=", 1)[1])
     return host, port, cmd, p
 
 
@@ -123,6 +134,17 @@ def cmd_config_order(host, port, p):
     ret = struct.unpack("<i", resp[:4])[0] if len(resp) >= 4 else -999
     print(f"[rpc] ConfigHomingAll order={p['order']} ret={ret} "
           f"(0=ok, -1=空, -2=未配置的轴)")
+    return ret
+
+
+def cmd_config_order_ex(host, port, p):
+    # SmcConfigHomingOrderExReq (B4): char[16] + int32 auto_on_init = 20B
+    order = p["order"].ljust(16, '\0')[:16].encode("ascii")
+    payload = order + struct.pack("<i", p["auto_init"])
+    err, resp = rpc_call(host, port, CMD_CONFIG_HOMING_ORDER_EX, payload)
+    ret = struct.unpack("<i", resp[:4])[0] if len(resp) >= 4 else -999
+    print(f"[rpc] ConfigHomingAllEx order={p['order']} auto_init={p['auto_init']} "
+          f"ret={ret} (0=ok, -1=空/运行中, -2=未配置的轴)")
     return ret
 
 
@@ -170,6 +192,8 @@ def main():
         return 0 if cmd_config_axis(host, port, p) == 0 else 1
     elif cmd == "config_order":
         return 0 if cmd_config_order(host, port, p) == 0 else 1
+    elif cmd == "config_order_ex":
+        return 0 if cmd_config_order_ex(host, port, p) == 0 else 1
     elif cmd == "trigger":
         return 0 if cmd_trigger(host, port, p) == 0 else 1
     elif cmd == "cancel":

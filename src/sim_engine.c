@@ -14,6 +14,12 @@ _Atomic int  g_sim_force_log = 0;  // P0-Laser: parser M30 抢写 g_laser_rt 后
 // @Safe: Math functions, blocking, and I/O are allowed.
 int sim_engine_init(const char *output_path, int use_binary)
 {
+    // @Safe: 幂等守卫 — 已初始化 (fp 非空) 则复用现有缓冲与文件.
+    //   支持 SMC_InitAndStart 二次调用 (例如 B4 auto_on_init=1 在 ConfigHomingAllEx
+    //   之后重新触发自动回零), 避免重复 malloc/fopen 泄漏与双写同一文件.
+    if (g_sim_logger.fp != NULL) {
+        return 0;
+    }
     memset(&g_sim_logger, 0, sizeof(sim_logger_t));
 
     g_sim_logger.capacity = SIM_BUF_CAPACITY;
@@ -130,13 +136,23 @@ int sim_engine_init(const char *output_path, int use_binary)
 
 // ================== 启动落盘线程 ==================
 // @Context: Non-RealTime Background Thread
+// 独立标志: 区分 "引擎激活(running, RT 在 init 内即置 1)" 与 "落盘线程已创建".
+//   之前误用 g_sim_logger.running 作守卫, 导致首次启动就提前返回, 落盘线程永不创建,
+//   CSV 只剩表头无数据行.
+static int g_sim_flush_started = 0;
 int sim_engine_start(void)
 {
+    // @Safe: 幂等守卫 — 落盘线程已创建则直接返回,
+    //   避免 SMC_InitAndStart 二次调用时创建第二个 flush 线程 (双线程写同一 fp + 双关闭崩溃).
+    if (g_sim_flush_started) {
+        return 0;
+    }
     if (pthread_create(&g_sim_logger.flush_thread, NULL,
                         sim_flush_thread_func, &g_sim_logger) != 0) {
         printf("[SimEngine] 落盘线程创建失败!\n");
         return -1;
     }
+    g_sim_flush_started = 1;
     printf("[SimEngine] 落盘线程已启动\n");
     return 0;
 }

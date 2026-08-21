@@ -104,6 +104,26 @@ int sim_drive_inject_fault(int axis_idx, int slave_subidx);
  * alpha 必须在 (0, 1) 范围内, 否则返回 -1 */
 int sim_drive_config_alpha(int axis_idx, double alpha);
 
+/* @Context: Non-RealTime Background Thread (RPC 线程)
+ * @Thread-Safety: 直接给 motor[1].pos 加 offset (一次性写入, RT 下一周期消费).
+ *   B2 (2026-07-23) 模拟双驱龙门轴主从机械静态差. 用于 pre-align 算法 sim 验证.
+ *   axis_idx 必须是 slave_count>=2 的双驱轴; 否则返回 -1.
+ *   offset_pulse: 直接加到 slave motor pos 的偏移量 (模拟机械梁倾斜或安装错位).
+ *   注入后 master/slave pos 形成静态差, axis_homing pre-align 阶段以对称到中点算法
+ *   (p_center=(p_m+p_s)/2, 设 homing_shift 让主从命令都=p_center) 消除静态差.
+ *   注: 实机不需要此 mock (机械差天然存在), 仅 sim 验证用. */
+int sim_drive_inject_gantry_offset(int axis_idx, int32_t offset_pulse);
+
+/* @Context: Non-RealTime Background Thread (pre-align worker, axis_ctrl.c)
+ * @Thread-Safety: 直接把 motor[subidx].pos 按一阶低通推向 target (与 sim_drive_step_axis
+ *   同款整数算法, 但绕过 cia_state 门限 + PDO 写跳过).
+ *   B2 (2026-07-23) 用途: sim 模式下 homing 处于 RUNNING 时 RT 冻结该轴 PDO 写,
+ *   实际电机位置不更新, pre-align 收敛轮询读不到真实收敛. 此函数让 pre-align worker
+ *   在 sim 下手动把实际位置推向 p_center, 模拟实机伺服在 homing 期间跟随命令的收敛.
+ *   alpha 为固定健康速率(与 ConfigSimDynamics 的 gap 衰减解耦), 必须在 (0,1).
+ *   返回 0=成功, -1=参数越界 */
+int sim_drive_step_toward(int axis_idx, int slave_subidx, int32_t target, double alpha);
+
 /* @Context: 1ms Hard-RT Thread
  * @Danger: 只读, O(AXIS_NUM * MAX_SLAVES_PER_AXIS) ≤ 10 次比较。
  * slave_id → (axis_idx, subidx) 线性查找。

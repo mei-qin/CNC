@@ -141,6 +141,15 @@ typedef enum {
 
     /* --- Emergency Stop 0x0062 (P0-A, ISO 13850 软件层) --- */
     SMC_CMD_EMERGENCY_STOP           = 0x0062,  /* 软急停一站式触发 (原子序列) */
+
+    /* --- Gantry Pre-Align 0x0063 (B2, 2026-07-23) --- */
+    SMC_CMD_CONFIG_GANTRY_ALIGN      = 0x0063,  /* 配置双驱龙门轴 pre-align 锚定前预对中 */
+
+    /* --- Gantry Mock 0x0064 (B2 sim-only, 测试用) --- */
+    SMC_CMD_INJECT_GANTRY_OFFSET     = 0x0064,  /* sim 模式注入主从静态差 (验证 pre-align) */
+
+    /* --- Homing Order v2 0x0065 (B4, 2026-07-23) --- */
+    SMC_CMD_CONFIG_HOMING_ORDER_EX   = 0x0065,  /* v2: order + auto_on_init (旧 0x005C 不变) */
 } SmcCmdType;
 
 /* ============================================================
@@ -630,6 +639,15 @@ typedef struct {
 } SmcConfigHomingOrderReq;
 typedef struct { int32_t ret_code; } SmcConfigHomingOrderRes;
 
+/* SMC_CONFIG_HOMING_ORDER_EX (0x0065) — B4 (2026-07-23) v2: order + auto_on_init */
+/* 与 0x005C 区别: 加 auto_on_init 字段. 旧 client 继续用 0x005C (auto_on_init 保持现状) */
+/* auto_on_init: 0=不自动 (默认), 1=SMC_InitAndStart 末尾自动回零 */
+typedef struct {
+    char    order_letters[SMC_HOMING_ORDER_MAX_LEN];
+    int32_t auto_on_init;   /* 0/1 */
+} SmcConfigHomingOrderExReq;
+typedef struct { int32_t ret_code; } SmcConfigHomingOrderExRes;
+
 /* SMC_HOMING_TRIGGER (0x005D): 触发回零 */
 typedef struct {
     uint8_t z_letter;   /* 轴字母, '\0' = HomeAll */
@@ -676,6 +694,31 @@ typedef struct {
 typedef struct {
     int32_t ret_code;   /* 恒 0=已触发 (急停不可拒) */
 } SmcEmergencyStopRes;
+
+/* SMC_CONFIG_GANTRY_ALIGN (0x0063) — B2 (2026-07-23) 双驱龙门 pre-align 配置 */
+/* 配置时序: SMC_InitAndStart 之前 (与 SMC_CONFIG_HOMING_AXIS 同语义) */
+/* 仅对 slave_count==2 双驱轴生效; 触发阈值 tol_pulse=0 表示跳过 pre-align */
+typedef struct {
+    uint8_t z_letter;          /* 轴字母 */
+    uint8_t _pad[3];
+    int32_t tol_pulse;         /* 触发阈值脉冲数 (0=跳过; 推荐 pulse_per_mm × 0.05mm) */
+    int32_t timeout_ms;        /* 收敛超时 [500, 30000], 默认 3000 */
+} SmcConfigGantryAlignReq;
+typedef struct {
+    int32_t ret_code;          /* 0=ok, -1=未配置/单驱/运行中/参数非法 */
+} SmcConfigGantryAlignRes;
+
+/* SMC_INJECT_GANTRY_OFFSET (0x0064) — B2 (2026-07-23) sim 模式 mock 注入 */
+/* 仅 g_sim_mode==1 有效; 实机返回 -2 */
+/* 测试场景: 注入主从静态差 → 触发 homing → 验证 pre-align 触发与收敛 */
+typedef struct {
+    uint8_t z_letter;          /* 轴字母 (必须是 slave_count==2 双驱轴) */
+    uint8_t _pad[3];
+    int32_t offset_pulse;      /* 加到 slave motor pos 的偏移量 (正/负均可) */
+} SmcInjectGantryOffsetReq;
+typedef struct {
+    int32_t ret_code;          /* 0=ok, -1=非双驱/参数越界, -2=非 sim 模式 */
+} SmcInjectGantryOffsetRes;
 
 #pragma pack(pop)
 
