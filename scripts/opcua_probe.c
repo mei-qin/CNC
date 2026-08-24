@@ -21,8 +21,11 @@
 
 #define PROBE_URL_DEFAULT  "opc.tcp://127.0.0.1:4840"
 #define PROBE_NC_PATH      "/tmp/opcua_probe_test.nc"
-/* CNC 端程序根目录 (与 rpc/opcua_server.c CNC_PROGRAM_DIR_DEFAULT 对齐) */
-#define PROBE_NC_SHARED    "/home/meiqin/nc/opcua_probe_test.nc"
+/* CNC 端程序根目录 (与 rpc/opcua_server.c 对齐): SMC_PROGRAM_DIR 环境变量
+ * 优先, 默认开发机路径。main() 开头初始化 (实机用户名可能不同, 如 server) */
+#define PROBE_NC_DIR_DEFAULT "/home/meiqin/nc"
+static char PROBE_NC_SHARED[512];
+static char PROBE_NC_DIR[448];
 
 static int g_pass = 0, g_fail = 0;
 
@@ -134,6 +137,15 @@ int main(int argc, char *argv[])
 {
     const char *url = (argc > 1) ? argv[1] : PROBE_URL_DEFAULT;
     char buf[256];
+
+    /* 程序根目录: 与 server 端 SMC_PROGRAM_DIR 对齐 (实机用户名差异适配) */
+    {
+        const char *env = getenv("SMC_PROGRAM_DIR");
+        snprintf(PROBE_NC_DIR, sizeof(PROBE_NC_DIR), "%s",
+                 (env && env[0]) ? env : PROBE_NC_DIR_DEFAULT);
+        snprintf(PROBE_NC_SHARED, sizeof(PROBE_NC_SHARED),
+                 "%s/opcua_probe_test.nc", PROBE_NC_DIR);
+    }
 
     printf("=== OPC UA probe: %s ===\n", url);
 
@@ -293,7 +305,7 @@ int main(int argc, char *argv[])
     {
         /* 5a-0. 准备两份相同程序: /tmp (Linux 绝对路径用) + 程序根目录
          * (模拟 SMB 共享写入, 供 Windows 形式路径 basename 回退命中) */
-        mkdir("/home/meiqin/nc", 0755);
+        mkdir(PROBE_NC_DIR, 0755);   /* 已存在 no-op */
         write_probe_gcode(PROBE_NC_PATH);
         write_probe_gcode(PROBE_NC_SHARED);
 
