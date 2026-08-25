@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -440,6 +441,49 @@ int main(int argc, char *argv[])
         read_double(client, "CNC.Axis.X.ActualPosition", &px);
         snprintf(buf, sizeof(buf), "X=%.4f (moved from 0)", px);
         check(px > 0.0, "Jog moved X axis (+direction)", buf);
+    }
+
+    /* ---- 8b. Jog.MoveInc(String, Int32, Double, Double) 增量寸动回归 ----
+     * (依赖 8 的 JOG 已停; 增量段 2mm@5mm/s, 验证精确到位 + 基准=当前实际位置) */
+    {
+        UA_NodeId o = UA_NODEID_STRING(1, (char *)"CNC.Jog");
+        UA_NodeId m = UA_NODEID_STRING(1, (char *)"CNC.Jog.MoveInc");
+
+        double x0 = -1e9;
+        read_double(client, "CNC.Axis.X.ActualPosition", &x0);
+
+        UA_Variant in[4];
+        UA_String axis = UA_STRING((char *)"X");
+        UA_Int32 dir = 1;
+        UA_Double dist = 2.0;
+        UA_Double speed = 5.0;
+        UA_Variant_setScalarCopy(&in[0], &axis, &UA_TYPES[UA_TYPES_STRING]);
+        UA_Variant_setScalarCopy(&in[1], &dir, &UA_TYPES[UA_TYPES_INT32]);
+        UA_Variant_setScalarCopy(&in[2], &dist, &UA_TYPES[UA_TYPES_DOUBLE]);
+        UA_Variant_setScalarCopy(&in[3], &speed, &UA_TYPES[UA_TYPES_DOUBLE]);
+        size_t out_sz = 0;
+        UA_Variant *out = NULL;
+        UA_StatusCode sc = UA_Client_call(client, o, m, 4, in, &out_sz, &out);
+        UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+        UA_Variant_clear(&in[2]); UA_Variant_clear(&in[3]);
+        int iok = -1;
+        if (sc == UA_STATUSCODE_GOOD && out_sz > 0 &&
+            UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_BOOLEAN]))
+            iok = (*(UA_Boolean *)out[0].data) != 0;
+        if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_VARIANT]);
+        snprintf(buf, sizeof(buf), "ret=%d x0=%.4f", iok, x0);
+        check(iok == 1, "Call CNC.Jog.MoveInc(X +2mm) -> true", buf);
+
+        /* 等段消费完成: 2mm@5mm/s ≈ 0.4s + 加减速裕量, 上限 2s */
+        const double target = x0 + 2.0;
+        double x1 = -1e9;
+        for (int i = 0; i < 100; i++) {
+            usleep(20000);
+            read_double(client, "CNC.Axis.X.ActualPosition", &x1);
+            if (fabs(x1 - target) < 0.01) break;
+        }
+        snprintf(buf, sizeof(buf), "x1=%.4f target=%.4f", x1, target);
+        check(fabs(x1 - target) < 0.05, "MoveInc moved X exactly +2mm", buf);
     }
 
     /* ---- 9. Home: 状态读 + 方法 (协议层; sim 未配 homing 业务值可为 false) ---- */

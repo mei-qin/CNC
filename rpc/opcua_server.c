@@ -108,7 +108,8 @@ typedef enum {
     OM_SYSTEM_ESTOP,
     OM_HOME_ALL,
     OM_HOME_AXIS,
-    OM_JOG_MOVE
+    OM_JOG_MOVE,
+    OM_JOG_MOVE_INC
 } OpcMethodKind;
 
 typedef struct {
@@ -116,7 +117,7 @@ typedef struct {
     int8_t  axis_idx;  /* 轴节点: g_axis 索引; 非轴节点 -1 */
 } OpcNodeCtx;
 
-/* 静态上下文池: 注册期线性分配 (当前方法 10 个 / 变量 ~44 个, 留余量) */
+/* 静态上下文池: 注册期线性分配 (当前方法 11 个 / 变量 ~44 个, 留余量) */
 static OpcNodeCtx g_var_ctx_pool[96];
 static int        g_var_ctx_n;
 static OpcNodeCtx g_mtd_ctx_pool[16];
@@ -557,6 +558,7 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
     char axis_letter = 'X';
     UA_Int32 jog_dir = 0;
     UA_Double jog_speed = 0.0;
+    UA_Double jog_distance = 0.0;
 
     switch ((OpcMethodKind)ctx->kind) {
 
@@ -675,6 +677,56 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
             ok = (SMC_JogStop(axis_letter) == 0);
         else
             ok = (SMC_JogStart(axis_letter, (int)jog_dir, jog_speed) == 0);
+        break;
+
+    case OM_JOG_MOVE_INC: {
+        /* 增量寸动: in String axis, Int32 dir(±1), Double distance(>0),
+         * Double speed(>0, mm/s)。精确走 distance mm — 底层复用
+         * SMC_MoveRelative (与 RPC MoveRelative 同源, plan_cursor 基准),
+         * 零新运动学路径。 */
+        if (inputSize != 4 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_INT32]) ||
+            !UA_Variant_hasScalarType(&input[2], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[3], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        {
+            UA_String *s = (UA_String *)input[0].data;
+            if (s && s->length > 0 && s->data)
+                axis_letter = (char)toupper((unsigned char)((char *)s->data)[0]);
+            jog_dir      = *(UA_Int32 *)input[1].data;
+            jog_distance = *(UA_Double *)input[2].data;
+            jog_speed    = *(UA_Double *)input[3].data;
+        }
+        /* 边界校验: SMC_MoveRelative 为 void fire-and-forget (轴不存在只
+         * printf 后静默忽略), 越界入参必须在方法层拒收 */
+        {
+            int aidx = (axis_letter >= 'A' && axis_letter <= 'Z')
+                           ? g_axis_map[axis_letter - 'A'] : -1;
+            if (aidx < 0 || aidx >= AXIS_NUM
+                || (jog_dir != 1 && jog_dir != -1)
+                || !(jog_distance > 0.0) || !(jog_speed > 0.0)) {
+                ok = false;
+                break;
+            }
+        }
+        /* 与 SMC_JogStart 同源互斥: Homing/SafeLift/parser 活动期拒绝。
+         * SMC_MoveRelative 自身无互斥检查, 手动段混入自动流程队列是
+         * 硬伤, 此守卫不可省。 */
+        if (g_interpolator.homing_state != 0
+            || g_interpolator.safe_lift_state != 0
+            || SMC_IsParserRunning()) {
+            ok = false;
+            break;
+        }
+        /* 连续 JOG 进行中则幂等全停: ALL 路径恒返回 0, 恢复 time_scale
+         * 并同步 plan_cursor 到当前实际位置 (P0-1 hotfix #2) — 保证增量
+         * 基准是此刻位置而非 JOG 前旧值。空闲态调用无害 (幂等)。 */
+        SMC_JogStop(SMC_AXIS_ALL);
+        /* 有符号距离 = distance × dir; void 返回, 与 RPC 层 fire-and-forget
+         * 语义对等。连续两次增量: plan_cursor 已推进, 距离正确累加。 */
+        SMC_MoveRelative(axis_letter, jog_distance * (double)jog_dir, jog_speed);
+        ok = true;
         break;
     }
 
@@ -939,6 +991,16 @@ static void build_address_space(UA_Server *s)
             arg_in_double("speed",  "mm/s"),
         };
         add_method(s, "Jog.Move", ns_jog, "Move", "JOG move", OM_JOG_MOVE, in, 3);
+    }
+    {
+        UA_Argument in[4] = {
+            arg_in_string("axis",     "axis letter"),
+            arg_in_int32("dir",       "-1/+1 direction"),
+            arg_in_double("distance", "travel distance (mm, > 0)"),
+            arg_in_double("speed",    "mm/s (> 0)"),
+        };
+        add_method(s, "Jog.MoveInc", ns_jog, "MoveInc", "incremental JOG move",
+                   OM_JOG_MOVE_INC, in, 4);
     }
 
     /* ---- 速度/倍率 (直挂 CNC 下) ---- */
