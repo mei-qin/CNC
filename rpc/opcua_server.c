@@ -729,6 +729,7 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
         ok = true;
         break;
     }
+    }
 
     return UA_Variant_setScalarCopy(output, &ok, &UA_TYPES[UA_TYPES_BOOLEAN]);
 }
