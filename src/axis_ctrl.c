@@ -1562,14 +1562,11 @@ void axis_homing(int axis_idx)
         }
     }
 
-    // ② sim_mode: 直接 DONE 不调 SDO
-    if (g_sim_mode) {
-        g_interpolator.homing_state = 3;
-        EventLogger_Push(SEVERITY_INFO, source, 0x0006, 3,
-                         "homing done (sim stub)");
-        printf("[Homing] %s sim 模式直接 DONE\n", g_axis[axis_idx].axis_name);
-        return;
-    }
+    // ② sim_mode: 跳过 ⑤⑥⑧ 的 SDO/CiA402/bit12 硬件段, 但保留 ⑨⑩⑪ 软件锚定。
+    //    (2026-08-26 前此处直接 return → sim 回零"直接 DONE"但 homing_shift 不重锚、
+    //    current_pos/plan_cursor 不清零, movecontrol 坐标不更新; method 35 锚定是
+    //    纯数学 — 读反馈脉冲→设 shift→清零, 无硬件依赖, sim 下必须执行)
+    const int hw_homing = !g_sim_mode;
 
     // ③ 单轴快照 (FAULT 时回滚). v2 (2026-07-20): home_offset 常量化后, 只需 snapshot
     //   homing_shift (home_offset 是安装时常量, 不会变).
@@ -1590,53 +1587,61 @@ void axis_homing(int axis_idx)
     uint8_t csp_mode = 8;
     int fault = 0;
 
-    for (int s = 0; s < slave_count; s++) {
-        int slave_id = g_axis[axis_idx].slave_ids[s];
-        ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &homing_mode, EC_TIMEOUTRXM);
-        osal_usleep(100000);  // 100ms
-        ecx_SDOwrite(&ctx, slave_id, 0x6098, 0x00, FALSE, 1, &homing_method, EC_TIMEOUTRXM);
-        osal_usleep(50000);   // 50ms
-    }
-    // 触发 homing (双驱同周期发 CW)
-    axis_pdo_write_cw_only(axis_idx, 0x001F);  // bit4=START_HOME + 使能位
-    ecx_send_processdata(&ctx);
-
-    EventLogger_Push(SEVERITY_INFO, source, 0x0006, 2,
-                     "homing running (SDO done, polling bit12)");
-
-    // ⑥ 轮询双驱 bit12 同步 + cancel 检测 + SW_ERROR
-    int timeout = timeout_ms / 100;
-    while (timeout-- > 0) {
-        osal_usleep(100000);
-        // cancel 检测 (PENDING/DONE cancel 不进这里, 但 v1 简化也允许 RUNNING cancel)
-        if (atomic_load_explicit(&g_interpolator.homing_cancel_req,
-                                  memory_order_acquire) != 0) {
-            printf("[Homing] %s 用户取消\n", g_axis[axis_idx].axis_name);
-            fault = 1;
-            break;
-        }
-        int all_done = 1;
+    if (hw_homing) {
         for (int s = 0; s < slave_count; s++) {
-            int sid = g_axis[axis_idx].slave_ids[s];
-            uint16_t sw = axis_pdo_read_sw(sid);
-            if (!(sw & 0x1000)) {
-                all_done = 0;  // bit12 = homing attained
-            }
-            if (sw & 0x0008) {  // bit3 = SW_ERROR (CiA402 fault)
-                printf("[Homing] %s slave[%d] SW_ERROR (sw=0x%04X)\n",
-                       g_axis[axis_idx].axis_name, s, sw);
+            int slave_id = g_axis[axis_idx].slave_ids[s];
+            ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &homing_mode, EC_TIMEOUTRXM);
+            osal_usleep(100000);  // 100ms
+            ecx_SDOwrite(&ctx, slave_id, 0x6098, 0x00, FALSE, 1, &homing_method, EC_TIMEOUTRXM);
+            osal_usleep(50000);   // 50ms
+        }
+        // 触发 homing (双驱同周期发 CW)
+        axis_pdo_write_cw_only(axis_idx, 0x001F);  // bit4=START_HOME + 使能位
+        ecx_send_processdata(&ctx);
+
+        EventLogger_Push(SEVERITY_INFO, source, 0x0006, 2,
+                         "homing running (SDO done, polling bit12)");
+    } else {
+        EventLogger_Push(SEVERITY_INFO, source, 0x0006, 2,
+                         "homing running (sim, software anchor only)");
+    }
+
+    // ⑥ 轮询双驱 bit12 同步 + cancel 检测 + SW_ERROR (仅实机; sim 无 bit12,
+    //    轮询只会白等 timeout 后误判 FAULT)
+    if (hw_homing) {
+        int timeout = timeout_ms / 100;
+        while (timeout-- > 0) {
+            osal_usleep(100000);
+            // cancel 检测 (PENDING/DONE cancel 不进这里, 但 v1 简化也允许 RUNNING cancel)
+            if (atomic_load_explicit(&g_interpolator.homing_cancel_req,
+                                      memory_order_acquire) != 0) {
+                printf("[Homing] %s 用户取消\n", g_axis[axis_idx].axis_name);
                 fault = 1;
                 break;
             }
+            int all_done = 1;
+            for (int s = 0; s < slave_count; s++) {
+                int sid = g_axis[axis_idx].slave_ids[s];
+                uint16_t sw = axis_pdo_read_sw(sid);
+                if (!(sw & 0x1000)) {
+                    all_done = 0;  // bit12 = homing attained
+                }
+                if (sw & 0x0008) {  // bit3 = SW_ERROR (CiA402 fault)
+                    printf("[Homing] %s slave[%d] SW_ERROR (sw=0x%04X)\n",
+                           g_axis[axis_idx].axis_name, s, sw);
+                    fault = 1;
+                    break;
+                }
+            }
+            if (fault) break;
+            if (all_done) break;
         }
-        if (fault) break;
-        if (all_done) break;
-    }
-    if (timeout <= 0 && !fault) {
-        printf("[Homing] %s 超时 (%d ms)\n", g_axis[axis_idx].axis_name, timeout_ms);
-        EventLogger_Push(SEVERITY_ALARM, source, 0x0007, axis_idx,
-                         "homing timeout");
-        fault = 1;
+        if (timeout <= 0 && !fault) {
+            printf("[Homing] %s 超时 (%d ms)\n", g_axis[axis_idx].axis_name, timeout_ms);
+            EventLogger_Push(SEVERITY_ALARM, source, 0x0007, axis_idx,
+                             "homing timeout");
+            fault = 1;
+        }
     }
 
     // ⑦ FAULT 路径: 单轴回滚 + state=4. v2: 回滚 homing_shift (home_offset 不变).
@@ -1655,11 +1660,13 @@ void axis_homing(int axis_idx)
         // 注: HomeAll 模式下 axis_homing_multi 检测 state==4 后回滚前序已成功轴
     }
 
-    // ⑧ 切回 CSP (双驱)
-    for (int s = 0; s < slave_count; s++) {
-        int slave_id = g_axis[axis_idx].slave_ids[s];
-        ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &csp_mode, EC_TIMEOUTRXM);
-        osal_usleep(100000);
+    // ⑧ 切回 CSP (双驱, 仅实机 — sim 从未离开 CSP)
+    if (hw_homing) {
+        for (int s = 0; s < slave_count; s++) {
+            int slave_id = g_axis[axis_idx].slave_ids[s];
+            ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &csp_mode, EC_TIMEOUTRXM);
+            osal_usleep(100000);
+        }
     }
 
     // ⑨ homing_shift 重新锚定 (v2, 2026-07-20): home_offset 严格常量化后,
