@@ -470,7 +470,7 @@ int main(int argc, char *argv[])
         if (sc == UA_STATUSCODE_GOOD && out_sz > 0 &&
             UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_BOOLEAN]))
             iok = (*(UA_Boolean *)out[0].data) != 0;
-        if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_VARIANT]);
+        if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
         snprintf(buf, sizeof(buf), "ret=%d x0=%.4f", iok, x0);
         check(iok == 1, "Call CNC.Jog.MoveInc(X +2mm) -> true", buf);
 
@@ -562,7 +562,7 @@ int main(int argc, char *argv[])
         if (sc7 == UA_STATUSCODE_GOOD && out_sz > 0 &&
             UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_BOOLEAN]))
             hv3 = (*(UA_Boolean *)out[0].data) != 0;
-        if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_VARIANT]);
+        if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
         snprintf(buf, sizeof(buf), "ret=%d sc=%s", hv3, UA_StatusCode_name(sc7));
         check(hv3 >= 0, "Call CNC.Home.Order(\"BC\") -> bool", buf);
     }
