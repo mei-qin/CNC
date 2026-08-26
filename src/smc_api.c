@@ -1329,11 +1329,15 @@ int SMC_JogStart(char axis_letter, int direction, double speed_mm_s)
         printf("[SMC_API] JogStart speed=%.2f 必须 > 0\n", speed_mm_s);
         return -1;
     }
-    // 三功能互斥
-    if (g_interpolator.homing_state != 0
+    // 三功能互斥。homing DONE(3) 除外 — 已完成静止态, 不占用资源
+    // (PENDING/RUNNING/FAULT 仍封锁; FAULT 需 System.Reset 确认, 保持工业语义)。
+    // 背景: 回零完成后 state 停在 3 不自动回 IDLE (仅 CancelHoming/报警复位清),
+    // 若 DONE 参与互斥, 每次回零后 JOG 被永久锁死 (movecontrol 实测 2026-08-26)。
+    if ((g_interpolator.homing_state != 0 && g_interpolator.homing_state != 3)
         || g_interpolator.safe_lift_state != 0
         || g_parser_ctrl.is_running) {
-        printf("[SMC_API] JogStart 与 Homing/SafeLift/parser 冲突\n");
+        printf("[SMC_API] JogStart 与 Homing/SafeLift/parser 冲突 (homing_state=%d)\n",
+               g_interpolator.homing_state);
         return -1;
     }
     // 检查当前是否已 JOG (单轴 JOG 模式 v1)

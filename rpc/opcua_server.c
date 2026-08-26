@@ -732,8 +732,9 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
         }
         /* 与 SMC_JogStart 同源互斥: Homing/SafeLift/parser 活动期拒绝。
          * SMC_MoveRelative 自身无互斥检查, 手动段混入自动流程队列是
-         * 硬伤, 此守卫不可省。 */
-        if (g_interpolator.homing_state != 0
+         * 硬伤, 此守卫不可省。homing DONE(3) 除外 (已完成静止态,
+         * 同 SMC_JogStart 2026-08-26 修正, 否则回零后增量寸动永久锁死)。 */
+        if ((g_interpolator.homing_state != 0 && g_interpolator.homing_state != 3)
             || g_interpolator.safe_lift_state != 0
             || SMC_IsParserRunning()) {
             ok = false;
