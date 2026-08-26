@@ -550,6 +550,21 @@ int main(int argc, char *argv[])
         if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
         snprintf(buf, sizeof(buf), "ret=%d sc=%s", hv2, UA_StatusCode_name(sc5));
         check(hv2 >= 0, "Call CNC.Home.Axis(String) -> bool", buf);
+
+        /* Home.Order(String): 子集串行回零 (旋转回零 "BC") */
+        UA_NodeId mo = UA_NODEID_STRING(1, (char *)"CNC.Home.Order");
+        UA_String axes = UA_STRING((char *)"BC");
+        UA_Variant_setScalarCopy(&in[0], &axes, &UA_TYPES[UA_TYPES_STRING]);
+        out_sz = 0; out = NULL;
+        UA_StatusCode sc7 = UA_Client_call(client, o, mo, 1, in, &out_sz, &out);
+        UA_Variant_clear(&in[0]);
+        int hv3 = -1;
+        if (sc7 == UA_STATUSCODE_GOOD && out_sz > 0 &&
+            UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_BOOLEAN]))
+            hv3 = (*(UA_Boolean *)out[0].data) != 0;
+        if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_VARIANT]);
+        snprintf(buf, sizeof(buf), "ret=%d sc=%s", hv3, UA_StatusCode_name(sc7));
+        check(hv3 >= 0, "Call CNC.Home.Order(\"BC\") -> bool", buf);
     }
 
     UA_Client_disconnect(client);

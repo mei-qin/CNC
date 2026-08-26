@@ -1222,6 +1222,64 @@ int SMC_HomeAll(void)
     return 0;
 }
 
+// @Context: Non-RealTime (HMI/CAM 通过 RPC/OPC UA 调用)
+// 子集回零: 按传入字母序串行回零 (如 "BC" = 旋转回零)。与 HomeAll 同一
+// worker 机制 (all-or-nothing 回滚), 仅轴集合/顺序不同。任一字母未配置
+// 回零 → 整体拒绝 (与 HomeAll 的 all-or-nothing 语义一致, 防半途误解)。
+int SMC_HomeOrder(const char *axis_letters)
+{
+    if (!g_homing_cfg.enabled) {
+        printf("[SMC_API] HomeOrder 未配置, 调 SMC_ConfigHomingAll 先\n");
+        return -1;
+    }
+    if (!axis_letters || axis_letters[0] == '\0') {
+        printf("[SMC_API] HomeOrder 空轴列表\n");
+        return -1;
+    }
+
+    int order[AXIS_NUM];
+    int count = 0;
+    for (const char *p = axis_letters; *p != '\0'; p++) {
+        int idx = axis_lookup(*p);
+        if (idx < 0 || !g_homing_cfg.axis[idx].enabled) {
+            printf("[SMC_API] HomeOrder 轴 '%c' 未配置回零\n",
+                   toupper((unsigned char)*p));
+            return -1;
+        }
+        int dup = 0;
+        for (int k = 0; k < count; k++)
+            if (order[k] == idx) { dup = 1; break; }
+        if (dup) continue;
+        order[count++] = idx;
+        if (count >= AXIS_NUM) break;
+    }
+    if (count == 0) {
+        printf("[SMC_API] HomeOrder 无有效轴\n");
+        return -1;
+    }
+
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] HomeOrder 系统运行中, 先 Abort\n");
+        return -1;
+    }
+    if (!homing_mutex_ok()) {
+        printf("[SMC_API] HomeOrder 与 SafeLift/JOG 冲突\n");
+        return -1;
+    }
+    if (!axis_anchored_ok()) {
+        printf("[SMC_API] HomeOrder 等待 RT 首周期锚定完成\n");
+        return -1;
+    }
+
+    g_interpolator.homing_source        = SOURCE_MANUAL;
+    g_interpolator.homing_method_in_use = 35;
+    if (spawn_homing_worker(order, count) != 0) {
+        printf("[SMC_API] HomeOrder worker 启动失败 (上一次回零未结束?)\n");
+        return -1;
+    }
+    return 0;
+}
+
 int SMC_CancelHoming(void)
 {
     if (!g_homing_cfg.enabled) return -1;

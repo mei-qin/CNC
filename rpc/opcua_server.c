@@ -108,6 +108,7 @@ typedef enum {
     OM_SYSTEM_ESTOP,
     OM_HOME_ALL,
     OM_HOME_AXIS,
+    OM_HOME_ORDER,
     OM_JOG_MOVE,
     OM_JOG_MOVE_INC
 } OpcMethodKind;
@@ -117,7 +118,7 @@ typedef struct {
     int8_t  axis_idx;  /* 轴节点: g_axis 索引; 非轴节点 -1 */
 } OpcNodeCtx;
 
-/* 静态上下文池: 注册期线性分配 (当前方法 11 个 / 变量 ~44 个, 留余量) */
+/* 静态上下文池: 注册期线性分配 (当前方法 12 个 / 变量 ~44 个, 留余量) */
 static OpcNodeCtx g_var_ctx_pool[96];
 static int        g_var_ctx_n;
 static OpcNodeCtx g_mtd_ctx_pool[16];
@@ -659,6 +660,25 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
         ok = (SMC_HomeAxis(axis_letter) == 0);
         break;
 
+    case OM_HOME_ORDER:
+        /* 子集串行回零 (如 "BC" 旋转回零): in: String axes (轴字母连写)。
+         * 复用 HomeAll 的 worker/all-or-nothing 回滚, 仅轴集合不同。 */
+        if (inputSize != 1 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        {
+            UA_String *s = (UA_String *)input[0].data;
+            size_t len = (s && s->length < sizeof(path) - 1) ? s->length : 0;
+            if (s && s->data && len > 0) {
+                memcpy(path, s->data, len);
+                path[len] = '\0';
+            } else {
+                path[0] = '\0';
+            }
+        }
+        ok = (SMC_HomeOrder(path) == 0);
+        break;
+
     case OM_JOG_MOVE:
         /* in: String axis, Int32 dir(-1/0/1), Double speed */
         if (inputSize != 3 ||
@@ -981,6 +1001,11 @@ static void build_address_space(UA_Server *s)
         UA_Argument in = arg_in_string("axis", "axis letter");
         add_method(s, "Home.Axis", ns_home, "Axis",
                    "home single axis", OM_HOME_AXIS, &in, 1);
+    }
+    {
+        UA_Argument in = arg_in_string("axes", "axis letters, e.g. \"BC\"");
+        add_method(s, "Home.Order", ns_home, "Order",
+                   "home axis subset in order", OM_HOME_ORDER, &in, 1);
     }
 
     UA_NodeId ns_jog = add_obj(s, "CNC.Jog", ns_cnc,

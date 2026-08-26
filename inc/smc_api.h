@@ -381,6 +381,11 @@ int SMC_HomeAxis(char axis_letter);
 // 返回: 0=已提交, -1=未配置/parser 正在跑/与其他子状态机冲突
 int SMC_HomeAll(void);
 
+// 子集串行回零 (异步, 立即返回; 按字母序回零, 如 "BC" 旋转回零)
+// 与 HomeAll 同一 worker/回滚机制; 任一轴未配置回零则整体拒绝
+// 返回: 0=已提交, -1=未配置/轴未配置/系统运行中/冲突/重入
+int SMC_HomeOrder(const char *axis_letters);
+
 // 取消回零 (仅 PENDING/DONE, RUNNING 拒绝)
 // 返回: 0=已取消, -1=未配置/正在 RUNNING 拒绝
 int SMC_CancelHoming(void);
