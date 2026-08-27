@@ -1692,6 +1692,13 @@ void axis_homing(int axis_idx)
     //   (与 SMC_JogStop api_sync_planner_cursor 同一类 bug — "绕过 parser 的运动"
     //   漏同步 plan_cursor.)
     plan_cursor[axis_idx] = 0.0;
+    // 2026-08-27: 段簿记同步清零 — target/start 残留上一程序末段的终点,
+    // OPC UA RemainingDistance (= target_pos - machine_pos) 永显冻结残差
+    // (movecontrol 实测: 程序末 20/20/50 → 回零后剩余移动显示残差且不变)。
+    // 与 current_pos/plan_cursor 同族的状态重置补全; 回零守卫保证此刻
+    // 空闲 (is_moving=0), 下一段装载时 RT 整体覆写 start/target, 写入安全。
+    g_interpolator.target_pos[axis_idx] = 0.0;
+    g_interpolator.start_pos[axis_idx]  = 0.0;
 
     // ⑪ state=DONE
     g_interpolator.homing_state = 3;
