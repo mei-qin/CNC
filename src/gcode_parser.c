@@ -2068,9 +2068,16 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                     abort_file = 1;
                     break;
                 }
-                // 暂停检查
-                while(g_parser_ctrl.is_paused){
+                // 暂停检查 (2026-08-27 死锁修复: 暂停等待必须同时消费 abort_request —
+                // 原循环只等 is_paused, 暂停期间 Stop 的 abort_request 永不被消费,
+                // parser 卡死在此 → RunLoadedProgram 拒绝(is_running=1) → UI Start/Stop 全无响应)
+                while(g_parser_ctrl.is_paused && !g_parser_ctrl.abort_request){
                     osal_usleep(100000); // 暂停时每100ms检查一次状态
+                }
+                if(g_parser_ctrl.abort_request){
+                    printf("[Parser] 暂停中收到中止请求, 停止解析文件: %s\n", g_parser_ctrl.filepath);
+                    abort_file = 1;
+                    break;
                 }
 
                 // 解析当前行 G-code 命令 (PC 指向), 入队失败或 GOTO 错则中止文件
@@ -2097,6 +2104,15 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 BSpline_Flush();
             }
             api_flush_planner();
+
+            // 2026-08-27: Abort-while-paused 收尾 — 暂停中中止时 feedhold 仍挂着
+            // (pause_request=1 / HOLD_PAUSED / time_scale=0), 无人恢复则 flush 过的
+            // 残余队列冻结永不消费 (软停止语义 = 清暂停让 RT 走完残余段)。
+            // 正常完成/非暂停中止路径 is_paused 必为 0, 此清理只命中暂停中中止。
+            if (g_parser_ctrl.is_paused) {
+                g_parser_ctrl.is_paused = 0;
+                api_motion_resume();   // pause_request=0 → RT HOLD_RESUMING
+            }
 
             // Phase 2B M5: 子程序未返回检测 (非致命, 便于调试)
             if(!abort_file && g_call_stack_top != 0){
