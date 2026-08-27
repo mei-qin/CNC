@@ -1350,8 +1350,10 @@ int SMC_JogStart(char axis_letter, int direction, double speed_mm_s)
     g_interpolator.jog_axis_idx   = idx;
     g_interpolator.jog_direction  = direction;
     g_interpolator.jog_speed_mm_s = speed_mm_s;
-    // step_mm 每 cycle 1ms 推进, 含方向
+    // step_mm 每 cycle 1ms 推进, 含方向; cur_step 从 0 起 (RT 按 max_acc 斜坡爬升,
+    // 2026-08-27 实机修复: 全速阶跃导致跟随误差报警 + SafeLiftZ 误触发)
     g_interpolator.jog_step_mm    = speed_mm_s * (double)direction / 1000.0;
+    g_interpolator.jog_cur_step_mm = 0.0;
     __sync_synchronize();
     atomic_store_explicit(&g_interpolator.jog_active_req, 1, memory_order_release);
 

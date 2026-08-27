@@ -398,6 +398,7 @@ typedef struct{
     int     jog_direction;             // +1 / -1
     double  jog_speed_mm_s;            // 速度 (mm/s)
     double  jog_step_mm;               // 预计算每 cycle 步长 = speed × direction / 1000
+    double  jog_cur_step_mm;           // 斜坡当前步长 (JogStart 清 0, RT 每 cycle 按 max_acc 爬向 jog_step_mm)
 
     // ---- P2-A: 实时倍率 + 模式标志 (RT 单写者字段) ----
     // 设计原因: CNC 操作面板必备 Feed/Rapid/Spindle 倍率旋钮 + 单段/空运行开关.

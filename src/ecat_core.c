@@ -753,8 +753,29 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                       memory_order_acquire) != 0) {
                 int j = g_interpolator.jog_axis_idx;
                 if (j >= 0 && j < AXIS_NUM) {
-                    double new_pos = g_axis[j].current_cmd_pos
-                                   + g_interpolator.jog_step_mm;
+                    /* JOG 加速斜坡 (2026-08-27 实机首测修复): 原实现第 1 周期即以
+                     * jog_step_mm 全速推进 → 指令速度 0→v 阶跃, 伺服跟不上, 0x60F4
+                     * 跟随误差冲高 (警告阈值 3000p 持续 200ms) → 报警 + SafeLiftZ
+                     * 自动抬 Z (X 轴 100% 倍率实测复现; 增量寸动走 planner S 曲线
+                     * 故平缓)。斜坡: 每周期步长增量 = 轴 max_acc/1e6 (mm/s²→mm/cycle²),
+                     * 爬向含方向的目标步长。停止路径不变 (JogStop 冻结指令, 误差收敛)。
+                     * @Danger: 仅 + - 与钳制比较, 无 math.h/无分配;
+                     * jog_cur_step_mm RT 单写者 (JogStart barrier 前清 0)。 */
+                    double new_pos;
+                    {
+                        double target_step = g_interpolator.jog_step_mm;
+                        double cur_step    = g_interpolator.jog_cur_step_mm;
+                        double accel_step  = g_axis[j].max_acc / 1000000.0;
+                        double delta       = target_step - cur_step;
+                        if (delta > accel_step)
+                            cur_step += accel_step;
+                        else if (delta < -accel_step)
+                            cur_step -= accel_step;
+                        else
+                            cur_step = target_step;
+                        g_interpolator.jog_cur_step_mm = cur_step;
+                        new_pos = g_axis[j].current_cmd_pos + cur_step;
+                    }
                     /* 软限位撞停 */
                     if (g_axis[j].enable_soft_limit) {
                         if (new_pos > g_axis[j].soft_limit_pos) {
