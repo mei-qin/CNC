@@ -9,6 +9,7 @@
 #include "sim_drive.h"
 #include "preview_streamer.h"   /* P0-b v2: PreviewStreamer_GetWriteSeq */
 #include "event_logger.h"       /* P1-b: EventLogger_Push */
+#include "param_store.h"        /* P2 (2026-08-28): Config* 钩子 — 写入即存 + 审计 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -291,6 +292,7 @@ int SMC_ConfigAxisTopology(const char* axis_name, int is_dual_drive, int master_
         strncpy(g_axis[existing_idx].axis_name, axis_name,
                 sizeof(g_axis[existing_idx].axis_name) - 1);
         g_axis[existing_idx].axis_name[sizeof(g_axis[existing_idx].axis_name) - 1] = '\0';
+        param_store_notify_topo(axis_name, is_dual_drive ? 1 : 0, master_id, slave_id);
         return 0;
     }
 
@@ -326,6 +328,7 @@ int SMC_ConfigAxisTopology(const char* axis_name, int is_dual_drive, int master_
     }
 
     g_allocated_axis_count++;
+    param_store_notify_topo(axis_name, is_dual_drive ? 1 : 0, master_id, slave_id);
     return 0;
 }
 
@@ -338,6 +341,7 @@ int SMC_ConfigSoftLimit(char axis_letter, int enable, double neg_limit_mm, doubl
     g_axis[idx].enable_soft_limit = enable;
     g_axis[idx].soft_limit_neg    = neg_limit_mm;
     g_axis[idx].soft_limit_pos    = pos_limit_mm;
+    param_store_notify_softlimit(axis_letter, enable, neg_limit_mm, pos_limit_mm);
     return 0;
 }
 
@@ -352,16 +356,33 @@ int SMC_ConfigGantrySyncAlarm(char axis_letter, int enable, int32_t tolerance_pu
     g_axis[idx].sync_max_err_pulse   = max_error_pulse;
     g_axis[idx].sync_err_time_ms     = time_ms;
     g_axis[idx]._current_sync_timer  = 0;
+    /* 档案只存 tol/max/time 三值 (apply 侧 tol>0 即 enable; enable=0 时
+     * 影子清零保持一致语义) */
+    param_store_notify_gantry_sync(axis_letter,
+                                   enable ? tolerance_pulse : 0,
+                                   max_error_pulse, time_ms);
     return 0;
 }
 
+// P2 (2026-08-28): 加静止守卫 — ppu 变更会撕裂 RT 位置映射
+//   (PDO 脉冲 = 机械坐标 × ppu + home_offset, 红线 #5), 运行中/队列未空一律拒绝。
+//   void 签名保持不变 (拒绝时 printf + 审计事件, 不写 g_axis)。
 void SMC_ConfigPulsePerUnit(char axis_letter, double pulse_per_unit){
     int idx = axis_lookup(axis_letter);
     if(idx < 0) {
         printf("[SMC_API] 轴 '%c' 未配置，无法设置脉冲当量！\n", toupper((unsigned char)axis_letter));
         return;
     }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API ERROR] 系统运行中，禁止修改 %s 脉冲当量 (位置映射连续性)!\n",
+               g_axis[idx].axis_name);
+        EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_REJECT,
+                         (int32_t)(pulse_per_unit * 1000.0),
+                         "ppu change rejected (motion active)");
+        return;
+    }
     g_axis[idx].pulse_per_unit = pulse_per_unit;
+    param_store_notify_ppu(axis_letter, pulse_per_unit);
 }
 
 // @Thread-Safety: Requires atomic operations or lock-free design.
@@ -395,6 +416,7 @@ int SMC_ConfigAxisDynamics(char axis_letter, int type, double max_v, double max_
     __sync_synchronize();
     printf("[SMC_API] %s 动力学: type=%d, Vmax=%.1f, Amax=%.1f, Dmax=%.1f, eq_radius=%.2f\n",
            g_axis[idx].axis_name, type, max_v, max_a, max_d, equivalent_radius);
+    param_store_notify_dyn(axis_letter, type, max_v, max_a, max_d, equivalent_radius);
     return 0;
 }
 
@@ -415,6 +437,7 @@ int SMC_ConfigPlannerParams(double tolerance, double max_centripetal_acc){
     __sync_synchronize();
     printf("[SMC_API] 规划器参数: tolerance=%.4f, centripetal_acc=%.1f\n",
            tolerance, max_centripetal_acc);
+    param_store_notify_planner(tolerance, max_centripetal_acc);
     return 0;
 }
 
@@ -429,6 +452,7 @@ void SMC_ConfigKinematicsOffset(double tool_len, double pivot_x, double pivot_y,
     g_kin_config.pivot_offset[2] = pivot_z;
     printf("[SMC_API] 运动学偏置: tool_len=%.2f mm, pivot=(%.2f, %.2f, %.2f) mm\n",
            tool_len, pivot_x, pivot_y, pivot_z);
+    param_store_notify_kinematics(tool_len, pivot_x, pivot_y, pivot_z);
 }
 
 // @Context: Non-RealTime Background Thread (初始化阶段调用)
@@ -446,6 +470,8 @@ void SMC_ConfigKinematics(int type,
     memcpy(g_kin_config.pivot_offset, pivot_off, sizeof(double) * 3);
     printf("[SMC_API] 运动学构型: type=%d, R1=[idx=%d,axis=%d], R2=[idx=%d,axis=%d]\n",
            type, r1_idx, r1_axis, r2_idx, r2_axis);
+    /* 与 ConfigKinematicsOffset 连续调用时, 影子已同值 → no-op, 无重复审计 */
+    param_store_notify_kinematics(tool_off[2], pivot_off[0], pivot_off[1], pivot_off[2]);
 }
 
 // ================== 坐标与状态 ==================
@@ -886,6 +912,7 @@ int SMC_ConfigSafeLiftZ(char z_letter, double safe_z_mm,
 
     printf("[SMC_API] SafeLift 配置: z=%s, target=%.2f mm, speed=%.1f mm/s, auto_on_alarm=%d\n",
            g_axis[idx].axis_name, safe_z_mm, lift_speed_mm_s, auto_on_alarm);
+    param_store_notify_safelift(safe_z_mm, lift_speed_mm_s, auto_on_alarm);
     return 0;
 }
 
@@ -988,6 +1015,7 @@ int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
 
     printf("[SMC_API] ConfigHoming %s: method=%d, timeout=%d ms\n",
            g_axis[idx].axis_name, method, timeout_ms);
+    param_store_notify_homing(axis_letter, method, timeout_ms, direction);
     return 0;
 }
 
@@ -1023,6 +1051,7 @@ int SMC_ConfigGantryAlign(char axis_letter, int32_t tol_pulse, int timeout_ms)
 
     printf("[SMC_API] ConfigGantryAlign %s: tol=%d pulse, timeout=%d ms\n",
            g_axis[idx].axis_name, tol_pulse, timeout_ms);
+    param_store_notify_gantry_align(axis_letter, tol_pulse, timeout_ms);
     return 0;
 }
 
@@ -1079,6 +1108,7 @@ int SMC_ConfigHomingAllEx(const char *order_letters, int auto_on_init)
     g_homing_cfg.enabled = 1;
     printf("[SMC_API] ConfigHomingAllEx: %d 轴顺序回零, auto_on_init=%d\n",
            g_homing_cfg.order_count, auto_on_init);
+    param_store_notify_homing_all(order_letters, auto_on_init);
     return 0;
 }
 

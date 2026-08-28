@@ -61,6 +61,7 @@ extern "C" {
 #define SOURCE_DRIVE      4
 #define SOURCE_PLC        5
 #define SOURCE_MANUAL     6
+#define SOURCE_CONFIG     7   /* P2 (2026-08-28): 机床参数档案 param_store */
 
 /* ---- event code 规范 (按 source 分段) ----
  * DRIVE=4:   0x0001 sync err / 0x0002 SW_ERROR / 0x0003 follow err hard / 0x0004 follow err warn
@@ -69,6 +70,10 @@ extern "C" {
  *            0x0030 LoadProgram start / 0x0031 LoadProgram done
  *            0x0032 RunLoadedProgram start / 0x0033 program done (M30) / 0x0034 abort
  * MANUAL=6:  0x0040 ClearAlarm req / 0x0041 alarm cleared (RT confirmed)
+ *            0x0044 safe_lift config rejected (over soft limit)
+ * CONFIG=7:  0x0001 profile 加载成功 / 0x0002 加载失败回退默认 / 0x0003 参数变更审计
+ *            0x0004 参数被拒 / 0x0005 档案落盘 (0=ok, -1=fail) / 0x0006 写保护拒绝
+ *            (code 定义见 param_store.h PS_EV_*)
  */
 
 #pragma pack(push, 1)

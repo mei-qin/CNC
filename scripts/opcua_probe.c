@@ -134,6 +134,49 @@ static void write_probe_gcode(const char *path)
     fclose(f);
 }
 
+/* 配置方法调用 (契约 §10): 返回协议层 0=拿到 Int32 出参 (业务码写 *out_rc),
+ * -1=传输失败/出参类型不对 */
+static int call_method_int32(UA_Client *c, const char *obj, const char *meth,
+                             size_t n_in, UA_Variant *in, int32_t *out_rc)
+{
+    UA_NodeId o = UA_NODEID_STRING(1, (char *)obj);
+    UA_NodeId m = UA_NODEID_STRING(1, (char *)meth);
+    size_t out_sz = 0;
+    UA_Variant *out = NULL;
+    UA_StatusCode sc = UA_Client_call(c, o, m, n_in, in, &out_sz, &out);
+    int ok = 0;
+    if (sc == UA_STATUSCODE_GOOD && out_sz > 0 &&
+        UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_INT32])) {
+        *out_rc = *(int32_t *)out[0].data;
+        ok = 1;
+    }
+    if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
+    return ok ? 0 : -1;
+}
+
+static UA_StatusCode write_bool(UA_Client *c, const char *id, UA_Boolean v)
+{
+    UA_Variant w;
+    UA_Variant_init(&w);
+    UA_Variant_setScalarCopy(&w, &v, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    UA_NodeId n = UA_NODEID_STRING(1, (char *)id);
+    UA_StatusCode sc = UA_Client_writeValueAttribute(c, n, &w);
+    UA_Variant_clear(&w);
+    return sc;
+}
+
+static int read_bool(UA_Client *c, const char *id, UA_Boolean *out)
+{
+    UA_Variant v;
+    UA_Variant_init(&v);
+    UA_StatusCode sc = read_variant(c, id, &v);
+    int ok = (sc == UA_STATUSCODE_GOOD) &&
+             UA_Variant_hasScalarType(&v, &UA_TYPES[UA_TYPES_BOOLEAN]);
+    if (ok) *out = *(UA_Boolean *)v.data;
+    UA_Variant_clear(&v);
+    return ok ? 0 : -1;
+}
+
 int main(int argc, char *argv[])
 {
     const char *url = (argc > 1) ? argv[1] : PROBE_URL_DEFAULT;
@@ -565,6 +608,162 @@ int main(int argc, char *argv[])
         if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
         snprintf(buf, sizeof(buf), "ret=%d sc=%s", hv3, UA_StatusCode_name(sc7));
         check(hv3 >= 0, "Call CNC.Home.Order(\"BC\") -> bool", buf);
+    }
+
+    /* ---- 10. CNC.Config 配置面 (契约 §10) ----
+     * 序列: 读变量 → 写保护拒收 (-2) → 解锁 → SetAxisDynamics 生效+回读
+     * → SetSoftLimit → SetPulsePerUnit (待重启 2 / sim 落盘拒绝 -1)
+     * → ProfileDirty → SaveProfile → 恢复写保护。
+     * 前置: 等回零 (§9) 离开 RUNNING, 避免 SMC 静止闸门误拒。 */
+    {
+        /* 10-0. 等待回零静止 (上限 5s; IDLE/DONE/FAULT 均可) */
+        int32_t hs = 2;
+        for (int i = 0; i < 100 && hs == 2; i++) {
+            usleep(50000);
+            read_int(client, "CNC.Home.State", &hs);
+        }
+
+        /* 10-1. 配置变量读 (X 轴 + 全局) */
+        double ms = -1, sl_pos = -1, tool = -1;
+        int32_t atype = -1, dirty = -1;
+        UA_Boolean wp = 0;
+        int ok_ms  = read_double(client, "CNC.Config.Axis.X.MaxSpeed", &ms) == 0;
+        int ok_at  = read_int(client, "CNC.Config.Axis.X.AxisType", &atype) == 0;
+        int ok_sl  = read_double(client, "CNC.Config.Axis.X.SoftLimitPos", &sl_pos) == 0;
+        int ok_tl  = read_double(client, "CNC.Config.ToolLen", &tool) == 0;
+        int ok_dy  = read_int(client, "CNC.Config.ProfileDirty", &dirty) == 0;
+        int ok_wp  = read_bool(client, "CNC.Config.WriteProtect", &wp) == 0;
+        printf("        X: MaxSpeed=%.2f AxisType=%d SoftLimitPos=%.1f "
+               "ToolLen=%.1f Dirty=%d WP=%d\n", ms, atype, sl_pos, tool, dirty, (int)wp);
+        check(ok_ms,  "Read CNC.Config.Axis.X.MaxSpeed (Double)", NULL);
+        check(ok_at,  "Read CNC.Config.Axis.X.AxisType (Int32)", NULL);
+        check(ok_sl,  "Read CNC.Config.Axis.X.SoftLimitPos", NULL);
+        check(ok_tl,  "Read CNC.Config.ToolLen", NULL);
+        check(ok_dy,  "Read CNC.Config.ProfileDirty (Int32)", NULL);
+        check(ok_wp && wp, "Read CNC.Config.WriteProtect (default true)", NULL);
+
+        /* 10-2. 写保护拒收: SetPlannerParams → Int32 -2 */
+        int32_t rc = 99;
+        {
+            UA_Variant in[2];
+            UA_Double tol = 0.05, acc = 500.0;
+            UA_Variant_setScalarCopy(&in[0], &tol, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[1], &acc, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int cok = call_method_int32(client, "CNC.Config", "CNC.Config.SetPlannerParams",
+                                        2, in, &rc);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            snprintf(buf, sizeof(buf), "rc=%d (expect -2)", rc);
+            check(cok == 0 && rc == -2, "SetPlannerParams write-protected -> -2", buf);
+        }
+
+        /* 10-3. 解锁: WriteProtect=false (Boolean 写, ds_write 按 kind 分派) */
+        {
+            UA_StatusCode scw = write_bool(client, "CNC.Config.WriteProtect", 0);
+            UA_Boolean back = 1;
+            for (int i = 0; i < 10 && back; i++) {
+                usleep(50000);
+                read_bool(client, "CNC.Config.WriteProtect", &back);
+            }
+            snprintf(buf, sizeof(buf), "write=%s readback=%d",
+                     UA_StatusCode_name(scw), (int)back);
+            check(scw == UA_STATUSCODE_GOOD && !back,
+                  "Write CNC.Config.WriteProtect=false", buf);
+        }
+
+        /* 10-4. SetAxisDynamics(X, 0, 60, 200, 200, 0) → 0 + 回读 60 */
+        {
+            UA_Variant in[6];
+            UA_String axis = UA_STRING((char *)"X");
+            UA_Int32 type = 0;
+            UA_Double v = 60.0, a = 200.0, d = 200.0, r = 0.0;
+            UA_Variant_setScalarCopy(&in[0], &axis, &UA_TYPES[UA_TYPES_STRING]);
+            UA_Variant_setScalarCopy(&in[1], &type, &UA_TYPES[UA_TYPES_INT32]);
+            UA_Variant_setScalarCopy(&in[2], &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[3], &a, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[4], &d, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[5], &r, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int cok = call_method_int32(client, "CNC.Config", "CNC.Config.SetAxisDynamics",
+                                        6, in, &rc);
+            for (int i = 0; i < 6; i++) UA_Variant_clear(&in[i]);
+            snprintf(buf, sizeof(buf), "rc=%d (expect 0)", rc);
+            check(cok == 0 && rc == 0, "SetAxisDynamics(X 60mm/s) -> 0", buf);
+
+            double back = -1;
+            for (int i = 0; i < 10 && back < 59.0; i++) {
+                usleep(50000);
+                read_double(client, "CNC.Config.Axis.X.MaxSpeed", &back);
+            }
+            snprintf(buf, sizeof(buf), "MaxSpeed=%.2f (expect 60)", back);
+            check(back > 59.0 && back < 61.0, "Readback MaxSpeed after set", buf);
+        }
+
+        /* 10-5. SetSoftLimit(X, 1, -10, 800) → 0 + 回读 800 */
+        {
+            UA_Variant in[4];
+            UA_String axis = UA_STRING((char *)"X");
+            UA_Int32 en = 1;
+            UA_Double neg = -10.0, pos = 800.0;
+            UA_Variant_setScalarCopy(&in[0], &axis, &UA_TYPES[UA_TYPES_STRING]);
+            UA_Variant_setScalarCopy(&in[1], &en, &UA_TYPES[UA_TYPES_INT32]);
+            UA_Variant_setScalarCopy(&in[2], &neg, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[3], &pos, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int cok = call_method_int32(client, "CNC.Config", "CNC.Config.SetSoftLimit",
+                                        4, in, &rc);
+            for (int i = 0; i < 4; i++) UA_Variant_clear(&in[i]);
+            snprintf(buf, sizeof(buf), "rc=%d (expect 0)", rc);
+            check(cok == 0 && rc == 0, "SetSoftLimit(X -10..800) -> 0", buf);
+
+            double back = -1;
+            read_double(client, "CNC.Config.Axis.X.SoftLimitPos", &back);
+            snprintf(buf, sizeof(buf), "SoftLimitPos=%.1f (expect 800)", back);
+            check(back > 799.0 && back < 801.0, "Readback SoftLimitPos", buf);
+        }
+
+        /* 10-6. SetPulsePerUnit(X, 10000) → 2=待重启 (sim 下档案拒绝落盘 → -1) */
+        {
+            UA_Variant in[2];
+            UA_String axis = UA_STRING((char *)"X");
+            UA_Double ppu = 10000.0;
+            UA_Variant_setScalarCopy(&in[0], &axis, &UA_TYPES[UA_TYPES_STRING]);
+            UA_Variant_setScalarCopy(&in[1], &ppu, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int cok = call_method_int32(client, "CNC.Config", "CNC.Config.SetPulsePerUnit",
+                                        2, in, &rc);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            snprintf(buf, sizeof(buf), "rc=%d (2=pending restart / -1=sim no-persist)", rc);
+            check(cok == 0 && (rc == 2 || rc == -1),
+                  "SetPulsePerUnit -> 2 (or -1 in sim)", buf);
+            /* ppu 运行值必须未变 (重启级: 不动 g_axis) */
+            double ppu_now = -1;
+            read_double(client, "CNC.Config.Axis.X.PulsePerUnit", &ppu_now);
+            snprintf(buf, sizeof(buf), "ppu=%.4f (unchanged)", ppu_now);
+            check(ppu_now > 9999.0 && ppu_now < 10001.0,
+                  "PulsePerUnit runtime value unchanged", buf);
+        }
+
+        /* 10-7. ProfileDirty + SaveProfile (sim 拒绝落盘 → -1; hw → 0) */
+        {
+            int32_t d2 = -1;
+            read_int(client, "CNC.Config.ProfileDirty", &d2);
+            int cok = call_method_int32(client, "CNC.Config", "CNC.Config.SaveProfile",
+                                        0, NULL, &rc);
+            snprintf(buf, sizeof(buf), "dirty=%d save_rc=%d", d2, rc);
+            check(cok == 0 && (rc == 0 || rc == -1),
+                  "SaveProfile -> 0 (or -1 in sim)", buf);
+        }
+
+        /* 10-8. 恢复写保护 → 再改必拒 (现场收尾习惯: 测完锁回) */
+        {
+            write_bool(client, "CNC.Config.WriteProtect", 1);
+            UA_Variant in[2];
+            UA_Double tol = 0.05, acc = 500.0;
+            UA_Variant_setScalarCopy(&in[0], &tol, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[1], &acc, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int cok = call_method_int32(client, "CNC.Config", "CNC.Config.SetPlannerParams",
+                                        2, in, &rc);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            snprintf(buf, sizeof(buf), "rc=%d (expect -2)", rc);
+            check(cok == 0 && rc == -2, "Re-protect -> Set rejected (-2)", buf);
+        }
     }
 
     UA_Client_disconnect(client);

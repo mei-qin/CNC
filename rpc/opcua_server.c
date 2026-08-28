@@ -43,6 +43,9 @@
 #include "axis_cfg.h"          /* AXIS_NUM / FeedHoldState_t */
 #include "smc_protocol.h"      /* SMC_MODE_SINGLE_BLOCK */
 #include "gcode_parser.h"      /* ParserControl_t */
+#include "global_def.h"        /* P3: g_axis / g_planner_config (CNC.Config 读) */
+#include "kinematics.h"        /* P3: g_kin_config / KIN_HEAD_HEAD */
+#include "param_store.h"       /* P3: CNC.Config 配置面 (写入即存 + WriteProtect) */
 
 /* ---- 配置常量 ---- */
 #define OPCUA_PORT              4840
@@ -95,6 +98,24 @@ typedef enum {
     OV_AXIS_ACTIVE,
     OV_HOME_STATE,
     OV_HOME_PROGRESS,
+    /* ---- P3 (2026-08-28): CNC.Config 配置面 (契约 §10) ---- */
+    OV_CFG_MAX_SPEED,        /* 每轴 Double: 单轴最大速度 */
+    OV_CFG_MAX_ACC,          /* 每轴 Double */
+    OV_CFG_MAX_DEC,          /* 每轴 Double */
+    OV_CFG_PPU,              /* 每轴 Double: 脉冲当量 */
+    OV_CFG_AXIS_TYPE,        /* 每轴 Int32: 0=线性 1=旋转 */
+    OV_CFG_EQ_RADIUS,        /* 每轴 Double: 旋转轴等效半径 */
+    OV_CFG_SL_ENABLE,        /* 每轴 Int32: 软限位使能 */
+    OV_CFG_SL_NEG,           /* 每轴 Double: 软限位负向 */
+    OV_CFG_SL_POS,           /* 每轴 Double: 软限位正向 */
+    OV_CFG_TOOL_LEN,         /* 全局 Double: 刀长 */
+    OV_CFG_PIVOT_X,          /* 全局 Double */
+    OV_CFG_PIVOT_Y,
+    OV_CFG_PIVOT_Z,
+    OV_CFG_CORNER_TOL,       /* 全局 Double: G64 拐角容差 */
+    OV_CFG_CENTRI_ACC,       /* 全局 Double: 最大向心加速度 */
+    OV_CFG_DIRTY,            /* 全局 Int32: 档案脏标志 */
+    OV_CFG_WRITE_PROTECT,    /* 全局 Boolean RW: 写保护 (仿 Fanuc PWE) */
     OV_KIND_COUNT
 } OpcVarKind;
 
@@ -110,18 +131,31 @@ typedef enum {
     OM_HOME_AXIS,
     OM_HOME_ORDER,
     OM_JOG_MOVE,
-    OM_JOG_MOVE_INC
+    OM_JOG_MOVE_INC,
+    /* ---- P3: CNC.Config 方法 (返回 Int32 生效码, 契约 §10) ---- */
+    OM_CONFIG_SET_DYNAMICS,
+    OM_CONFIG_SET_SOFTLIMIT,
+    OM_CONFIG_SET_PLANNER,
+    OM_CONFIG_SET_KINEMATICS,
+    OM_CONFIG_SET_PPU,
+    OM_CONFIG_SAVE_PROFILE
 } OpcMethodKind;
+
+/* P3: 配置写保护 (server 级开关, 仿 Fanuc PWE 参数写使能)。
+ * 默认 1=保护: 所有 CNC.Config Set 方法拒绝 (-2);
+ * 客户端写 CNC.Config.WriteProtect=false 解锁。通道安全策略, 不入档案。 */
+static int g_cfg_write_protect = 1;
 
 typedef struct {
     uint8_t kind;      /* OpcVarKind / OpcMethodKind */
     int8_t  axis_idx;  /* 轴节点: g_axis 索引; 非轴节点 -1 */
 } OpcNodeCtx;
 
-/* 静态上下文池: 注册期线性分配 (当前方法 12 个 / 变量 ~44 个, 留余量) */
-static OpcNodeCtx g_var_ctx_pool[96];
+/* 静态上下文池: 注册期线性分配。
+ * P3 扩容: config 面 +53 变量 (9×5 轴 + 8 全局) + 6 方法 → var 192 / mtd 32 */
+static OpcNodeCtx g_var_ctx_pool[192];
 static int        g_var_ctx_n;
-static OpcNodeCtx g_mtd_ctx_pool[16];
+static OpcNodeCtx g_mtd_ctx_pool[32];
 static int        g_mtd_ctx_n;
 
 static OpcNodeCtx *var_ctx_new(uint8_t kind, int axis_idx)
@@ -482,6 +516,103 @@ opcua_ds_read(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
         break;
     }
 
+    /* ---- P3: CNC.Config 读路径 (契约 §10) — 现读 g_axis / 规划器 / 运动学,
+     * 与 override 节点同模式 DataSource 无缓存, monitored item 天然最新值 ---- */
+    case OV_CFG_MAX_SPEED: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].max_speed : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_MAX_ACC: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].max_acc : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_MAX_DEC: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].max_dec : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_PPU: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].pulse_per_unit : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_AXIS_TYPE: {
+        UA_Int32 v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                     ? g_axis[ctx->axis_idx].axis_type : 0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT32]);
+        break;
+    }
+    case OV_CFG_EQ_RADIUS: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].equivalent_radius : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_SL_ENABLE: {
+        UA_Int32 v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                     ? g_axis[ctx->axis_idx].enable_soft_limit : 0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT32]);
+        break;
+    }
+    case OV_CFG_SL_NEG: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].soft_limit_neg : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_SL_POS: {
+        UA_Double v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? g_axis[ctx->axis_idx].soft_limit_pos : 0.0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_TOOL_LEN: {
+        UA_Double v = g_kin_config.tool_offset[2];
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_PIVOT_X: {
+        UA_Double v = g_kin_config.pivot_offset[0];
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_PIVOT_Y: {
+        UA_Double v = g_kin_config.pivot_offset[1];
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_PIVOT_Z: {
+        UA_Double v = g_kin_config.pivot_offset[2];
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_CORNER_TOL: {
+        UA_Double v = g_planner_config.corner_tolerance;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_CENTRI_ACC: {
+        UA_Double v = g_planner_config.max_centripetal_acc;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    case OV_CFG_DIRTY: {
+        UA_Int32 v = param_store_dirty() ? 1 : 0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT32]);
+        break;
+    }
+    case OV_CFG_WRITE_PROTECT: {
+        UA_Boolean v = (g_cfg_write_protect != 0);
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        break;
+    }
+
     default: {
         value->hasStatus = true;
         value->status = UA_STATUSCODE_BADINTERNALERROR;
@@ -504,7 +635,9 @@ opcua_ds_read(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
 
 /* @Context: Non-RealTime Background Thread (server 线程 Write)
  * @Safe: 调 SMC_SetOverride (非 RT 写 RT 单写者字段, 项目既有约定)。
- * 仅 3 个 override 节点可写 (accessLevel 已限制, 此处按 kind 二次防线)。 */
+ * 可写节点 (accessLevel 已限制, 此处按 kind 二次防线):
+ *   3 个 override (Double) + P3 的 WriteProtect (Boolean)。
+ * 按 kind 先分派再验类型 — override 族 Double / WriteProtect Boolean。 */
 static UA_StatusCode
 opcua_ds_write(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
                const UA_NodeId *nodeId, void *nodeContext,
@@ -512,25 +645,41 @@ opcua_ds_write(UA_Server *server, const UA_NodeId *sessionId, void *sessionConte
 {
     (void)server; (void)sessionId; (void)sessionContext; (void)nodeId; (void)range;
     OpcNodeCtx *ctx = (OpcNodeCtx *)nodeContext;
-    if (!ctx || !value || !value->hasValue ||
-        !UA_Variant_hasScalarType(&value->value, &UA_TYPES[UA_TYPES_DOUBLE])) {
+    if (!ctx || !value || !value->hasValue)
         return UA_STATUSCODE_BADTYPEMISMATCH;
-    }
-
-    UA_Double ratio = *(UA_Double *)value->value.data;
-    int pct = (int)(ratio * 100.0);   /* 契约比率 → pct */
 
     switch ((OpcVarKind)ctx->kind) {
     case OV_FEED_OVERRIDE:
-        printf("[opcua] write FeedOverride %.3f -> SMC_SetOverride(%d)\n", ratio, pct);
-        SMC_SetOverride(pct, -1, -1, 0, 0, NULL, NULL, NULL, NULL);
-        return UA_STATUSCODE_GOOD;
     case OV_RAPID_OVERRIDE:
-        SMC_SetOverride(-1, pct, -1, 0, 0, NULL, NULL, NULL, NULL);
+    case OV_SPINDLE_OVERRIDE: {
+        if (!UA_Variant_hasScalarType(&value->value, &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADTYPEMISMATCH;
+        UA_Double ratio = *(UA_Double *)value->value.data;
+        int pct = (int)(ratio * 100.0);   /* 契约比率 → pct */
+        if (ctx->kind == OV_FEED_OVERRIDE) {
+            printf("[opcua] write FeedOverride %.3f -> SMC_SetOverride(%d)\n", ratio, pct);
+            SMC_SetOverride(pct, -1, -1, 0, 0, NULL, NULL, NULL, NULL);
+        } else if (ctx->kind == OV_RAPID_OVERRIDE) {
+            SMC_SetOverride(-1, pct, -1, 0, 0, NULL, NULL, NULL, NULL);
+        } else {
+            SMC_SetOverride(-1, -1, pct, 0, 0, NULL, NULL, NULL, NULL);
+        }
         return UA_STATUSCODE_GOOD;
-    case OV_SPINDLE_OVERRIDE:
-        SMC_SetOverride(-1, -1, pct, 0, 0, NULL, NULL, NULL, NULL);
+    }
+    case OV_CFG_WRITE_PROTECT: {
+        /* P3: 写保护开关 (仿 Fanuc PWE)。true=锁定 (默认), false=解锁可改参数。
+         * 开关本身不受保护限制 (否则锁死无法解锁), 切换记审计事件。 */
+        if (!UA_Variant_hasScalarType(&value->value, &UA_TYPES[UA_TYPES_BOOLEAN]))
+            return UA_STATUSCODE_BADTYPEMISMATCH;
+        UA_Boolean v = *(UA_Boolean *)value->value.data;
+        g_cfg_write_protect = v ? 1 : 0;
+        printf("[opcua] Config.WriteProtect -> %s\n", g_cfg_write_protect ? "ON" : "OFF");
+        EventLogger_Push(SEVERITY_INFO, SOURCE_CONFIG, PS_EV_CHANGE,
+                         g_cfg_write_protect,
+                         g_cfg_write_protect ? "write protect ON"
+                                             : "write protect OFF (params editable)");
         return UA_STATUSCODE_GOOD;
+    }
     default:
         return UA_STATUSCODE_BADNOTWRITABLE;
     }
@@ -756,6 +905,165 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
 }
 
 /* =====================================================================
+ *  P3: CNC.Config 方法回调 (契约 §10)
+ *
+ *  返回码 (Int32, 生效级语义 — 市场对齐 Fanuc 参数生效级/Siemens MD 等级):
+ *    0  = 已生效 (SMC_Config* 静止闸门保证 idle, 对后续运动段生效)
+ *    2  = 已保存待重启生效 (ppu: 运行期改会撕裂 RT 位置映射, 只入档案)
+ *   -1  = 被拒 (运行中 / 校验失败 / 轴不存在)
+ *   -2  = 写保护 (WriteProtect=true, 仿 Fanuc PWE 锁定)
+ *
+ *  写入即存: SMC_Config* 内部 param_store_notify → 审计 0x0003 + 原子落盘。
+ * ===================================================================== */
+static UA_StatusCode
+opcua_config_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                       const UA_NodeId *methodId, void *methodContext,
+                       const UA_NodeId *objectId, void *objectContext,
+                       size_t inputSize, const UA_Variant *input,
+                       size_t outputSize, UA_Variant *output)
+{
+    (void)server; (void)sessionId; (void)sessionContext;
+    (void)methodId; (void)objectId; (void)objectContext; (void)outputSize;
+    OpcNodeCtx *ctx = (OpcNodeCtx *)methodContext;
+    if (!ctx) return UA_STATUSCODE_BADINTERNALERROR;
+
+    UA_Int32 rc = -1;
+    char axis_letter = '\0';
+
+    /* 公共闸门: 写保护锁定 → 全部拒绝 (含 SaveProfile, 防误触) */
+    if (g_cfg_write_protect) {
+        rc = -2;
+        EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_WRITE_PROTECT,
+                         ctx->kind, "config method rejected (write protected)");
+        goto out;
+    }
+
+    switch ((OpcMethodKind)ctx->kind) {
+
+    case OM_CONFIG_SET_DYNAMICS: {
+        /* in: String axis, Int32 type(0线/1旋), Double v, a, d, r */
+        if (inputSize != 6 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_INT32]) ||
+            !UA_Variant_hasScalarType(&input[2], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[3], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[4], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[5], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        UA_String *s = (UA_String *)input[0].data;
+        if (s && s->length > 0 && s->data)
+            axis_letter = (char)toupper((unsigned char)((char *)s->data)[0]);
+        UA_Int32 type = *(UA_Int32 *)input[1].data;
+        UA_Double v = *(UA_Double *)input[2].data;
+        UA_Double a = *(UA_Double *)input[3].data;
+        UA_Double d = *(UA_Double *)input[4].data;
+        UA_Double r = *(UA_Double *)input[5].data;
+        printf("[opcua] Config.SetAxisDynamics %c t=%d v=%.3f a=%.3f d=%.3f r=%.3f\n",
+               axis_letter, type, v, a, d, r);
+        rc = (SMC_ConfigAxisDynamics(axis_letter, (int)type, v, a, d, r) == 0) ? 0 : -1;
+        break;
+    }
+
+    case OM_CONFIG_SET_SOFTLIMIT: {
+        /* in: String axis, Int32 enable, Double neg, pos */
+        if (inputSize != 4 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_INT32]) ||
+            !UA_Variant_hasScalarType(&input[2], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[3], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        UA_String *s = (UA_String *)input[0].data;
+        if (s && s->length > 0 && s->data)
+            axis_letter = (char)toupper((unsigned char)((char *)s->data)[0]);
+        UA_Int32 en = *(UA_Int32 *)input[1].data;
+        UA_Double neg = *(UA_Double *)input[2].data;
+        UA_Double pos = *(UA_Double *)input[3].data;
+        printf("[opcua] Config.SetSoftLimit %c en=%d [%.3f, %.3f]\n",
+               axis_letter, en, neg, pos);
+        rc = (SMC_ConfigSoftLimit(axis_letter, (int)en, neg, pos) == 0) ? 0 : -1;
+        break;
+    }
+
+    case OM_CONFIG_SET_PLANNER: {
+        /* in: Double cornerTolerance, Double maxCentripetalAcc */
+        if (inputSize != 2 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        UA_Double tol = *(UA_Double *)input[0].data;
+        UA_Double acc = *(UA_Double *)input[1].data;
+        printf("[opcua] Config.SetPlannerParams tol=%.4f acc=%.1f\n", tol, acc);
+        rc = (SMC_ConfigPlannerParams(tol, acc) == 0) ? 0 : -1;
+        break;
+    }
+
+    case OM_CONFIG_SET_KINEMATICS: {
+        /* in: Double toolLen, pivotX, pivotY, pivotZ (Head-Head B绕Y/C绕Z 固定) */
+        if (inputSize != 4 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[2], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[3], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        UA_Double tool = *(UA_Double *)input[0].data;
+        UA_Double px = *(UA_Double *)input[1].data;
+        UA_Double py = *(UA_Double *)input[2].data;
+        UA_Double pz = *(UA_Double *)input[3].data;
+        printf("[opcua] Config.SetKinematics tool=%.2f pivot=(%.2f, %.2f, %.2f)\n",
+               tool, px, py, pz);
+        SMC_ConfigKinematicsOffset(tool, px, py, pz);
+        double tool_off[3]  = {0.0, 0.0, tool};
+        double pivot_off[3] = {px, py, pz};
+        SMC_ConfigKinematics(KIN_HEAD_HEAD,
+                             g_axis_map['B'-'A'], 1,
+                             g_axis_map['C'-'A'], 2,
+                             tool_off, pivot_off);
+        rc = 0;
+        break;
+    }
+
+    case OM_CONFIG_SET_PPU: {
+        /* in: String axis, Double ppu — 重启级: 只入档案不动 g_axis
+         * (RT 公式 脉冲 = 机械坐标 × ppu + offset, 运行期改必撕裂坐标映射) */
+        if (inputSize != 2 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        UA_String *s = (UA_String *)input[0].data;
+        if (s && s->length > 0 && s->data)
+            axis_letter = (char)toupper((unsigned char)((char *)s->data)[0]);
+        UA_Double ppu = *(UA_Double *)input[1].data;
+        printf("[opcua] Config.SetPulsePerUnit %c ppu=%.4f (pending restart)\n",
+               axis_letter, ppu);
+        if (ppu <= 0.0) {
+            rc = -1;
+            break;
+        }
+        int prc = param_store_set_axis_ppu(axis_letter, ppu);
+        rc = (prc == 0) ? 2 : -1;   /* 2 = 已保存待重启生效 */
+        break;
+    }
+
+    case OM_CONFIG_SAVE_PROFILE: {
+        /* 显式落盘兜底 (正常路径写入即存, 此方法供运维/上位"保存"按钮) */
+        printf("[opcua] Config.SaveProfile\n");
+        rc = (param_store_save() == 0) ? 0 : -1;
+        break;
+    }
+
+    default:
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    if (rc == -1)
+        EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_REJECT, ctx->kind,
+                         "config method rejected (busy/validation)");
+
+out:
+    return UA_Variant_setScalarCopy(output, &rc, &UA_TYPES[UA_TYPES_INT32]);
+}
+
+/* =====================================================================
  *  地址空间构建
  * ===================================================================== */
 
@@ -835,6 +1143,51 @@ add_method(UA_Server *s, const char *id_suffix, const UA_NodeId parent,
         ctx, NULL);
     if (sc != UA_STATUSCODE_GOOD)
         fprintf(stderr, "[opcua] add method node %s fail: 0x%08x\n", nodeid_str, sc);
+    return sc;
+}
+
+/* P3: 配置方法注册 helper — 与 add_method 同形, 区别:
+ * 出参 Int32 生效码 (0/2/-1/-2, 见 opcua_config_method_cb 头注释) 而非 Boolean */
+static UA_StatusCode
+add_config_method(UA_Server *s, const char *id_suffix, const UA_NodeId parent,
+                  const char *browse_name, const char *desc, uint8_t kind,
+                  const UA_Argument *in_args, size_t n_in)
+{
+    OpcNodeCtx *ctx = mtd_ctx_new(kind);
+    if (!ctx) {
+        fprintf(stderr, "[opcua] add config method %s fail: ctx pool exhausted\n", id_suffix);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+
+    char nodeid_str[128];
+    snprintf(nodeid_str, sizeof(nodeid_str), "CNC.%s", id_suffix);
+
+    UA_MethodAttributes ma;
+    UA_MethodAttributes_init(&ma);
+    ma.displayName = UA_LOCALIZEDTEXT("en-US", (char *)browse_name);
+    ma.description = UA_LOCALIZEDTEXT("en-US", (char *)(desc ? desc : browse_name));
+    ma.executable = true;
+    ma.userExecutable = true;
+
+    UA_Argument out_arg;
+    UA_Argument_init(&out_arg);
+    out_arg.name = UA_STRING((char *)"result");
+    out_arg.description = UA_LOCALIZEDTEXT(
+        "en-US", (char *)"0=applied / 2=saved,pending restart / -1=rejected / -2=write protected");
+    out_arg.dataType = UA_TYPES[UA_TYPES_INT32].typeId;
+    out_arg.valueRank = -1;
+
+    UA_StatusCode sc = UA_Server_addMethodNode(
+        s,
+        UA_NODEID_STRING(OPCUA_NAMESPACE_INDEX, nodeid_str),
+        parent,
+        UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+        UA_QUALIFIEDNAME(OPCUA_NAMESPACE_INDEX, (char *)browse_name),
+        ma, opcua_config_method_cb,
+        n_in, in_args, 1, &out_arg,
+        ctx, NULL);
+    if (sc != UA_STATUSCODE_GOOD)
+        fprintf(stderr, "[opcua] add config method node %s fail: 0x%08x\n", nodeid_str, sc);
     return sc;
 }
 
@@ -932,6 +1285,122 @@ static void build_axis_nodes(UA_Server *s, const UA_NodeId axis_parent)
         }
         printf("[opcua] axis object exposed: %s (idx=%d)\n", axis_name, idx);
     }
+}
+
+/* @Context: Non-RealTime Background Thread (server 线程启动期一次)
+ * P3: CNC.Config 对象 (契约 §10) — 全局配置变量 + 每轴配置变量 + 6 方法。
+ * 变量 DataSource 现读 g_axis/g_planner_config/g_kin_config (无缓存);
+ * 方法处理器调 SMC_Config* (与 9527 RPC 复用同一批入口)。
+ * 拓扑不暴露 (重启级, 仅档案文件); ppu 变量只读, 写走 SetPulsePerUnit。 */
+static void build_config_nodes(UA_Server *s, const UA_NodeId ns_cnc)
+{
+    UA_NodeId ns_cfg = add_obj(s, "CNC.Config", ns_cnc,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT), "Config");
+
+    /* ---- 全局配置变量 ---- */
+    add_var(s, "Config.ToolLen",          ns_cfg, "ToolLen",          &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_CFG_TOOL_LEN,     -1, false, -1);
+    add_var(s, "Config.PivotX",           ns_cfg, "PivotX",           &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_CFG_PIVOT_X,      -1, false, -1);
+    add_var(s, "Config.PivotY",           ns_cfg, "PivotY",           &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_CFG_PIVOT_Y,      -1, false, -1);
+    add_var(s, "Config.PivotZ",           ns_cfg, "PivotZ",           &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_CFG_PIVOT_Z,      -1, false, -1);
+    add_var(s, "Config.CornerTolerance",  ns_cfg, "CornerTolerance",  &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_CFG_CORNER_TOL,   -1, false, -1);
+    add_var(s, "Config.MaxCentripetalAcc",ns_cfg, "MaxCentripetalAcc",&UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_CFG_CENTRI_ACC,   -1, false, -1);
+    add_var(s, "Config.ProfileDirty",     ns_cfg, "ProfileDirty",     &UA_TYPES[UA_TYPES_INT32].typeId,    OV_CFG_DIRTY,        -1, false, -1);
+    /* 写保护开关 (仿 Fanuc PWE): 唯一可写配置变量, 默认 true=锁定 */
+    add_var(s, "Config.WriteProtect",     ns_cfg, "WriteProtect",     &UA_TYPES[UA_TYPES_BOOLEAN].typeId,  OV_CFG_WRITE_PROTECT,-1, true,  -1);
+
+    /* ---- 每轴配置变量 (按 g_axis_map 拓扑动态, 仿 build_axis_nodes) ---- */
+    static const struct {
+        const char *attr;
+        uint8_t     kind;
+        int         is_int;   /* 1=Int32, 0=Double */
+    } attrs[] = {
+        { "MaxSpeed",        OV_CFG_MAX_SPEED,  0 },
+        { "MaxAccel",        OV_CFG_MAX_ACC,    0 },
+        { "MaxDecel",        OV_CFG_MAX_DEC,    0 },
+        { "PulsePerUnit",    OV_CFG_PPU,        0 },
+        { "AxisType",        OV_CFG_AXIS_TYPE,  1 },
+        { "EqRadius",        OV_CFG_EQ_RADIUS,  0 },
+        { "SoftLimitEnable", OV_CFG_SL_ENABLE,  1 },
+        { "SoftLimitNeg",    OV_CFG_SL_NEG,     0 },
+        { "SoftLimitPos",    OV_CFG_SL_POS,     0 },
+    };
+
+    for (int letter = 0; letter < 26; letter++) {
+        int idx = g_axis_map[letter];
+        if (idx < 0 || idx >= AXIS_NUM) continue;
+        const char *axis_name = g_axis[idx].axis_name;
+        if (axis_name[0] == '\0') continue;
+
+        char axis_obj_id[40];
+        snprintf(axis_obj_id, sizeof(axis_obj_id), "CNC.Config.Axis.%s", axis_name);
+        UA_NodeId axis_obj = add_obj(s, axis_obj_id, ns_cfg,
+                                     UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                                     axis_name);
+
+        for (size_t k = 0; k < sizeof(attrs) / sizeof(attrs[0]); k++) {
+            const UA_NodeId *dt = attrs[k].is_int
+                ? &UA_TYPES[UA_TYPES_INT32].typeId
+                : &UA_TYPES[UA_TYPES_DOUBLE].typeId;
+            char leaf[72];
+            snprintf(leaf, sizeof(leaf), "Config.Axis.%s.%s", axis_name, attrs[k].attr);
+            UA_StatusCode sc = add_var(s, leaf, axis_obj, attrs[k].attr,
+                                       dt, attrs[k].kind, idx, false, -1);
+            if (sc != UA_STATUSCODE_GOOD)
+                fprintf(stderr, "[opcua] add config var %s fail: 0x%08x\n", leaf, sc);
+        }
+    }
+
+    /* ---- 6 配置方法 (返回 Int32 生效码) ---- */
+    {
+        UA_Argument in[6] = {
+            arg_in_string("axis",      "axis letter"),
+            arg_in_int32("type",       "0=linear 1=rotary"),
+            arg_in_double("maxSpeed",  "max speed (mm/s or deg/s)"),
+            arg_in_double("maxAccel",  "max accel"),
+            arg_in_double("maxDecel",  "max decel"),
+            arg_in_double("eqRadius",  "equivalent radius (rotary, mm)"),
+        };
+        add_config_method(s, "Config.SetAxisDynamics", ns_cfg, "SetAxisDynamics",
+                          "set axis dynamics (idle only)", OM_CONFIG_SET_DYNAMICS, in, 6);
+    }
+    {
+        UA_Argument in[4] = {
+            arg_in_string("axis",   "axis letter"),
+            arg_in_int32("enable",  "0=off 1=on"),
+            arg_in_double("neg",    "negative limit"),
+            arg_in_double("pos",    "positive limit"),
+        };
+        add_config_method(s, "Config.SetSoftLimit", ns_cfg, "SetSoftLimit",
+                          "set soft limits", OM_CONFIG_SET_SOFTLIMIT, in, 4);
+    }
+    {
+        UA_Argument in[2] = {
+            arg_in_double("cornerTolerance",   "G64 corner tolerance (mm)"),
+            arg_in_double("maxCentripetalAcc", "max centripetal accel (mm/s^2)"),
+        };
+        add_config_method(s, "Config.SetPlannerParams", ns_cfg, "SetPlannerParams",
+                          "set planner params", OM_CONFIG_SET_PLANNER, in, 2);
+    }
+    {
+        UA_Argument in[4] = {
+            arg_in_double("toolLen", "tool length (mm)"),
+            arg_in_double("pivotX",  "pivot offset X"),
+            arg_in_double("pivotY",  "pivot offset Y"),
+            arg_in_double("pivotZ",  "pivot offset Z"),
+        };
+        add_config_method(s, "Config.SetKinematics", ns_cfg, "SetKinematics",
+                          "set 5-axis kinematics offsets", OM_CONFIG_SET_KINEMATICS, in, 4);
+    }
+    {
+        UA_Argument in[2] = {
+            arg_in_string("axis", "axis letter"),
+            arg_in_double("ppu",  "pulse per unit (>0)"),
+        };
+        add_config_method(s, "Config.SetPulsePerUnit", ns_cfg, "SetPulsePerUnit",
+                          "set ppu (saved, takes effect after restart)", OM_CONFIG_SET_PPU, in, 2);
+    }
+    add_config_method(s, "Config.SaveProfile", ns_cfg, "SaveProfile",
+                      "explicit save machine profile", OM_CONFIG_SAVE_PROFILE, NULL, 0);
 }
 
 /* @Context: Non-RealTime Background Thread (server 线程启动期一次) */
@@ -1040,6 +1509,9 @@ static void build_address_space(UA_Server *s)
     UA_NodeId ns_axis = add_obj(s, "CNC.Axis", ns_cnc,
             UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT), "Axis");
     build_axis_nodes(s, ns_axis);
+
+    /* ---- P3: CNC.Config 配置面 (契约 §10) ---- */
+    build_config_nodes(s, ns_cnc);
 }
 
 /* =====================================================================
