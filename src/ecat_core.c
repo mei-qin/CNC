@@ -217,6 +217,34 @@ static inline void rt_resolve_scurve_step(double eff_scale)
     }
 }
 
+/* F2 (2026-08-28): 报警路径中止 JOG — RT 上下文, 幂等, 仅 JOG 激活时动作。
+ *
+ * 背景 (实机 2026-08-28 复现): 跟随误差超限/SW_ERROR 置 g_sys_alarm_state 后,
+ * 原实现不清 jog_active_req → 标志卡 1 → SMC_JogStart 对所有轴返回
+ * "已有 JOG 进行中" (smc_api.c 单轴 JOG 互斥) → 寸动全轴锁死。
+ *
+ * 语义与 SMC_JogStop(SMC_AXIS_ALL) (Non-RT) 对齐: 清 ACTIVE/axis_idx/斜坡,
+ * 恢复 time_scale=1.0 (2026-07-20 hotfix 的 RT 侧对齐, 否则段消费永久屏蔽)。
+ * plan_cursor 故意不同步: 增量寸动方法层每次必先 SMC_JogStop(ALL) (其内部
+ * api_sync_planner_cursor), RT 侧零 Non-RT 调用。
+ *
+ * @Context: 1ms Hard-RT Thread
+ * @Danger: 仅 atomic store + 常量串 EventLogger_Push (无锁 ring 写), 无阻塞。 */
+static void rt_jog_abort_on_alarm(void)
+{
+    if (atomic_load_explicit(&g_interpolator.jog_active_req,
+                             memory_order_acquire) == 0)
+        return;
+    int j = g_interpolator.jog_axis_idx;
+    atomic_store_explicit(&g_interpolator.jog_active_req, 0, memory_order_release);
+    g_interpolator.jog_axis_idx    = -1;
+    g_interpolator.jog_cur_step_mm = 0.0;
+    g_interpolator.time_scale      = 1.0;
+    /* JOG 激活期必有 is_moving=0 (Start/段互斥), 无 HOLD_BRAKING 冲突 */
+    EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x000B, j,
+                     "jog aborted by system alarm");
+}
+
 /************************ 实时控制线程（核心！1ms周期，五轴同周期控制） ************************/
 OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 {
@@ -751,6 +779,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
              * 与 SafeLift/Homing 互斥 (cycle 头 SMC_JogStart 已检查, 这里 RT 信任 active_req) */
             if (atomic_load_explicit(&g_interpolator.jog_active_req,
                                       memory_order_acquire) != 0) {
+                /* F1 (2026-08-28): 报警冻结 — 段消费环在下方 while 内有"报警
+                 * 冻结"检查, JOG 块原先没有: 报警置位后指令位置仍每 ms 推进,
+                 * 与堵转实际位置持续发散, 二次触发驱动器大偏差故障 (AL009)。
+                 * 报警即中止 (清 ACTIVE + 恢复 time_scale), 本周期不推进。 */
+                if (atomic_load_explicit(&g_sys_alarm_state,
+                                         memory_order_acquire) != 0) {
+                    rt_jog_abort_on_alarm();
+                } else {
                 int j = g_interpolator.jog_axis_idx;
                 if (j >= 0 && j < AXIS_NUM) {
                     /* JOG 加速斜坡 (2026-08-27 实机首测修复): 原实现第 1 周期即以
@@ -799,6 +835,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.time_scale       = 0.0;
                     ms_budget = 0.0;
                 }
+                }   /* F1 else (非报警) 结束 */
             }
 
             while (ms_budget > 1e-6 && rt_iter < RT_ITER_CAP
@@ -1357,6 +1394,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                         EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
                                          "drive SW_ERROR detected, FAULT_RESET sent");
+                        rt_jog_abort_on_alarm();   /* F2: 报警同步中止 JOG */
                         break;
                     }
 
@@ -1390,6 +1428,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                             atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                             EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0003, abs_err,
                                              "follow err hard limit exceeded");
+                            rt_jog_abort_on_alarm();   /* F2: 报警同步中止 JOG */
                         }else if(abs_err>FOLLOW_ERR_WARN_PULSE){
                             g_axis[i]._follow_err_timer++;
                             if(g_axis[i]._follow_err_timer>=FOLLOW_ERR_WARN_TIME_MS){

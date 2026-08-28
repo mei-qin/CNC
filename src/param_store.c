@@ -114,7 +114,10 @@ static void ps_default_profile(MachineProfile_t *p)
     /* Z 安全抬升 */
     p->safe_z_mm = 50.0;
     p->lift_speed_mm_s = 20.0;
-    p->auto_on_alarm = 1;
+    /* auto_on_alarm 默认 0 (2026-08-28 实机禁用): 报警自动抬 Z 在寸动调机期
+     * 反复误触发 (任一轴跟随误差即抬 Z, 且 DONE 态锁死全轴寸动)。
+     * 机制保留: 档案改 1 重新启用; 手动抬升 (RPC 0x0057 / SMC_SafeLiftZ) 不受影响 */
+    p->auto_on_alarm = 0;
 
     /* 回零全局 */
     strcpy(p->homing_order, "ZXYBC");
@@ -362,11 +365,18 @@ static void ps_write_axis_block(FILE *fp, const MachineProfile_t *p, int i)
 static int ps_save_locked(const MachineProfile_t *p)
 {
     if (g_sim_mode) {
-        if (!g_ps_saved_sim_warn) {
-            printf("[param_store] sim 模式: 档案不落盘 (防污染实机参数)\n");
-            g_ps_saved_sim_warn = 1;
+        /* 防污染语义: sim 会话写【默认路径】会覆盖实机同目录档案 → 拒绝。
+         * 显式 SMC_MACHINE_PROFILE 指向的档案 (测试/联调专用路径, 如 /tmp/xx)
+         * 允许落盘 — 否则 sim 下保存链路 (写入即存/SaveProfile) 无法测试。 */
+        const char *env = getenv("SMC_MACHINE_PROFILE");
+        if (!env || env[0] == '\0') {
+            if (!g_ps_saved_sim_warn) {
+                printf("[param_store] sim 模式: 默认路径档案不落盘 "
+                       "(防污染实机参数; 测试请设 SMC_MACHINE_PROFILE)\n");
+                g_ps_saved_sim_warn = 1;
+            }
+            return -1;
         }
-        return -1;
     }
 
     const char *path = param_store_path();

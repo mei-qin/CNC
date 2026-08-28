@@ -1056,7 +1056,9 @@ static int kernel_init_hw(const char *iface)
         printf("[hw] 双驱轴 %c: 龙门同步 (档案) + 预对中 (ppu 折算)\n", letter);
     }
 
-    /* 10. A4 Z 安全抬升 (auto_on_alarm 来自档案, 默认 1: 报警自动抬, 激光头防撞) */
+    /* 10. A4 Z 安全抬升 (auto_on_alarm 来自档案, 默认 0 — 2026-08-28 实机禁用
+     *     自动抬升: 寸动调机期误触发 + DONE 态锁死全轴寸动; 档案改 1 启用,
+     *     手动抬升 API 0x0057 不受影响) */
     if (hw->safe_z_mm != PS_TODO_D)
         SMC_ConfigSafeLiftZ('Z', hw->safe_z_mm, hw->lift_speed_mm_s,
                             hw->auto_on_alarm);
