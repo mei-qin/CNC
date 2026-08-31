@@ -60,7 +60,7 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[0].sl_enable = 0; p->ax[0].sl_neg = 0.0; p->ax[0].sl_pos = 0.0;
     p->ax[0].gs_tol_pulse = 0; p->ax[0].gs_max_err_pulse = 0; p->ax[0].gs_err_time_ms = 0;
     p->ax[0].hm_enable = 1; p->ax[0].hm_method = 35;
-    p->ax[0].hm_direction = 1; p->ax[0].hm_timeout_ms = 10000;
+    p->ax[0].hm_direction = 1; p->ax[0].hm_timeout_ms = 10000; p->ax[0].hm_speed = 10.0;
 
     /* Y: 双驱龙门 slave 3+4 */
     p->ax[1].is_dual = 1;  p->ax[1].master_id = 3;  p->ax[1].slave_id = 4;
@@ -71,7 +71,7 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[1].gs_tol_pulse = 1000; p->ax[1].gs_max_err_pulse = 8000;
     p->ax[1].gs_err_time_ms = 100;
     p->ax[1].hm_enable = 1; p->ax[1].hm_method = 35;
-    p->ax[1].hm_direction = 1; p->ax[1].hm_timeout_ms = 10000;
+    p->ax[1].hm_direction = 1; p->ax[1].hm_timeout_ms = 10000; p->ax[1].hm_speed = 10.0;
 
     /* Z: 单驱 slave 6, 软限位 (-500,+200) */
     p->ax[2].is_dual = 0;  p->ax[2].master_id = 6;  p->ax[2].slave_id = -1;
@@ -81,7 +81,7 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[2].sl_enable = 1; p->ax[2].sl_neg = -500.0; p->ax[2].sl_pos = 200.0;
     p->ax[2].gs_tol_pulse = 0; p->ax[2].gs_max_err_pulse = 0; p->ax[2].gs_err_time_ms = 0;
     p->ax[2].hm_enable = 1; p->ax[2].hm_method = 35;
-    p->ax[2].hm_direction = 1; p->ax[2].hm_timeout_ms = 10000;
+    p->ax[2].hm_direction = 1; p->ax[2].hm_timeout_ms = 10000; p->ax[2].hm_speed = 10.0;
 
     /* C: 旋转, 等效半径 50mm */
     p->ax[3].is_dual = 0;  p->ax[3].master_id = 1;  p->ax[3].slave_id = -1;
@@ -91,7 +91,7 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[3].sl_enable = 0; p->ax[3].sl_neg = 0.0; p->ax[3].sl_pos = 0.0;
     p->ax[3].gs_tol_pulse = 0; p->ax[3].gs_max_err_pulse = 0; p->ax[3].gs_err_time_ms = 0;
     p->ax[3].hm_enable = 1; p->ax[3].hm_method = 35;
-    p->ax[3].hm_direction = 1; p->ax[3].hm_timeout_ms = 10000;
+    p->ax[3].hm_direction = 1; p->ax[3].hm_timeout_ms = 10000; p->ax[3].hm_speed = 10.0;
 
     /* B: 旋转, 等效半径 80mm */
     p->ax[4].is_dual = 0;  p->ax[4].master_id = 2;  p->ax[4].slave_id = -1;
@@ -101,7 +101,7 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[4].sl_enable = 0; p->ax[4].sl_neg = 0.0; p->ax[4].sl_pos = 0.0;
     p->ax[4].gs_tol_pulse = 0; p->ax[4].gs_max_err_pulse = 0; p->ax[4].gs_err_time_ms = 0;
     p->ax[4].hm_enable = 1; p->ax[4].hm_method = 35;
-    p->ax[4].hm_direction = 1; p->ax[4].hm_timeout_ms = 10000;
+    p->ax[4].hm_direction = 1; p->ax[4].hm_timeout_ms = 10000; p->ax[4].hm_speed = 10.0;
 
     /* 五轴运动学 (Head-Head 原值) */
     p->tool_len = 150.0;
@@ -153,6 +153,7 @@ static const PsAxisField_t g_axis_fields[] = {
     {"homing_method",        offsetof(ProfileAxis_t, hm_method),       0},
     {"homing_direction",     offsetof(ProfileAxis_t, hm_direction),    0},
     {"homing_timeout_ms",    offsetof(ProfileAxis_t, hm_timeout_ms),   0},
+    {"homing_speed",         offsetof(ProfileAxis_t, hm_speed),        1},
 };
 
 /* 轴字母 → 档案下标 (axis_order 顺序); 找不到返回 -1 */
@@ -358,6 +359,7 @@ static void ps_write_axis_block(FILE *fp, const MachineProfile_t *p, int i)
     fprintf(fp, "homing_method=%d\n",        a->hm_method);
     fprintf(fp, "homing_direction=%d\n",     a->hm_direction);
     fprintf(fp, "homing_timeout_ms=%d\n",    a->hm_timeout_ms);
+    fprintf(fp, "homing_speed=%.6f\n",       a->hm_speed);
     fprintf(fp, "\n");
 }
 

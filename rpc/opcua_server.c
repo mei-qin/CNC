@@ -132,6 +132,8 @@ typedef enum {
     OM_HOME_ORDER,
     OM_JOG_MOVE,
     OM_JOG_MOVE_INC,
+    /* v1.5 (2026-08-28): 当前位设为激活 WCS 零点 (main 时代 SetZero 语义) */
+    OM_HOME_SET_ORIGIN,
     /* ---- P3: CNC.Config 方法 (返回 Int32 生效码, 契约 §10) ---- */
     OM_CONFIG_SET_DYNAMICS,
     OM_CONFIG_SET_SOFTLIMIT,
@@ -848,6 +850,21 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
             ok = (SMC_JogStart(axis_letter, (int)jog_dir, jog_speed) == 0);
         break;
 
+    case OM_HOME_SET_ORIGIN:
+        /* v1.5: 当前位设为激活 WCS 零点 (纯偏置写, 无运动)。in: String axis
+         * ("ALL"/空 = 全部轴)。G53 模态拒绝 (false)。 */
+        if (inputSize != 1 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        {
+            UA_String *s = (UA_String *)input[0].data;
+            char a = SMC_AXIS_ALL;
+            if (s && s->length == 1 && s->data)   /* 长度 1 = 单轴字母 */
+                a = (char)toupper((unsigned char)((char *)s->data)[0]);
+            ok = (SMC_SetOriginHere(a) == 0);
+        }
+        break;
+
     case OM_JOG_MOVE_INC: {
         /* 增量寸动: in String axis, Int32 dir(±1), Double distance(>0),
          * Double speed(>0, mm/s)。精确走 distance mm — 底层复用
@@ -1476,6 +1493,14 @@ static void build_address_space(UA_Server *s)
         UA_Argument in = arg_in_string("axes", "axis letters, e.g. \"BC\"");
         add_method(s, "Home.Order", ns_home, "Order",
                    "home axis subset in order", OM_HOME_ORDER, &in, 1);
+    }
+    /* v1.5 (2026-08-28): 当前位设为激活 WCS 零点 (main 时代 SetZero 语义,
+     * 纯偏置写无运动); 之后 Home.* 回零物理回到该点 */
+    {
+        UA_Argument in = arg_in_string("axis", "axis letter (length 1) or \"ALL\"");
+        add_method(s, "Home.SetOrigin", ns_home, "SetOrigin",
+                   "set current position as active WCS origin (no motion)",
+                   OM_HOME_SET_ORIGIN, &in, 1);
     }
 
     UA_NodeId ns_jog = add_obj(s, "CNC.Jog", ns_cnc,

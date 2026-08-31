@@ -1426,7 +1426,12 @@ void axis_homing(int axis_idx)
     int source = g_interpolator.homing_source;
     HomingAxisCfg_t *cfg = &g_homing_cfg.axis[axis_idx];
     int timeout_ms = cfg->timeout_ms;
-    int method     = cfg->method;
+    /* v1.5 (2026-08-28): 运行方法以触发时拷贝为准 (multi 逐轴设置)。语义:
+     *   35 = 回当前激活 WCS 逻辑零点的物理运动 (RT 运动块, 全程 CSP, 无 SDO;
+     *        G54 偏置默认 0 时 = 上电锚定机械零点。原"当前位置标为零"语义
+     *        已移至 SMC_SetOriginHere — WCS 偏置写入, 不再走回零状态机)
+     *   1-19 = 真开关回零 (v2 预留: HM 模式 SDO + bit12, 即原实机路径) */
+    int method     = g_interpolator.homing_method_in_use;
 
     printf("[Homing] %s 开始回零 (method=%d, timeout=%d ms)\n",
            g_axis[axis_idx].axis_name, method, timeout_ms);
@@ -1449,15 +1454,13 @@ void axis_homing(int axis_idx)
     //       但 sim_drive_inject_gantry_offset 只改 pos 不改 home_offset, 假设不成立.
     //       对称对中算法不依赖该假设, sim 和实机都正确.
     //
-    //   ⚠️ 架构限制 (实机上线前必须解决, v3 PRE_ALIGN state):
-    //     axis_homing_multi:1708 等 homing_state==2 (RUNNING) 才调本函数, 入口已 RUNNING.
-    //     ecat_core.c:744 RUNNING 时 RT 跳过该轴 PDO 写 (CiA402 homing 接管设计).
-    //     → 实机 homing_shift[0/1] 不会通过 PDO 下发, master/slave pos 不收敛到 p_center.
-    //     → sim 路径用 sim_drive_step_toward 手动推进 pos 作为 workaround (见 line ~1487).
-    //     → 实机无等价机制, pre-align 当前在实机不工作!
-    //   v3 方案: 新增 state=5 PRE_ALIGN, RT 在此 state 正常写 PDO (与 SafeLift 子状态机同构).
-    //            axis_homing_multi 在 PENDING→RUNNING 之间插 PRE_ALIGN, pre-align 完成后 Non-RT
-    //            设 RUNNING. 详见 memory cnc-p01-homing-jog.md B2 实机架构债.
+    //   ⚠️ 架构限制 (v1.5 已解决 — 见下):
+    //     旧版 ecat_core RUNNING 时 RT 跳过该轴 PDO 写 (CiA402 HM 接管设计),
+    //     实机 homing_shift[0/1] 不经 PDO 下发 → master/slave 不收敛, 实机
+    //     pre-align 不工作 (仅 sim 有 sim_drive_step_toward workaround)。
+    //   v1.5 (2026-08-28): m35 改为 RT 运动块回零, 驱动器全程 CSP, RT 在
+    //     RUNNING 期间【继续写该轴 PDO】(ecat_core PDO 豁免条件加 method!=35) —
+    //     临时 homing_shift 实时下发, 实机 pre-align 随之生效 (原架构债消除)。
     //
     //   sim_mode 也走此路径 (验证 mock 不需要真实 SDO, 但需 sim_drive_step_toward 推进 pos)
     int slave_count_pre = g_axis[axis_idx].slave_count;
@@ -1581,13 +1584,47 @@ void axis_homing(int axis_idx)
     g_interpolator.homing_state = 2;
     __sync_synchronize();
 
-    // ⑤ 双驱循环触发 homing (CiA402 mode 6 + method + CW trigger)
-    uint8_t homing_mode = 6;
-    int8_t  homing_method = (int8_t)method;
-    uint8_t csp_mode = 8;
+    // ⑤⑥ v1.5: m35 = RT 运动块回零 (无 SDO);
+    //         其余 (1-19 真开关回零, 预留) = 原实机 HM/SDO + bit12 轮询路径
     int fault = 0;
 
-    if (hw_homing) {
+    if (method == 35) {
+        /* m35 回零: RT 运动块推进 current_cmd_pos 朝机械零点 (ecat_core v1.5 块),
+         * worker 只轮询收尾 — DONE(RT 置 3) / FAULT(4) / 取消 / 他轴报警 / 超时。
+         * 不重锚 homing_shift (⑨ 跳过): 零点恒为上电锚定点, 回零不再"漂移"。 */
+        EventLogger_Push(SEVERITY_INFO, source, 0x0006, 2,
+                         "homing running (m35, RT motion to machine zero)");
+        int t = timeout_ms / 100;
+        while (t-- > 0) {
+            osal_usleep(100000);
+            if (atomic_load_explicit(&g_interpolator.homing_cancel_req,
+                                     memory_order_acquire) != 0) {
+                printf("[Homing] %s 用户取消\n", g_axis[axis_idx].axis_name);
+                fault = 1;
+                break;
+            }
+            if (g_interpolator.homing_state == 3) break;   /* RT DONE */
+            if (g_interpolator.homing_state == 4) { fault = 1; break; }
+            if (atomic_load_explicit(&g_sys_alarm_state,
+                                     memory_order_acquire) != 0) {
+                printf("[Homing] %s 系统报警中止\n", g_axis[axis_idx].axis_name);
+                EventLogger_Push(SEVERITY_ALARM, source, 0x0008, axis_idx,
+                                 "homing aborted by system alarm");
+                fault = 1;
+                break;
+            }
+        }
+        if (t <= 0 && !fault && g_interpolator.homing_state != 3) {
+            printf("[Homing] %s 超时 (%d ms)\n", g_axis[axis_idx].axis_name, timeout_ms);
+            EventLogger_Push(SEVERITY_ALARM, source, 0x0007, axis_idx,
+                             "homing timeout");
+            fault = 1;
+        }
+    } else if (hw_homing) {
+        // ⑤ 双驱循环触发 homing (CiA402 mode 6 + method + CW trigger)
+        uint8_t homing_mode = 6;
+        int8_t  homing_method = (int8_t)method;
+
         for (int s = 0; s < slave_count; s++) {
             int slave_id = g_axis[axis_idx].slave_ids[s];
             ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &homing_mode, EC_TIMEOUTRXM);
@@ -1660,8 +1697,9 @@ void axis_homing(int axis_idx)
         // 注: HomeAll 模式下 axis_homing_multi 检测 state==4 后回滚前序已成功轴
     }
 
-    // ⑧ 切回 CSP (双驱, 仅实机 — sim 从未离开 CSP)
-    if (hw_homing) {
+    // ⑧ 切回 CSP (双驱, 仅实机 HM 路径 — sim 与 m35 从未离开 CSP)
+    if (hw_homing && method != 35) {
+        uint8_t csp_mode = 8;
         for (int s = 0; s < slave_count; s++) {
             int slave_id = g_axis[axis_idx].slave_ids[s];
             ecx_SDOwrite(&ctx, slave_id, 0x6060, 0x00, FALSE, 1, &csp_mode, EC_TIMEOUTRXM);
@@ -1676,41 +1714,45 @@ void axis_homing(int axis_idx)
     //   v2 优势: home_offset 严格只读, RT/Non-RT race 消除 (CLAUDE.md 红线合规).
     //   与 ecat_core.c:317 首周期锚定不同 — 首周期是 home_offset 一次性写入 (常量定值),
     //   此处是 homing_shift 每次回零重写 (运行时变量).
-    for (int s = 0; s < slave_count; s++) {
-        int slave_id = g_axis[axis_idx].slave_ids[s];
-        int32_t cur_pulse = axis_pdo_read_pos(slave_id);
-        g_axis[axis_idx].homing_shift[s] = cur_pulse - g_axis[axis_idx].home_offset[s];
+    // v1.5 (2026-08-28): 仅未来真回零 method (1-19, HM 后) 重锚;
+    //   m35 不重锚 — 原点由 WCS 定义 (默认上电位点), 回零是"回到原点"而非
+    //   "重定义原点"。原"当前位置标为零"语义已移至 SMC_SetOriginHere (WCS 写入)。
+    if (method != 35) {
+        for (int s = 0; s < slave_count; s++) {
+            int slave_id = g_axis[axis_idx].slave_ids[s];
+            int32_t cur_pulse = axis_pdo_read_pos(slave_id);
+            g_axis[axis_idx].homing_shift[s] = cur_pulse - g_axis[axis_idx].home_offset[s];
+        }
     }
 
-    // ⑩ current_cmd_pos 归零 (机械原点 = G53 原点)
-    g_axis[axis_idx].current_cmd_pos = 0.0;
-    g_interpolator.current_pos[axis_idx] = 0.0;
+    // ⑩ 归位到回零目标 (m35: RT 运动块到达时已锁定 target, 此处幂等;
+    //     G54 偏置 0 时 target=0 与旧行为一致)。current/plan_cursor/段簿记
+    //     全部以机械空间 target 对齐 — 后续 MoveRelative/RemainingDistance 基准。
+    //     (plan_cursor 残留旧值 = 2026-07-20 hotfix; target/start 残差 =
+    //     2026-08-27 fix, 均并入此处)
+    double home_target = g_interpolator.homing_target_pos;
+    g_axis[axis_idx].current_cmd_pos = home_target;
+    g_interpolator.current_pos[axis_idx] = home_target;
     __sync_synchronize();
-    // P0-1 hotfix (2026-07-20): 同步 plan_cursor[axis_idx] = 0
-    // 背景: homing 后 current_cmd_pos=0, 但 plan_cursor 残留 homing 前的旧值.
-    //   后续 api_move_relative 基于 plan_cursor 计算 target, 位置基准错位.
-    //   (与 SMC_JogStop api_sync_planner_cursor 同一类 bug — "绕过 parser 的运动"
-    //   漏同步 plan_cursor.)
-    plan_cursor[axis_idx] = 0.0;
-    // 2026-08-27: 段簿记同步清零 — target/start 残留上一程序末段的终点,
-    // OPC UA RemainingDistance (= target_pos - machine_pos) 永显冻结残差
-    // (movecontrol 实测: 程序末 20/20/50 → 回零后剩余移动显示残差且不变)。
-    // 与 current_pos/plan_cursor 同族的状态重置补全; 回零守卫保证此刻
-    // 空闲 (is_moving=0), 下一段装载时 RT 整体覆写 start/target, 写入安全。
-    g_interpolator.target_pos[axis_idx] = 0.0;
-    g_interpolator.start_pos[axis_idx]  = 0.0;
+    plan_cursor[axis_idx] = home_target;
+    g_interpolator.target_pos[axis_idx] = home_target;
+    g_interpolator.start_pos[axis_idx]  = home_target;
 
-    // ⑪ state=DONE
-    g_interpolator.homing_state = 3;
-    EventLogger_Push(SEVERITY_INFO, source, 0x0006, 3, "homing done");
-    printf("[Homing] %s DONE (homing_shift re-anchored, home_offset constant, pos reset to 0)\n",
-           g_axis[axis_idx].axis_name);
+    // ⑪ state=DONE (m35: RT 运动块到达时已置 3 + done 事件, 不重复推)
+    if (method != 35) {
+        g_interpolator.homing_state = 3;
+        EventLogger_Push(SEVERITY_INFO, source, 0x0006, 3, "homing done");
+    }
+    printf("[Homing] %s DONE (method=%d, pos reset to 0)\n",
+           g_axis[axis_idx].axis_name, method);
 }
 
 // P0-1: 多轴串行回零 + all-or-nothing 回滚 (补强点 #2)
 // @Context: Non-RealTime (parser_thread 或 SMC_HomeAll 触发路径)
-// 调用方: G28 parser (SOURCE_PARSER), SMC_HomeAll 异步路径 (SOURCE_MANUAL)
+// 调用方: G28 parser (SOURCE_PARSER), SMC_HomeAll/HomeOrder worker (SOURCE_MANUAL)
 //
+// v1.5 (2026-08-28): m35 目标 = 当前激活 WCS 逻辑零点 (G54 偏置默认 0 时
+//   = 上电锚定机械零点)。逐轴刷新 method/target (axis_homing 以此为准)。
 // 任一轴 FAULT → 回滚所有已成功轴 (homing_shift + current_cmd_pos) 到快照值 (v2: home_offset 常量不动)
 // 返回: 0=全部成功, -1=有轴 FAULT (已回滚)
 int axis_homing_multi(const int *axis_indices, int count, int source)
@@ -1735,6 +1777,16 @@ int axis_homing_multi(const int *axis_indices, int count, int source)
     for (int i = 0; i < count; i++) {
         int idx = axis_indices[i];
         g_interpolator.homing_axis_idx = idx;
+        /* v1.5: 逐轴刷新运行 method (axis_homing 以 homing_method_in_use 为准)
+         * + 回零目标 = 当前激活 WCS 逻辑零点的 G53 投影 (G53: 0; G54..: work offset;
+         * 偏置默认 0 → 与机械零点重合, 即上电锚定点)。homing 期间 parser 已停,
+         * work_offsets 表稳定, Non-RT 读安全。 */
+        g_interpolator.homing_method_in_use = g_homing_cfg.axis[idx].method;
+        g_interpolator.homing_target_pos = 0.0;
+        if (g_coord_mgr.current_coord != COORD_G53) {
+            g_interpolator.homing_target_pos =
+                g_coord_mgr.work_offsets[g_coord_mgr.current_coord - 1][idx];
+        }
 
         // P0-1 fix: 每轴开始前把 state 重置回 IDLE, 让 RT 重新走 pending_req 消费 +
         //   PENDING(1)->RUNNING(2) 提升 (含 fresh 延迟一周期). 否则上一轴结束时

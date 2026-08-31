@@ -386,6 +386,13 @@ int SMC_HomeAll(void);
 // 返回: 0=已提交, -1=未配置/轴未配置/系统运行中/冲突/重入
 int SMC_HomeOrder(const char *axis_letters);
 
+// v1.5 (2026-08-28): 当前位置设为原点 (main 时代 SetZero 语义)
+// 把当前激活工件坐标系 (G54..G59; G53 拒绝) 零点定义在当前物理位置。
+// 纯 WCS 偏置写入, 无运动; 之后回零 (m35) 物理回到这里。
+// axis_letter: 单轴字母 或 SMC_AXIS_ALL (-1) 全轴
+// 返回: 0=成功, -1=G53 模态/轴未配置/运行中/冲突
+int SMC_SetOriginHere(char axis_letter);
+
 // 取消回零 (仅 PENDING/DONE, RUNNING 拒绝)
 // 返回: 0=已取消, -1=未配置/正在 RUNNING 拒绝
 int SMC_CancelHoming(void);

@@ -809,6 +809,21 @@ static int handle_client_request(int client_fd)
         resp_payload_len = sizeof(SmcHomingCancelRes);
         break;
     }
+    /* ===== v1.5 (2026-08-28): 当前位设为激活 WCS 零点 ===== */
+    case SMC_CMD_SET_ORIGIN_HERE: {
+        if (req_hdr.data_len < sizeof(SmcSetOriginHereReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcSetOriginHereReq *req = (SmcSetOriginHereReq *)payload;
+        SmcSetOriginHereRes *res = (SmcSetOriginHereRes *)resp_buf;
+        char axis = (req->z_letter != 0) ? (char)req->z_letter : (char)SMC_AXIS_ALL;
+        res->ret_code = SMC_SetOriginHere(axis);
+        printf("[rpc] SetOriginHere %s ret=%d\n",
+               (req->z_letter != 0) ? "单轴" : "全轴", res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcSetOriginHereRes);
+        break;
+    }
     case SMC_CMD_GET_HOMING: {
         SmcGetHomingRes *res = (SmcGetHomingRes *)resp_buf;
         int state = 0, axis_idx = -1;
@@ -1063,12 +1078,14 @@ static int kernel_init_hw(const char *iface)
         SMC_ConfigSafeLiftZ('Z', hw->safe_z_mm, hw->lift_speed_mm_s,
                             hw->auto_on_alarm);
 
-    /* 11. B 级回零 (v1 method 35 软件法; 顺序/auto_on_init 来自档案,
-     *     auto_on_init=0 手动触发, 失败要人看见。硬件开关接入后切 1-19) */
+    /* 11. B 级回零 (v1.5 m35 = 回 WCS 零点运动; 顺序/速度/超时/auto_on_init 来自档案,
+     *     hm_speed 0 = 轴 max_speed; auto_on_init=0 手动触发, 失败要人看见。
+     *     硬件 home switch 接入后切 1-19) */
     for (int i = 0; i < hw->axis_count && i < AXIS_NUM; i++)
         if (hw->ax[i].hm_enable)
             SMC_ConfigHoming(hw->axis_order[i][0], hw->ax[i].hm_method,
-                             0, 0, hw->ax[i].hm_direction, hw->ax[i].hm_timeout_ms);
+                             hw->ax[i].hm_speed, 0, hw->ax[i].hm_direction,
+                             hw->ax[i].hm_timeout_ms);
     if (hw->homing_order[0] != '\0')
         SMC_ConfigHomingAllEx(hw->homing_order, hw->auto_on_init);
 

@@ -150,6 +150,9 @@ typedef enum {
 
     /* --- Homing Order v2 0x0065 (B4, 2026-07-23) --- */
     SMC_CMD_CONFIG_HOMING_ORDER_EX   = 0x0065,  /* v2: order + auto_on_init (旧 0x005C 不变) */
+
+    /* --- Set Origin Here 0x0066 (v1.5, 2026-08-28) --- */
+    SMC_CMD_SET_ORIGIN_HERE          = 0x0066,  /* 当前位设为激活 WCS 零点 (main 时代 SetZero 语义) */
 } SmcCmdType;
 
 /* ============================================================
@@ -647,6 +650,15 @@ typedef struct {
     int32_t auto_on_init;   /* 0/1 */
 } SmcConfigHomingOrderExReq;
 typedef struct { int32_t ret_code; } SmcConfigHomingOrderExRes;
+
+/* SMC_SET_ORIGIN_HERE (0x0066) — v1.5 (2026-08-28): 当前位设为激活 WCS 零点 */
+/* main 时代 SetZero 语义: work_offsets[当前WCS] = 当前 G53 坐标 (纯偏置写, 无运动) */
+/* 之后回零 (m35) 物理回到该点。G53 模态拒绝 (ret_code=-1) */
+typedef struct {
+    uint8_t z_letter;   /* 轴字母; '\0' = 全部轴 */
+    uint8_t _pad[3];
+} SmcSetOriginHereReq;
+typedef struct { int32_t ret_code; } SmcSetOriginHereRes;
 
 /* SMC_HOMING_TRIGGER (0x005D): 触发回零 */
 typedef struct {

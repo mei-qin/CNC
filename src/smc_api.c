@@ -1000,11 +1000,17 @@ int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
         printf("[SMC_API] ConfigHoming timeout_ms=%d 越界 [1000, 60000]\n", timeout_ms);
         return -1;
     }
+    // v1.5: search_speed 语义激活 — m35 回零速度 (>0 固定 mm/s; 0 = RT 用轴 max_speed)
+    if (search_speed < 0.0) {
+        printf("[SMC_API] ConfigHoming search_speed=%.2f 必须 >= 0 (0=轴 max_speed)\n",
+               search_speed);
+        return -1;
+    }
 
     HomingAxisCfg_t *cfg = &g_homing_cfg.axis[idx];
     cfg->enabled            = 1;
     cfg->method             = method;
-    cfg->search_speed_mm_s  = (search_speed > 0.0) ? search_speed : 10.0;
+    cfg->search_speed_mm_s  = search_speed;
     cfg->creep_speed_mm_s   = (creep_speed > 0.0) ? creep_speed : 1.0;
     cfg->direction          = direction;
     cfg->timeout_ms         = timeout_ms;
@@ -1307,6 +1313,52 @@ int SMC_HomeOrder(const char *axis_letters)
         printf("[SMC_API] HomeOrder worker 启动失败 (上一次回零未结束?)\n");
         return -1;
     }
+    return 0;
+}
+
+// v1.5 (2026-08-28): 当前位置设为原点 — main 时代 api_set_zero 语义 (WCS 偏置)。
+// 把当前激活工件坐标系 (G54..G59; G53 拒绝) 的零点定义在当前物理位置:
+//   work_offsets[wcs][axis] = 当前 G53 坐标 → 该点逻辑坐标变 0。
+// 纯 WCS 表写入 (RT 不读 work_offsets, 逻辑坐标走段快照 active_offset),
+// 无 homing_shift/PDO 参与, 无撕裂窗口。设原点后回零 (m35) 物理回到这里。
+// axis_letter: 单轴字母 或 SMC_AXIS_ALL 全轴。
+int SMC_SetOriginHere(char axis_letter)
+{
+    if (g_coord_mgr.current_coord == COORD_G53) {
+        printf("[SMC_API] SetOriginHere: 当前 G53 模态, 先激活工件坐标系 (G54..G59)\n");
+        return -1;
+    }
+    int idx = -2;   /* -2 = ALL */
+    if (axis_letter != SMC_AXIS_ALL) {
+        idx = axis_lookup(axis_letter);
+        if (idx < 0) {
+            printf("[SMC_API] SetOriginHere 轴 '%c' 未配置\n",
+                   toupper((unsigned char)axis_letter));
+            return -1;
+        }
+    }
+    if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
+        printf("[SMC_API] SetOriginHere 系统运行中, 先 Abort\n");
+        return -1;
+    }
+    if (!homing_mutex_ok()) {
+        printf("[SMC_API] SetOriginHere 与 Homing/SafeLift/JOG 冲突\n");
+        return -1;
+    }
+
+    int coord_idx = g_coord_mgr.current_coord - 1;
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (idx >= 0 && i != idx) continue;
+        g_coord_mgr.work_offsets[coord_idx][i] = g_coord_mgr.current_g53_pos[i];
+        g_coord_mgr.current_logical_pos[i] = 0.0;
+    }
+    /* plan_cursor 是机械空间, 不随 WCS 改动 — 同步到当前实际位即可 */
+    api_sync_planner_cursor();
+
+    EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0045, g_coord_mgr.current_coord,
+                     "origin set here (WCS zero at current pos)");
+    printf("[SMC_API] SetOriginHere: G%d 零点已设于当前位%s\n",
+           coord_idx + 54, (idx < 0) ? " (全部轴)" : "");
     return 0;
 }
 

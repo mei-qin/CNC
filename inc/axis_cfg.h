@@ -236,9 +236,9 @@ extern SafeLiftConfig_t g_safe_lift_cfg;  // 定义在 smc_api.c
 // 错误恢复: FAULT 状态 + alarm + all-or-nothing 回滚 (HomeAll 串行第 N 轴失败时回滚前 N-1 轴)
 typedef struct {
     int    enabled;             // 0/1: 该轴是否参与回零
-    int    method;              // 35 (v1 唯一支持) / 1-19 (v2 预留)
-    double search_speed_mm_s;   // method 1-19 寻零速度 (v1 忽略)
-    double creep_speed_mm_s;    // method 1-19 蠕动速度 (v1 忽略)
+    int    method;              // 35 (v1.5 = 回 WCS 零点运动) / 1-19 (v2 预留开关回零)
+    double search_speed_mm_s;   // v1.5: m35 回零速度 (>0 固定 mm/s; 0 = 轴 max_speed)
+    double creep_speed_mm_s;    // method 1-19 蠕动速度 (v2 用)
     int    direction;           // +1 / -1 (method 1-19 寻零方向)
     int    timeout_ms;          // 默认 10000
     int    home_switch_pdo_bit; // method 1-19 DI bit 偏移 (v2 用)
@@ -388,6 +388,11 @@ typedef struct{
     int     homing_pending_fresh;      // P0-1 fix: 本 cycle 刚进 PENDING=1, 供 RT 延迟一周期再
                                        // 提升到 RUNNING, 保证 PENDING(1) 在 1ms CSV 至少记录一次
                                        // (与 safe_lift_pending_fresh 同构; 否则 0->1->2 同周不可见)
+    // ---- v1.5 (2026-08-28) m35 回零运动块状态 (RT 单写者, target Non-RT 触发时写) ----
+    // m35 语义: 回当前激活 WCS 逻辑零点的物理运动 (G54 偏置默认 0 时 = 上电锚定
+    // 机械零点)。RT 推进 current_cmd_pos (仿 JOG 斜坡防速度阶跃)。
+    double  homing_target_pos;         // 回零目标 (机械坐标 mm; = WCS 零点的 G53 投影)
+    double  homing_cur_step_mm;        // 斜坡当前步长 (mm/cycle), promote 时清 0
 
     // ---- P0-1 JOG: RT 协同字段 (与 SafeLift/Homing 同模式) ----
     // JOG: 持续运动直到 SMC_JogStop 或撞软限位. method 35 前置依赖 (手动定位参考位)

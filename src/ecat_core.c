@@ -621,6 +621,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     } else {
                         g_interpolator.homing_state = 2;  /* RUNNING */
                         g_interpolator.time_scale   = 0.0;  /* 冻结段消费 */
+                        /* v1.5 m35: 运动斜坡清零 (RT 运动块据此起步, 防 promote 前
+                         * 残留上次步长造成速度阶跃) */
+                        g_interpolator.homing_cur_step_mm = 0.0;
                         /* event 推送由 Non-RT axis_homing 入口负责 (避免 RT 内重复推) */
                     }
                 }
@@ -767,11 +770,65 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 ms_budget = 0.0;
             }
 
-            /* P0-1 Homing: RUNNING 期间冻结段消费 (axis_homing 在 Non-RT 做 SDO, 这里只冻结)
-             * @Danger: 仅 time_scale=0 + ms_budget=0, 无 math.h/malloc/printf */
+            /* P0-1 Homing: RUNNING 期间冻结段消费 (m35 运动块驱动, 其余 method
+             * 的 SDO/轮询由 Non-RT axis_homing 完成, 这里只冻结)
+             * @Danger: 仅 + - * / 比较, 无 math.h/malloc/printf; EventLogger 常量串。 */
             if (g_interpolator.homing_state == 2) {
                 g_interpolator.time_scale = 0.0;
                 ms_budget = 0.0;
+
+                /* v1.5 (2026-08-28) m35 回零运动块: 朝当前激活 WCS 逻辑零点
+                 * (homing_target_pos, G54 偏置默认 0 时 = 上电锚定机械零点)
+                 * 推进 current_cmd_pos (物理回到"原点"), 驱动器全程保持 CSP (不切 HM)。
+                 * 斜坡仿 JOG (max_acc 爬升, 防速度阶跃冲 0x60F4); 到达锁 target → DONE(3)。
+                 * 速度 = 档案 homing_speed (>0 固定 mm/s; ≤0 用轴 max_speed)。
+                 * 报警即中止 (镜像 F1): 真实跟随误差由 case-3 监控捕获 (m35 不豁免,
+                 * 见 F7 门), 置 alarm 后本块下周期检测到 → FAULT(4) 停止推进。 */
+                if (g_interpolator.homing_method_in_use == 35) {
+                    int h = g_interpolator.homing_axis_idx;
+                    if (h >= 0 && h < AXIS_NUM) {
+                        if (atomic_load_explicit(&g_sys_alarm_state,
+                                                 memory_order_acquire) != 0) {
+                            g_interpolator.homing_state = 4;
+                            g_interpolator.homing_cur_step_mm = 0.0;
+                            EventLogger_Push(SEVERITY_ALARM,
+                                             (uint8_t)g_interpolator.homing_source,
+                                             0x0008, h,
+                                             "homing aborted by system alarm");
+                        } else {
+                            double pos = g_axis[h].current_cmd_pos;
+                            double tgt = g_interpolator.homing_target_pos;
+                            double speed = g_homing_cfg.axis[h].search_speed_mm_s;
+                            if (!(speed > 0.0)) speed = g_axis[h].max_speed;
+                            if (speed > 0.0) {
+                                double dir = (tgt > pos) ? 1.0 : -1.0;   /* 朝目标 */
+                                double target_step = dir * speed / 1000.0;
+                                double accel_step  = g_axis[h].max_acc / 1000000.0;
+                                double cur = g_interpolator.homing_cur_step_mm;
+                                double delta = target_step - cur;
+                                if (delta > accel_step)       cur += accel_step;
+                                else if (delta < -accel_step) cur -= accel_step;
+                                else                          cur  = target_step;
+                                g_interpolator.homing_cur_step_mm = cur;
+                                double new_pos = pos + cur;
+                                /* 到达: 下一步将越过目标 → 锁定 target, DONE */
+                                if ((new_pos - tgt) * dir >= 0.0) {
+                                    g_axis[h].current_cmd_pos = tgt;
+                                    g_interpolator.current_pos[h] = tgt;
+                                    g_interpolator.homing_state = 3;   /* DONE */
+                                    g_interpolator.homing_cur_step_mm = 0.0;
+                                    EventLogger_Push(SEVERITY_INFO,
+                                                     (uint8_t)g_interpolator.homing_source,
+                                                     0x0006, 3,
+                                                     "homing done (m35, at origin)");
+                                } else {
+                                    g_axis[h].current_cmd_pos = new_pos;
+                                    g_interpolator.current_pos[h] = new_pos;
+                                }
+                            }
+                        }
+                    }
+                }
             }
 
             /* P0-1 JOG: ACTIVE 期间每 cycle 增量 + 软限位撞停 (method 35 前置依赖)
@@ -1418,7 +1475,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     }
 
                     // 跟随误差监控：直接从驱动器 TxPDO 0x60F4 读取（驱动器自身计算，无坐标系偏移风险）
-                    {
+                    // F7 (2026-08-28): 真回零窗口豁免 — 仅未来 method 1-19 (HM 开关回零):
+                    // HM 模式下驱动器重定义坐标系, 0x60F4 变成"残留目标 vs 新坐标"的
+                    // 全量伪偏差 (X 回零实测伪偏差 = 轴绝对位置, 必超硬限而轴没动)。
+                    // v1.5 m35 (RT 运动块, 驱动器全程 CSP 不切模式) 无伪偏差,
+                    // 监控保持激活 — m35 回零途中的真实堵转照样要抓。
+                    if (g_interpolator.homing_state == 2
+                        && g_interpolator.homing_axis_idx == i
+                        && g_interpolator.homing_method_in_use != 35) {
+                        g_axis[i]._follow_err_timer = 0;
+                    } else {
                         int32_t follow_err=axis_pdo_read_follow_err(g_axis[i].slave_ids[0]);
                         int32_t abs_err=follow_err<0?-follow_err:follow_err;
                         if(abs_err>FOLLOW_ERR_MAX_PULSE){
@@ -1440,7 +1506,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         }else{
                             g_axis[i]._follow_err_timer=0;
                         }
-                    }
+                    }   /* F7 else (非回零窗口) 结束 */
 
                     break;
 
@@ -1464,11 +1530,15 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     break;
                 }
 
-                /* P0-1 Homing: 该轴 RUNNING 时跳过 CSP PDO 写入, 让驱动器内部 homing 接管
-                 * (CiA402 mode 6 + method 35, axis_homing Non-RT 已触发)
+                /* P0-1 Homing: 该轴 RUNNING 时跳过 CSP PDO 写入 — 仅限驱动器侧接管
+                 * 的 method (未来 1-19 真 HM 开关回零需写保护窗口)。
+                 * v1.5 (2026-08-28) m35 例外: 回零运动块在 RT 推进 current_cmd_pos,
+                 * 驱动器保持 CSP, 必须继续写 PDO (顺带解决 pre-align 实机 PDO 不下发的
+                 * 架构债 — 临时 homing_shift 现在能实时生效)。
                  * JOG 不需要门: CSP 持续写 current_cmd_pos 增量即是 JOG 的实现 */
                 if (g_interpolator.homing_state == 2
-                    && g_interpolator.homing_axis_idx == i) {
+                    && g_interpolator.homing_axis_idx == i
+                    && g_interpolator.homing_method_in_use != 35) {
                     continue;
                 }
 

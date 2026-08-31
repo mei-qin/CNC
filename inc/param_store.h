@@ -78,11 +78,12 @@ typedef struct {
     int    gs_tol_pulse;
     int    gs_max_err_pulse;
     int    gs_err_time_ms;
-    /* 回零 (立即级, 仅档案) */
+    /* 回零 (v1.5: m35 = 回 WCS 零点运动) */
     int    hm_enable;
     int    hm_method;
     int    hm_direction;
     int    hm_timeout_ms;
+    double hm_speed;            /* 回零速度 mm/s; >0 固定值, 0 = 轴 max_speed */
 } ProfileAxis_t;
 
 /* ---- 全局档案 ---- */
