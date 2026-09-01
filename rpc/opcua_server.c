@@ -57,7 +57,7 @@
 /* 程序根目录 (Syntec 生态同款: 共享文件系统 + 路径触发加载):
  * 上位把 .nc 写入共享目录 (SMB), Load 传 Windows 形式路径/裸文件名时
  * 取 basename 在此目录下回退查找。环境变量 SMC_PROGRAM_DIR 可覆盖。 */
-#define CNC_PROGRAM_DIR_DEFAULT "/home/meiqin/nc"
+#define CNC_PROGRAM_DIR_DEFAULT "/home/server/nc"
 
 /* ---- 契约机器状态枚举 (契约 §1) ---- */
 #define CNC_ST_IDLE    0
