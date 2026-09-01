@@ -371,14 +371,30 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // 检查 DI 互锁 + g_sys_alarm_state, 异常时立即关激光 + 锁存 emergency_kill.
             // 必须早于段消费环: 段消费时会调 laser_rt_apply_aux, 如果 emergency_kill=1
             // 则 apply_aux 屏蔽 seg 推进, 保证段消费不会重新打开激光.
+            /* 边沿采样: safety_gate 在报警锁存期间每周期返回 1, 事件仅在 kill
+             * 新锁存或互锁位图变化时推一次 — 否则 1ms/条 × 1024 环容 ≈ 1s 冲掉
+             * 整个事件环, 真正的首因报警 (如驱动器 SW_ERROR) 被挤出, UI 只见
+             * 一墙互锁警告, 排障方向被误导。 */
+            int     laser_was_killed = g_laser_rt.emergency_kill;
+            uint16_t laser_prev_mask = g_laser_rt.interlock_status;
             if (laser_rt_safety_gate()) {
                 // DI 互锁异常触发系统软停机 (与跟随误差超差同等级别)
                 // safety_gate 内部已 set g_laser_rt, 这里只需保证运动也停车
                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
-                /* P1-b: laser safety 互锁报警事件 (rt_log 风格, 常量 message) */
-                EventLogger_Push(SEVERITY_ALARM, SOURCE_LASER, 0x0010,
-                                 (int32_t)g_laser_rt.interlock_status,
-                             "laser safety interlock triggered (door/estop/alm/water/gas)");
+                if (!laser_was_killed
+                    || g_laser_rt.interlock_status != laser_prev_mask) {
+                    /* P1-b: 互锁报警事件 — 位图==0x8000 是系统报警联动 (跟随者,
+                     * 非激光自身故障), 文案分开避免误导排障方向 (常量串, RT 安全) */
+                    if (g_laser_rt.interlock_status == 0x8000) {
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_LASER, 0x0010,
+                                         (int32_t)g_laser_rt.interlock_status,
+                                         "laser killed by system alarm (bit15, follower)");
+                    } else {
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_LASER, 0x0010,
+                                         (int32_t)g_laser_rt.interlock_status,
+                                     "laser safety interlock triggered (door/estop/alm/water/gas)");
+                    }
+                }
 
                 /* P0-3 SafeLift: 报警路径自动触发抬升 (若配置 auto_on_alarm=1)
                  * 设计: 与 emergency_kill 同周期触发, RT 后续在安全点 (HOLD_PAUSED)
@@ -442,18 +458,26 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 int hpending = atomic_load_explicit(&g_interpolator.homing_pending_req,
                                                      memory_order_acquire);
                 if (hpending) {
+                    /* 互斥源三合一: SafeLift / JOG / 悬挂未执行的报警复位。
+                     * 复位悬挂期拒绝新握手: 复位执行门 (下方 op_ready+静止) 未满足时,
+                     * 新握手与本复位在状态机上互踩 (kickoff timeout 根因 B)。 */
                     int mutex_ok = (g_interpolator.safe_lift_state == 0
+                                    && g_interpolator.alarm_reset_request == 0
                                     && atomic_load_explicit(&g_interpolator.jog_active_req,
                                                             memory_order_acquire) == 0);
                     if (g_interpolator.homing_state == 0 && mutex_ok) {
                         g_interpolator.homing_state = 1;  /* PENDING */
                         g_interpolator.homing_pending_fresh = 1;  /* P0-1 fix: PENDING 至少可见一周期 */
+                        atomic_store_explicit(&g_interpolator.homing_pending_req, 0,
+                                              memory_order_release);
                         EventLogger_Push(SEVERITY_INFO,
                                          g_interpolator.homing_source,
                                          0x0006, 1, "homing pending");
                     }
-                    atomic_store_explicit(&g_interpolator.homing_pending_req, 0,
-                                          memory_order_release);
+                    /* mutex 拒绝时保留 pending_req, 下周期重试 — 互斥源 (JOG/SafeLift/
+                     * 报警复位) 消失后握手自然收敛, 不再静默吞请求 (kickoff timeout
+                     * 根因 A)。放弃时由 Non-RT 调用方撤回 (axis_homing_multi 超时
+                     * 路径 store 0), 不会泄漏。 */
                 }
             }
 
@@ -492,16 +516,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         || g_interpolator.safe_lift_state == 1) {
                         g_interpolator.safe_lift_state = 0;  /* → IDLE */
                     }
-                    /* P0-1 Homing: alarm_reset 协同 (同 SafeLift 模式)
-                     *   state==2 (RUNNING): 拒绝清 (axis_homing 在 Non-RT 跑, 不能中断)
-                     *   state==3 DONE / state==1 PENDING / state==4 FAULT: 清 → IDLE */
-                    if (g_interpolator.homing_state == 2) {
-                        /* 同 SafeLift: 不清 alarm_reset_request, 跳过本周期 */
-                    } else if (g_interpolator.homing_state == 3
-                               || g_interpolator.homing_state == 1
-                               || g_interpolator.homing_state == 4) {
-                        g_interpolator.homing_state = 0;  /* → IDLE */
-                    }
+                    /* P0-1 Homing: alarm_reset 协同 — 残留 homing_state 清理已移入
+                     * 下方执行门内。原位置在门外: 悬挂未执行的复位请求每周期回打
+                     * 新鲜 PENDING(1), 吞掉刚发起的握手 = kickoff timeout 根因 B。 */
                     /* P0-1 JOG: alarm_reset 时强停 JOG (alarm 必停车) */
                     if (atomic_load_explicit(&g_interpolator.jog_active_req,
                                               memory_order_acquire) != 0) {
@@ -510,6 +527,13 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_interpolator.jog_axis_idx = -1;
                     }
                 if(g_all_axis_op_ready && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)){
+                    /* P0-1 Homing: 残留状态清理 (仅复位真正执行时回打):
+                     * DONE(3) / FAULT(4) / 迟到 PENDING(1) → IDLE;
+                     * RUNNING(2) 拒绝清 (axis_homing 在 Non-RT 跑, 不能中断)。 */
+                    if (g_interpolator.homing_state != 0
+                        && g_interpolator.homing_state != 2) {
+                        g_interpolator.homing_state = 0;  /* → IDLE */
+                    }
                     g_interpolator.is_moving = 0;
                     g_interpolator.is_waiting_mcode = 0;
                     g_interpolator.time_scale = 1.0;
@@ -1384,6 +1408,23 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
                 switch(g_axis[i].cia_step){
                     case 0:
+                    /* F8 (2026-09-01): 使能握手期故障路由 — case 0/1/2 原先无 SW_ERROR
+                     * 检测: 驱动器带锁存故障重启 (Z 关机序列坠轴/抱闸类锁存故障) 时,
+                     * CiA402 Fault 态下 CW_SHUTDOWN(0x06) 无效, case 0 永远等不到
+                     * SW_SHUTDOWN_RDY, g_all_axis_op_ready 悬置, 现场只能驱动器断电
+                     * 清除 RAM 故障 (商业控制器如新代均为故障复位→重新使能, 无需断电)。
+                     * 统一路由到 case 4 复位环: FAULT_RESET 至故障位清除后回 case 0 全握手。
+                     * @Danger: 整数比较 + 既有 EventLogger ring 写, 无 malloc/printf/math。 */
+                    if(sw & SW_ERROR){
+                        g_axis[i].cia_step = 4;
+                        g_axis[i].cia_step_delay = 0;
+                        g_axis[i]._follow_err_timer = 0;
+                        all_ready_flag = 0;
+                        output_cw = CW_FAULT_RESET;
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
+                                         "drive fault at enable handshake, FAULT_RESET sent");
+                        break;
+                    }
                     output_cw=CW_SHUTDOWN;
                     if(g_axis[i].cia_step_delay==1){
                         int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
@@ -1398,6 +1439,17 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     break;
 
                     case 1:
+                    /* F8: 同 case 0 — 握手中途锁存故障路由到 case 4 复位环 */
+                    if(sw & SW_ERROR){
+                        g_axis[i].cia_step = 4;
+                        g_axis[i].cia_step_delay = 0;
+                        g_axis[i]._follow_err_timer = 0;
+                        all_ready_flag = 0;
+                        output_cw = CW_FAULT_RESET;
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
+                                         "drive fault at enable handshake, FAULT_RESET sent");
+                        break;
+                    }
                     output_cw=CW_SWITCH_ON;
                     if(g_axis[i].cia_step_delay==1){
                         int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
@@ -1414,6 +1466,17 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     break;
 
                     case 2:
+                    /* F8: 同 case 0 — 握手中途锁存故障路由到 case 4 复位环 */
+                    if(sw & SW_ERROR){
+                        g_axis[i].cia_step = 4;
+                        g_axis[i].cia_step_delay = 0;
+                        g_axis[i]._follow_err_timer = 0;
+                        all_ready_flag = 0;
+                        output_cw = CW_FAULT_RESET;
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
+                                         "drive fault at enable handshake, FAULT_RESET sent");
+                        break;
+                    }
                     output_cw=CW_ENABLE_OP;
                     if(g_axis[i].cia_step_delay==1){
                         int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];

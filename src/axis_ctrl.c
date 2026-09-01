@@ -1581,7 +1581,12 @@ void axis_homing(int axis_idx)
     double ccp_snap = g_axis[axis_idx].current_cmd_pos;
 
     // ④ 设 state=RUNNING (RT 协同门已开, RT 跳过该轴 CSP PDO 写)
-    g_interpolator.homing_state = 2;
+    //    FAULT(4) 不覆写: 防止任何调用路径在握手失败宣判 FAULT 后经本入口
+    //    静默自愈 (kickoff timeout "报警但机床正常"矛盾的根治点;
+    //    正常路径 state∈{0,1,2,3} 不受影响)
+    if (g_interpolator.homing_state != 4) {
+        g_interpolator.homing_state = 2;
+    }
     __sync_synchronize();
 
     // ⑤⑥ v1.5: m35 = RT 运动块回零 (无 SDO);
@@ -1643,9 +1648,12 @@ void axis_homing(int axis_idx)
                          "homing running (sim, software anchor only)");
     }
 
-    // ⑥ 轮询双驱 bit12 同步 + cancel 检测 + SW_ERROR (仅实机; sim 无 bit12,
-    //    轮询只会白等 timeout 后误判 FAULT)
-    if (hw_homing) {
+    // ⑥ 轮询双驱 bit12 同步 + cancel 检测 + SW_ERROR (仅实机真开关回零 method 1-19)。
+    //    排除 m35: CSP 模式下 bit12(homing attained) 无定义 — 依赖驱动器恰好回 1
+    //    才不卡超时 (若回 0 会把 m35 的成功 DONE 翻成超时 FAULT + 回滚);
+    //    m35 的完成/故障判定已由其轮询环 (state 3/4 + sys alarm) 全覆盖。
+    //    sim 无 bit12, 轮询只会白等 timeout 后误判 FAULT, 同样排除。
+    if (hw_homing && method != 35) {
         int timeout = timeout_ms / 100;
         while (timeout-- > 0) {
             osal_usleep(100000);
@@ -1800,25 +1808,75 @@ int axis_homing_multi(const int *axis_indices, int count, int source)
         atomic_store_explicit(&g_interpolator.homing_pending_req, 1,
                               memory_order_release);
 
-        // 等 RT 把 state 推到 RUNNING (axis_homing 入口设)
-        // 放宽到 2s: 含 fresh 延迟 1 cycle + promote, 且 wait 采样 1ms 有抖动.
+        // 等 RT 把 state 推到 RUNNING(2) 或 DONE(3)。DONE 也是成功:
+        // 零偏移回零 (轴已在原点, 如重复回零) 时 m35 运动块在 promote 后
+        // 1 周期内 2→3, state==2 只存在约 1ms, 1ms 采样会漏采 → 假超时
+        // (kickoff timeout 报警但机床"正常"的主触发器)。
+        // RT 侧 mutex 拒绝 (JOG/SafeLift/报警复位悬挂) 时保留 pending_req
+        // 逐周期重试, 2s 内互斥源消失即自然收敛; 仍超时 = 互斥源持续在位
+        // 或 RT 异常。
+        int kickoff_fault = 0;
         int wait_t = 2000;  // 2s 超时
-        while (g_interpolator.homing_state != 2 && wait_t-- > 0) {
+        while (g_interpolator.homing_state != 2
+               && g_interpolator.homing_state != 3
+               && wait_t-- > 0) {
             osal_usleep(1000);
         }
-        if (g_interpolator.homing_state != 2) {
-            // RT 没及时启动 (异常), 立即 FAULT
-            g_interpolator.homing_state = 4;
-            EventLogger_Push(SEVERITY_ALARM, source, 0x0008, idx,
-                             "homing RT kickoff timeout");
-            // 触发全量回滚 (下面 fault 检测会处理)
+        if (g_interpolator.homing_state != 2
+            && g_interpolator.homing_state != 3) {
+            /* 撤回握手 — 防止放弃后 RT 迟到消费 pending_req 造成无主
+             * RUNNING (无人轮询收尾的运动块):
+             * ① 静默期: 作废请求 + 等 ≥2 个 RT 周期, 在途消费落定
+             * ② 按 state 分类: 2/3=迟到成功走正常路径; 1=卡 PENDING 用
+             *    cancel 拉回 IDLE (RT 同周期序 cancel 先于 1→2 提升,
+             *    fresh 机制保证提升前 PENDING 至少可见一周期, cancel 必赢);
+             *    0=请求从未被消费, 干净放弃
+             * ③ cancel 与提升的残余竞争若产生 2/3 → 仍按迟到成功处理
+             *    (axis_homing 恢复监督), 不丢运动。 */
+            atomic_store_explicit(&g_interpolator.homing_pending_req, 0,
+                                  memory_order_release);
+            osal_usleep(2000);  // 静默期: 2 RT cycles
+            if (g_interpolator.homing_state == 1) {
+                atomic_store_explicit(&g_interpolator.homing_cancel_req, 1,
+                                      memory_order_release);
+                int cw = 50;  // 50ms cancel 确认窗
+                while (cw-- > 0
+                       && atomic_load_explicit(&g_interpolator.homing_cancel_req,
+                                               memory_order_acquire) != 0
+                       && g_interpolator.homing_state == 1) {
+                    osal_usleep(1000);
+                }
+                // 兜底自清: RT 异常未消费时不悬挂 (下次握手不被旧 cancel 吞)
+                atomic_store_explicit(&g_interpolator.homing_cancel_req, 0,
+                                      memory_order_release);
+            }
+            if (g_interpolator.homing_state != 2
+                && g_interpolator.homing_state != 3) {
+                /* 真故障: FAULT + 系统报警, 不再调 axis_homing。
+                 * 原实现此处宣判 FAULT(4) 后仍无条件调 axis_homing, 其
+                 * 入口 ④ 覆写 state=2 把 FAULT 静默抹掉 — 报警孤儿事件 +
+                 * 机床"表现正常"的自愈矛盾根源。回滚由下方检测统一处理。 */
+                g_interpolator.homing_state = 4;
+                EventLogger_Push(SEVERITY_ALARM, source, 0x0008, idx,
+                                 "homing RT kickoff timeout");
+                atomic_store_explicit(&g_sys_alarm_state, 1,
+                                      memory_order_release);
+                printf("[Homing] %s RT kickoff 握手超时 (2s), FAULT\n",
+                       g_axis[idx].axis_name);
+                kickoff_fault = 1;
+            }
         }
 
-        // 调 axis_homing 同步阻塞
-        axis_homing(idx);
+        // 握手已开 (或零偏移迟到完成) 才执行回零; kickoff FAULT 跳过
+        if (g_interpolator.homing_state == 2
+            || g_interpolator.homing_state == 3) {
+            axis_homing(idx);
+        }
 
         // ③ 任一轴 FAULT → 回滚所有已成功轴
-        if (g_interpolator.homing_state == 4) {
+        //    kickoff_fault 本地标志优先: FAULT 置 4 后到本检测之间的 EventLogger/
+        //    printf 让出点理论上可被 RT alarm_reset 路径清回 0, 局部变量免竞争
+        if (kickoff_fault || g_interpolator.homing_state == 4) {
             printf("[Homing] HomeAll 第 %d 轴 (%s) FAULT, 触发全量回滚\n",
                    i, g_axis[idx].axis_name);
             for (int j = 0; j <= i && j < AXIS_NUM; j++) {
