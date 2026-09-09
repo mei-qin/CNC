@@ -505,6 +505,39 @@ static int handle_client_request(int client_fd)
         resp_payload_len = sizeof(SmcConfigLaserCoupleTableRes);
         break;
     }
+    case SMC_CMD_CONFIG_LASER_GAS: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserGasReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserGasReq *req = (SmcConfigLaserGasReq *)payload;
+        SmcConfigLaserGasRes *res = (SmcConfigLaserGasRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserGas(req->ch_ao_pressure, req->pressure_max_bar);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserGasRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_MICRO_JOINT: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserMicroJointReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserMicroJointReq *req = (SmcConfigLaserMicroJointReq *)payload;
+        SmcConfigLaserMicroJointRes *res = (SmcConfigLaserMicroJointRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserMicroJoint(req->mj_ratio);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserMicroJointRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_PIERCE_TABLE: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserPierceTableReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserPierceTableReq *req = (SmcConfigLaserPierceTableReq *)payload;
+        SmcConfigLaserPierceTableRes *res = (SmcConfigLaserPierceTableRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserPierceTable(req->steps, req->count);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserPierceTableRes);
+        break;
+    }
     case SMC_CMD_SET_OPTIONAL_STOP_ENABLE: {
         if (req_hdr.data_len < sizeof(SmcSetOptionalStopEnableReq)) {
             res_hdr.err_code = SMC_ERR_PARAM; break;
@@ -625,6 +658,43 @@ static int handle_client_request(int client_fd)
         SMC_GetProgramStructure(res);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcGetProgramStructureRes);
+        break;
+    }
+
+    /* ===== 断点续切 Phase 1 (2026-09-08): ResumeSearch / ResumeStart / GetResume ===== */
+    case SMC_CMD_RESUME_SEARCH: {
+        if (req_hdr.data_len < sizeof(SmcResumeSearchReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcResumeSearchReq *req = (SmcResumeSearchReq *)payload;
+        printf("[rpc] ResumeSearch: target_line=%d\n", (int)req->target_line);
+        SmcResumeSearchRes *res = (SmcResumeSearchRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = SMC_ResumeSearch(req->target_line);
+        res->target_line = g_parser_ctrl.resume_target_line;
+        memcpy(res->target_pos, g_parser_ctrl.resume_target_pos,
+               sizeof(double) * AXIS_NUM);
+        printf("[rpc] ResumeSearch: 返回码=%d (0=冻结, -3=非G00边界, -5=行不存在)\n",
+               res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcResumeSearchRes);
+        break;
+    }
+    case SMC_CMD_RESUME_START: {
+        printf("[rpc] ResumeStart\n");
+        SmcResumeStartRes *res = (SmcResumeStartRes *)resp_buf;
+        res->ret_code = SMC_ResumeStart();
+        printf("[rpc] ResumeStart: 返回码=%d\n", res->ret_code);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcResumeStartRes);
+        break;
+    }
+    case SMC_CMD_GET_RESUME: {
+        /* 无 Req, Res = SmcGetResumeRes */
+        SmcGetResumeRes *res = (SmcGetResumeRes *)resp_buf;
+        SMC_GetResumeState(res);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetResumeRes);
         break;
     }
     case SMC_CMD_CLEAR_ALARM: {
@@ -950,6 +1020,10 @@ static int kernel_init(const char *iface)
     SMC_ConfigPlannerParams(0.05, 500.0);
     SMC_ConfigGantrySyncAlarm('Y', 1, 1000, 8000, 100);
     SMC_ConfigSoftLimit('Z', 1, -500.0, 200.0);
+    /* P0 (2026-09-02): 旋转轴软限位 — 与 main.c / param_store.c ps_default_profile
+     * 三处同步, 值以 param_store.c 为单一权威 (C±730°/B±110°) */
+    SMC_ConfigSoftLimit('C', 1, -730.0, 730.0);
+    SMC_ConfigSoftLimit('B', 1, -110.0, 110.0);
 
     /* 7. 启动 EtherCAT / 仿真内核 */
     if (SMC_InitAndStart(iface) != 0) {
@@ -1047,6 +1121,14 @@ static int kernel_init_hw(const char *iface)
                              tool_off, pivot_off);
     }
 
+    /* 6.5 P0: RTCP 奇异点阈值 (0 = 显式禁用; 哨兵未填跳过 → 编译默认 30.0) */
+    if (hw->singularity_rmax != PS_TODO_D)
+        SMC_ConfigSingularityRmax(hw->singularity_rmax);
+
+    /* 6.6 P1 (2026-09-04): 双摆头链序 (置于 SMC_ConfigKinematics 之后 —
+     *    后者不写 chain_order, 但调用顺序即规范)。0=已交付默认 no-op。 */
+    SMC_ConfigKinematicsChain(hw->chain_order);
+
     /* 7. C 级规划器 (档案值; 回退默认 0.05/500) */
     if (hw->corner_tolerance > 0.0 && hw->max_centripetal_acc > 0.0)
         SMC_ConfigPlannerParams(hw->corner_tolerance, hw->max_centripetal_acc);
@@ -1056,6 +1138,12 @@ static int kernel_init_hw(const char *iface)
         if (hw->ax[i].sl_enable)
             SMC_ConfigSoftLimit(hw->axis_order[i][0], 1,
                                 hw->ax[i].sl_neg, hw->ax[i].sl_pos);
+
+    /* 8.5 P0: 旋转轴 G90 最短路径解缠绕 (ConfigAxisDynamics 已默认开,
+     *        此处应用档案显式值 — ini rot_wrap_enable=0 关闭) */
+    for (int i = 0; i < hw->axis_count && i < AXIS_NUM; i++)
+        if (hw->ax[i].dyn_type == 1)
+            SMC_ConfigRotWrapEnable(hw->axis_order[i][0], hw->ax[i].rot_wrap_enable);
 
     /* 9. 双驱龙门 (按拓扑自动发现): sync 三值来自档案;
      *    align tol 由 ppu 折算 0.05mm (派生值, 不入档案) */

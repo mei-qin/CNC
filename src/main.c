@@ -10,6 +10,7 @@
 #include "smc_api.h"
 #include "macro_eval.h"   // 宏变量环境初始化
 #include "sim_drive.h"    // g_sim_rt_cycle (RT cycle 诊断)
+#include "event_logger.h" // P0 (2026-09-02): cnc_test 事件落盘 (对齐 rpc_server 两入口)
 
 // ============================================================================
 // 动态轴坐标信息构建（安全 snprintf 拼接，防溢出）
@@ -152,6 +153,10 @@ int main(int argc, char *argv[])
     // ==========================================
     Macro_Init();
 
+    // P0 (2026-09-02): 事件持久化 — cnc_test sim 路径补齐 (rpc_server 两入口已有)。
+    // 否则 0x0024/0x0025/0x0026 等测试核验事件只进内存 ring, 不落 event_logs/。
+    EventLogger_Init();
+
     // ==========================================
     // 2. 硬件拓扑配置（字母化 API，底层自动分配房间号）
     // ==========================================
@@ -204,6 +209,10 @@ int main(int argc, char *argv[])
     SMC_ConfigPlannerParams(0.05, 500.0);
     SMC_ConfigGantrySyncAlarm('Y', 1, 1000, 8000, 100); // Y 轴龙门同步防撕裂
     SMC_ConfigSoftLimit('Z', 1, -500.0, 200.0);          // Z 轴防撞软限位 (放宽以适应RTCP逆解)
+    // P0 (2026-09-02): 旋转轴软限位 — 与 rpc_server.c kernel_init / param_store.c
+    // ps_default_profile 三处同步, 值以 param_store.c 为单一权威 (C±730°/B±110°)
+    SMC_ConfigSoftLimit('C', 1, -730.0, 730.0);          // C 轴 (允两圈冗余)
+    SMC_ConfigSoftLimit('B', 1, -110.0, 110.0);          // B 轴 (摆头行程)
 
     // ==========================================
     // 6. 启动 EtherCAT 内核

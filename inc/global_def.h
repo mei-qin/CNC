@@ -78,4 +78,11 @@ extern int32_t          g_program_total_lines;         // cache: g_current_progr
 extern int32_t          g_program_num_o_labels;        // cache: g_current_program->num_o_labels
 extern int32_t          g_program_num_n_labels;        // cache: g_current_program->num_n_labels
 
+// ---- 断点续切 Phase 1 (2026-09-08): SEARCH 重放校验状态 ----
+// parser_thread 唯一写者 (SEARCH 收尾), SMC_ResumeSearch/Start + snapshot 跨线程读。
+// g_program_resume_result: 0=未启动/进行中, 1=边界冻结成功, 2=行存在但非 G00 边界,
+//                          3=行不存在 (SEARCH 重放到 EOF 未命中)。
+extern _Atomic int      g_program_resume_ready;        // 1=SEARCH 已冻结有效边界, 可 ResumeStart
+extern _Atomic int      g_program_resume_result;       // SEARCH 完成码 (见上)
+
 #endif // GLOBAL_DEF_H

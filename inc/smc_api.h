@@ -35,6 +35,14 @@ int SMC_ConfigAxisTopology(const char* axis_name, int is_dual_drive, int master_
 // 2.配置轴的软件限位参数
 int SMC_ConfigSoftLimit(char axis_letter, int enable, double neg_limit_mm, double pos_limit_mm);
 
+// 2.1 P0: 配置旋转轴 G90 最短路径解缠绕 (wrap-to-nearest)
+// 仅对 axis_type==1 的轴有意义; 线性轴调用返回 -1
+int SMC_ConfigRotWrapEnable(char axis_letter, int enable);
+
+// 2.2 P0: 配置 RTCP 奇异点检测阈值 (R_max = 物理步长/逻辑步长 峰值)
+// rmax <= 0 显式禁用检测; 默认 30.0 (编译期 g_rtcp_singularity_rmax)
+int SMC_ConfigSingularityRmax(double rmax);
+
 // 3.配置轴的龙门同步报警参数
 int SMC_ConfigGantrySyncAlarm(char axis_letter, int enable, int32_t tolerance_pulse, int32_t max_error_pulse, int time_ms);
 
@@ -163,6 +171,28 @@ int SMC_RunLoadedProgram(void);
 int SMC_GetProgramStructure(SmcGetProgramStructureRes *out);
 
 // =======================================================
+// 断点续切 Phase 1 (2026-09-08): ResumeSearch / ResumeStart / GetResumeState
+// =======================================================
+// 典型流程: (中断发生后) GetResumeState/preview 历史选定边界行 → ResumeSearch
+//           (阻塞校验+冻结) → 操作员确认 → ResumeStart (前导重定位+续切)
+//
+// 断点续切第一步: 校验 target_line 是 G00 边界行 (轮廓进近行) 并 SEARCH 重放
+// 建立模态。阻塞至重放完成 (毫秒~百毫秒级, 5s 超时兜底)。
+// 前置: LoadProgram 已完成 + SafeLiftZ 已配置 (前导依赖) + 文件/WCS 指纹一致。
+// 返回: 0=边界已冻结 (可 ResumeStart),
+//       -1=parser 忙, -2=未 LoadProgram/指纹不符, -3=行存在但非 G00 边界,
+//       -4=SafeLiftZ 未配置, -5=行不存在 (或 M30 前/被中止), -6=搜索超时
+int SMC_ResumeSearch(int32_t target_line);
+
+// 断点续切第二步: 从冻结边界起跑。parser 从头重放, 已执行区间被跳段丢弃,
+// 边界行拦截生成重定位前导 (激光模态恢复 + SafeZ 抬升 → 安全高度平移 → Z 下降)。
+// 返回: 0=已启动, -1=未冻结 (先 ResumeSearch), -2=parser 忙, -3=指纹不符 (冻结已作废)
+int SMC_ResumeStart(void);
+
+// 查询续切状态 (ready 位 / SEARCH 结果码 / 冻结行号与目标位姿)
+void SMC_GetResumeState(SmcGetResumeRes *out);
+
+// =======================================================
 // P1-b: ClearAlarm (清除系统报警)
 // =======================================================
 // 触发 RT alarm_reset_request, RT 在安全点 (queue 空 + 驱动就绪) 时实际清。
@@ -209,6 +239,11 @@ void SMC_ConfigKinematics(int type,
                           int r1_idx, int r1_axis,
                           int r2_idx, int r2_axis,
                           double tool_off[3], double pivot_off[3]);
+
+// P1 (2026-09-04): 配置双摆头链序 (G43.5 姿态解算 + 逆解装配共用)
+// 0 = R1 外层 (已交付默认, B外C内刀具同轴) / 1 = R2 外层 (典型 C外B内腕)
+// 须在 SMC_ConfigKinematics 之后调; 非法值 (非 0/1) 忽略并 WARN
+void SMC_ConfigKinematicsChain(int chain_order);
 
 // =======================================================
 // 仿真驱动器 API (仅 g_sim_mode==1 时有效, 真实硬件模式返回错误)
@@ -278,6 +313,16 @@ int SMC_ConfigLaserCoupling(int mode, double v_thresh_mm_s);
 //   LaserCouplePoint_t t[3] = {{0,0}, {5,0.3}, {20,1.0}};
 //   SMC_ConfigLaserCoupleTable(t, 3);
 int SMC_ConfigLaserCoupleTable(const LaserCouplePoint_t *points, int count);
+
+// P0-2 (2026-09-03): 配置辅助气压 AO 通道 + 量程 (M13 P<bar> 配套)
+// ch 0-3; max_bar<=0 拒绝 (未配置即 M13 一律报警, 防呆)
+int SMC_ConfigLaserGas(uint8_t ch_ao_pressure, double pressure_max_bar);
+
+// P1-5 (2026-09-03): 微连接段功率系数 (M77 P<ratio> / OPC UA 配套), (0,1]
+int SMC_ConfigLaserMicroJoint(double mj_ratio);
+
+// P1-4 (2026-09-03): 渐进穿孔台阶表 (M76 P<级数> 配套), count 1..8
+int SMC_ConfigLaserPierceTable(const LaserPierceStep_t *steps, int count);
 
 // 6.查询激光器完整状态 (HMI 用, 镜像 RT 单写者字段 + 段级派生 + 加工统计)
 // struct-based out param: 字段过多 (14 个), out param 模式不可读, 改用 Res 结构体直接 fill

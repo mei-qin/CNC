@@ -72,6 +72,10 @@ typedef struct {
     // ---- AO 通道偏移 ----
     uint8_t ch_ao_power;        // 功率通道 (0-10V, 0-65535 = 0-power_max_w)
     uint8_t ch_ao_freq;         // 频率通道 (0-10V, 0-65535 = 0-freq_max_hz)
+    // P0-2 (2026-09-03): 辅助气压通道 (比例阀 0-10V)。pressure_max_bar<=0 = 未配置不输出。
+    // 气压 AO 不受 can_emit 门 (关光后吹气继续冷却, 切割工艺标准语义)。
+    uint8_t ch_ao_pressure;     // 气压通道 (默认 2)
+    double  pressure_max_bar;   // 量程 bar (RPC 0x0067 配置, 默认 0=禁用)
 
     // ---- 物理量程 ----
     double  power_max_w;        // 默认 3000.0
@@ -88,6 +92,17 @@ typedef struct {
     _Atomic volatile double v_thresh_mm_s;     // 低速阈值 (mm/s)
     LaserCouplePoint_t couple_table[LASER_COUPLE_TABLE_MAX];  // 查表采样点 (init 阶段配置, RT 只读)
     int    couple_table_len;    // 实际采样点数 (1..LASER_COUPLE_TABLE_MAX, init 阶段配置)
+
+    // ---- P1-5 (2026-09-03): 微连接段功率系数 ----
+    // SEG_FLAG_MICRO_JOINT 置位段: coupling ratio × mj_ratio。
+    // atomic: M77 (parser) / RPC 0x0068 / OPC UA SetMicroJoint 多写者;
+    // 入队时快照到 seg.aux_laser_mj_ratio, RT 读段级快照 (与 coupling_mode 同 B1 模式)。
+    _Atomic volatile double mj_ratio;          // (0,1], 默认 1.0 = 不衰减
+
+    // ---- P1-4 (2026-09-03): 渐进穿孔台阶表 (M76 P<级数> 逐级驱动) ----
+    // init 阶段配置 RT 只读 (与 couple_table 同模式); 默认表 1 级 {3000W, 2000Hz, 500ms}。
+    LaserPierceStep_t pierce_table[LASER_PIERCE_TABLE_MAX];
+    int    pierce_table_len;     // 1..LASER_PIERCE_TABLE_MAX
 } LaserConfig_t;
 
 typedef struct {
@@ -97,6 +112,7 @@ typedef struct {
     double power_w;             // 当前功率 (W)
     double freq_hz;             // 当前频率 (Hz)
     int    gas_select;          // 0=off, 1=N2, 2=O2, 3=Air
+    double gas_pressure_bar;    // P0-2: 辅助气压设定值 bar (M13 P, RT 消费 M 段时同步)
 
     // ---- 加工统计 (RT 单写者累计, HMI 只读) ----
     // pierce_count: M64 段 (G04 dwell) 完成时 ++, 跨程序不清零 (累计量)
@@ -119,6 +135,18 @@ typedef struct {
     // 段级配置镜像 (RT 消费段时从 seg.aux_laser_* 同步, 不再每 cycle 读 g_laser_cfg)
     int    coupling_mode_rt;    // 当前段生效的 coupling mode (0/1)
     double v_thresh_rt;         // 当前段生效的 v_thresh (mm/s)
+
+    // ---- P1-5 (2026-09-03): 微连接段功率系数镜像 ----
+    // current_seg_flags: sync_config 每段同步 seg_flags (laser_ctrl 域内可读, 勿直读 g_interpolator)
+    uint8_t current_seg_flags;  // bit0=lead_in, bit1=micro_joint (当前段)
+    double  mj_ratio_rt;        // 当前段生效的微连接系数 (M77/RPC/OPC UA 设, 入队快照)
+
+    // ---- P0-1 (2026-09-03): feedhold 光闸 gate ----
+    // @Thread-Safety: RT 单写者 (ecat_core HOLD 状态机每 cycle 赋值), 后台只读.
+    // 1 = feedhold 刹车/暂停中, 光闸 DO 强制关; 不锁存 — RESUMING 即清 0,
+    //     恢复功率由耦合表从低速 ratio 自然斜坡, 无需特判.
+    // 同时是 M64/M76 计时冻结门 (闸关不计时), 与 M0/M1 程序暂停共用 pause_request 路径.
+    int    hold_gate_off;
 } LaserRTState_t;
 
 extern LaserConfig_t  g_laser_cfg;
@@ -151,6 +179,11 @@ void laser_rt_apply_aux(const TrajectorySegment_t *seg);
 // 设计原因: parser 单线程解析远快于 RT 消费, 若 RT 读全局 g_laser_cfg.coupling_mode,
 //   M70 P1 → M70 P0 顺序覆盖会在 RT 第一次读之前完成, RT 全程看到 mode=0.
 void laser_rt_sync_config(const TrajectorySegment_t *seg);
+
+// @Context: 1ms Hard-RT Thread (M76 段加载 + 等待块台阶推进)
+// @Danger:   仅数组读 + 字段赋值.
+// P1-4 (2026-09-03): 写入第 idx 级渐进穿孔台阶 (功率/频率), idx 越界静默跳过.
+void laser_rt_apply_pierce_stage(int idx);
 
 // @Context: 1ms Hard-RT Thread (ecat_thread_rt cycle 尾, ecx_send_processdata 前)
 // @Danger:   NO BLOCKING, NO PRINTF.

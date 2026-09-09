@@ -62,6 +62,11 @@ typedef struct {
     int64_t  laser_on_time_ms;            // 累计激光开启时间 ms (enable&&shutter&&!ekill 时累加)
     uint8_t  current_seg_flags;           // 当前段工艺标记 (bit0=lead_in, bit1=micro_joint)
     int      is_piercing;                 // 是否在 G04 穿孔 dwell 中 (派生: is_waiting_mcode && current_mcode==64)
+    // ---- P0-1 (2026-09-03): feedhold 光闸 gate CSV 追踪 ----
+    // 1 = BRAKING/PAUSED 中光闸强制关 (M64/M76 计时同门冻结); 验证暂停关光语义
+    int      laser_hold_gate_off;         // RT 写, g_laser_rt.hold_gate_off
+    // ---- P0-2: 辅助气压设定追踪 (M13 P<bar>, 验证关光后吹气继续) ----
+    double   laser_gas_pressure_bar;      // RT 写, g_laser_rt.gas_pressure_bar
     // ---- P0-3 SafeLift: 抬升状态机 CSV 追踪 (验证 alarm 自动 / 手动 / DONE 路径) ----
     int      safe_lift_state;             // 0=IDLE, 1=PENDING, 2=RUNNING, 3=DONE
     double   safe_lift_z_cmd;             // Z 轴当前命令位置 (mm) = g_axis[z_idx].current_cmd_pos
@@ -172,6 +177,9 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int64_t laser_on_time_ms,
                                      uint8_t current_seg_flags,
                                      int is_piercing,
+                                     // P0-1 feedhold 光闸 gate + P0-2 辅助气压 (CSV 2 列)
+                                     int laser_hold_gate_off,
+                                     double laser_gas_pressure_bar,
                                      int safe_lift_state,
                                      double safe_lift_z_cmd,
                                      int homing_state,
@@ -206,6 +214,9 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
                                      int64_t laser_on_time_ms,
                                      uint8_t current_seg_flags,
                                      int is_piercing,
+                                     // P0-1 feedhold 光闸 gate + P0-2 辅助气压 (CSV 2 列)
+                                     int laser_hold_gate_off,
+                                     double laser_gas_pressure_bar,
                                      int safe_lift_state,
                                      double safe_lift_z_cmd,
                                      int homing_state,
@@ -261,6 +272,9 @@ static inline void sim_engine_push(uint64_t cycle, double virtual_time_ms,
     r->laser_on_time_ms     = laser_on_time_ms;
     r->current_seg_flags    = current_seg_flags;
     r->is_piercing          = is_piercing;
+    // P0-1/P0-2: feedhold 光闸 gate + 辅助气压 (CSV 2 列, 与表头顺序一致)
+    r->laser_hold_gate_off    = laser_hold_gate_off;
+    r->laser_gas_pressure_bar = laser_gas_pressure_bar;
     // P0-3 SafeLift: 抬升状态机 CSV 追踪
     r->safe_lift_state      = safe_lift_state;
     r->safe_lift_z_cmd      = safe_lift_z_cmd;

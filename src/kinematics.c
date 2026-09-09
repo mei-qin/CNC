@@ -15,7 +15,8 @@ KinConfig_t g_kin_config = {
     -1, -1,             // rot_1_idx, rot_2_idx (未配置)
     0, 0,               // rot_1_axis, rot_2_axis
     {0.0, 0.0, 0.0},    // tool_offset
-    {0.0, 0.0, 0.0}     // pivot_offset
+    {0.0, 0.0, 0.0},    // pivot_offset
+    0                   // chain_order (P1: 0=R1 外层, 已交付默认)
 };
 
 // ====================================================================
@@ -169,10 +170,17 @@ void Kinematics_Inverse(double tip_xyz[3], double rot_a, double rot_b, double ro
     switch (cfg->type) {
 
     case KIN_HEAD_HEAD:
-        // T_head = R1 * T_pivot * R2 * T_tool
-        Mat4x4_Multiply(tmp_a, R2, T_tool);        // R2 * T_tool
-        Mat4x4_Multiply(tmp_b, T_pivot, tmp_a);     // T_pivot * R2 * T_tool
-        Mat4x4_Multiply(T_head, R1, tmp_b);         // R1 * T_pivot * R2 * T_tool
+        if (cfg->chain_order == 0) {
+            // 现状链序 (已交付默认, 字节级保持): T_head = R1 * T_pivot * R2 * T_tool
+            Mat4x4_Multiply(tmp_a, R2, T_tool);        // R2 * T_tool
+            Mat4x4_Multiply(tmp_b, T_pivot, tmp_a);     // T_pivot * R2 * T_tool
+            Mat4x4_Multiply(T_head, R1, tmp_b);         // R1 * T_pivot * R2 * T_tool
+        } else {
+            // P1 (2026-09-04) chain 1: T_head = R2 * T_pivot * R1 * T_tool (C外B内腕)
+            Mat4x4_Multiply(tmp_a, R1, T_tool);        // R1 * T_tool
+            Mat4x4_Multiply(tmp_b, T_pivot, tmp_a);     // T_pivot * R1 * T_tool
+            Mat4x4_Multiply(T_head, R2, tmp_b);         // R2 * T_pivot * R1 * T_tool
+        }
         break;
 
     case KIN_TABLE_TABLE:
@@ -205,6 +213,7 @@ void Kinematics_Inverse(double tip_xyz[3], double rot_a, double rot_b, double ro
     switch (cfg->type) {
     case KIN_HEAD_HEAD:
         // T_head_0 = I * T_pivot * I * T_tool = T_pivot * T_tool
+        // (P1 注: θ=0 时 R1=R2=I, 两链序零位数值相同 — chain_order 不影响此块)
         Mat4x4_Multiply(T_head_0, T_pivot, T_tool);
         break;
     case KIN_TABLE_TABLE:
@@ -238,4 +247,167 @@ void Kinematics_Inverse(double tip_xyz[3], double rot_a, double rot_b, double ro
                      + (vec_table[i] - vec_table_0[i])
                      - (vec_head[i]  - vec_head_0[i]);
     }
+}
+
+// ====================================================================
+// P1 (2026-09-04): G43.5 刀轴矢量 → 旋转角闭式解
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: 纯数学 (sqrt/atan2/acos/fmod 可重入), 全程局部变量, 无静态状态。
+//
+// 数学 (t = 刀轴单位矢 = (0,0,-1) 内层系, u = 机床系期望刀轴, 归一化后):
+//   chain 0 (R1 外层, 刀具与 rot_2 轴线同轴): u = R_1(b)·t — 可达集为一条
+//     圆弧, rot_2 对方向中性 → n_solved=1 (rot_2 保持现值)。
+//     rot_1 绕 Y: u = (-sin b, 0, -cos b) ⇒ b = atan2(-u.x, -u.z), 需 |u.y|<EPS
+//     rot_1 绕 X: u = (0, sin b, -cos b)  ⇒ b = atan2( u.y, -u.z), 需 |u.x|<EPS
+//   chain 1 (R2 外层绕 Z): u = R_z(c)·R_1(b)·t
+//     u_z = -cos b ⇒ b = acos(clamp(-u.z)) ∈ [0,π];
+//     内层绕 Y: u = (-sin b·cos c, -sin b·sin c, -cos b) ⇒ c = atan2(-u.y, -u.x)
+//     内层绕 X: u = (-sin b·sin c,  sin b·cos c, -cos b) ⇒ c = atan2(-u.x, u.y)
+//     双解 (b,c) / (-b, c+π) 取离当前近者 (C 距差折 ±180, 复用 wrap 思想);
+//     腕奇异 |sin b|<EPS (u 竖直): c 不定 → 保持现值, n_solved=1。
+// 输出单位: 度 (直配 parser val_axis)。
+// ====================================================================
+
+#define KIN_ORIENT_EPS 1e-6
+#define KIN_RAD2DEG    (180.0 / M_PI)
+
+int Kinematics_SolveOrientation(const double u_in[3], double cur_rot1_deg, double cur_rot2_deg,
+                                double *out_rot1_deg, double *out_rot2_deg, int *n_solved)
+{
+    *n_solved = 0;
+    KinConfig_t *cfg = &g_kin_config;
+
+    if (cfg->type != KIN_HEAD_HEAD || cfg->rot_1_idx < 0 || cfg->rot_2_idx < 0)
+        return KIN_ORIENT_ERR_CONFIG;
+
+    double len = sqrt(u_in[0]*u_in[0] + u_in[1]*u_in[1] + u_in[2]*u_in[2]);
+    if (len < 1e-9) return KIN_ORIENT_ERR_UNREACH;   // 防御 (parser 已前置拦零矢量)
+    double ux = u_in[0] / len, uy = u_in[1] / len, uz = u_in[2] / len;
+
+    if (cfg->chain_order == 0) {
+        // 前提: 刀具与内层 rot_2 轴线同轴 (否则闭式解不成立)
+        if (cfg->rot_2_axis != 2 ||
+            fabs(cfg->tool_offset[0]) > 1e-9 || fabs(cfg->tool_offset[1]) > 1e-9)
+            return KIN_ORIENT_ERR_CONFIG;
+        double b;
+        if (cfg->rot_1_axis == 1) {              // 外层绕 Y
+            if (fabs(uy) > KIN_ORIENT_EPS) return KIN_ORIENT_ERR_UNREACH;
+            b = atan2(-ux, -uz);
+        } else if (cfg->rot_1_axis == 0) {       // 外层绕 X
+            if (fabs(ux) > KIN_ORIENT_EPS) return KIN_ORIENT_ERR_UNREACH;
+            b = atan2(uy, -uz);
+        } else {
+            return KIN_ORIENT_ERR_CONFIG;
+        }
+        *out_rot1_deg = b * KIN_RAD2DEG;
+        *n_solved = 1;
+        return KIN_ORIENT_OK;
+    }
+
+    // ---- chain 1: R2 外层 (必须绕 Z) ----
+    if (cfg->rot_2_axis != 2) return KIN_ORIENT_ERR_CONFIG;
+
+    double cz = -uz;
+    if (cz >  1.0) cz =  1.0;
+    if (cz < -1.0) cz = -1.0;
+    double b = acos(cz);                          // ∈ [0, π]
+
+    if (fabs(sin(b)) < KIN_ORIENT_EPS) {
+        // 腕奇异 (u 竖直): c 不定保持现值; b=180° 超软限位由 0x0024 管线兜底
+        *out_rot1_deg = (uz < 0.0) ? 0.0 : 180.0;
+        *n_solved = 1;
+        return KIN_ORIENT_OK;
+    }
+
+    double c;
+    if (cfg->rot_1_axis == 1)      c = atan2(-uy, -ux);   // 内层绕 Y
+    else if (cfg->rot_1_axis == 0) c = atan2(-ux, uy);    // 内层绕 X
+    else return KIN_ORIENT_ERR_CONFIG;
+
+    double b1 =  b * KIN_RAD2DEG;
+    double c1 =  c * KIN_RAD2DEG;
+    double b2 = -b1;
+    double c2 =  c1 + 180.0;
+
+    // C 距差折 (-180, 180] — 与 wrap_rotary_shortest 同约定
+    double d1c = fmod(c1 - cur_rot2_deg, 360.0);
+    if (d1c > 180.0) d1c -= 360.0; else if (d1c <= -180.0) d1c += 360.0;
+    double d2c = fmod(c2 - cur_rot2_deg, 360.0);
+    if (d2c > 180.0) d2c -= 360.0; else if (d2c <= -180.0) d2c += 360.0;
+    double d1 = (b1 - cur_rot1_deg) * (b1 - cur_rot1_deg) + d1c * d1c;
+    double d2 = (b2 - cur_rot1_deg) * (b2 - cur_rot1_deg) + d2c * d2c;
+
+    if (d1 <= d2) { *out_rot1_deg = b1; *out_rot2_deg = c1; }   // 平局归 b>0 解
+    else          { *out_rot1_deg = b2; *out_rot2_deg = c2; }
+    *n_solved = 2;
+    return KIN_ORIENT_OK;
+}
+
+// ====================================================================
+// P1 (2026-09-07): G68.2/G68.3 倾斜面构帧
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: 纯数学 (sqrt/sin/cos 可重入), 全程局部变量。
+// R_out 行主序, 列向量 = [u v n]:
+//   正变换 machine = R·p:  m_x = R[0]px+R[1]py+R[2]pz (逐行点乘)
+//   反变换 p = Rᵀ·d:       p_x = R[0]dx+R[3]dy+R[6]dz (取列即行)
+// ====================================================================
+int Kinematics_BuildTiltFrame(const double n_in[3], double q_deg, double R_out[9])
+{
+    double len = sqrt(n_in[0]*n_in[0] + n_in[1]*n_in[1] + n_in[2]*n_in[2]);
+    if (len < 1e-9) return -1;
+    double nx = n_in[0]/len, ny = n_in[1]/len, nz = n_in[2]/len;
+
+    // 参考轴 a: 与 n 最不平行 (n 接近 X 时用 Y, 否则用 X)
+    double ax = (fabs(nx) < 0.9) ? 1.0 : 0.0;
+    double ay = (fabs(nx) < 0.9) ? 0.0 : 1.0;
+    double az = 0.0;
+
+    // u0 = normalize(a × n)
+    double u0x = ay*nz - az*ny;
+    double u0y = az*nx - ax*nz;
+    double u0z = ax*ny - ay*nx;
+    double l0 = sqrt(u0x*u0x + u0y*u0y + u0z*u0z);
+    if (l0 < 1e-12) return -1;               // 防御: a∥n (理论上不会发生)
+    u0x /= l0; u0y /= l0; u0z /= l0;
+
+    // w = n × u0 (单位, ⊥u0)
+    double wx = ny*u0z - nz*u0y;
+    double wy = nz*u0x - nx*u0z;
+    double wz = nx*u0y - ny*u0x;
+
+    // Rodrigues (n⊥u0 退化式): u = u0·cosQ + w·sinQ
+    double q  = q_deg * DEG2RAD;
+    double cq = cos(q), sq = sin(q);
+    double ux = u0x*cq + wx*sq;
+    double uy = u0y*cq + wy*sq;
+    double uz = u0z*cq + wz*sq;
+
+    // v = n × u
+    double vx = ny*uz - nz*uy;
+    double vy = nz*ux - nx*uz;
+    double vz = nx*uy - ny*ux;
+
+    R_out[0] = ux; R_out[1] = vx; R_out[2] = nx;
+    R_out[3] = uy; R_out[4] = vy; R_out[5] = ny;
+    R_out[6] = uz; R_out[7] = vz; R_out[8] = nz;
+    return 0;
+}
+
+void Kinematics_BuildEulerXYZ(double ax_deg, double ay_deg, double az_deg, double R_out[9])
+{
+    double axr = ax_deg * DEG2RAD, ayr = ay_deg * DEG2RAD, azr = az_deg * DEG2RAD;
+    double cx = cos(axr), sx = sin(axr);
+    double cy = cos(ayr), sy = sin(ayr);
+    double cz = cos(azr), sz = sin(azr);
+
+    // R = Rz(az)·Ry(ay)·Rx(ax) 展开式
+    R_out[0] = cz*cy;
+    R_out[1] = cz*sy*sx - sz*cx;
+    R_out[2] = cz*sy*cx + sz*sx;
+    R_out[3] = sz*cy;
+    R_out[4] = sz*sy*sx + cz*cx;
+    R_out[5] = sz*sy*cx - cz*sx;
+    R_out[6] = -sy;
+    R_out[7] = cy*sx;
+    R_out[8] = cy*cx;
 }

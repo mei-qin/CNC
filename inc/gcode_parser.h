@@ -32,6 +32,8 @@ typedef struct {
                             // 由 RT 消费段时根据 seg.active_wcs 更新,保证 UI/宏与物理运动同步。
     int feed_mode;         // 进给模式: FEED_MODE_G93 或 FEED_MODE_G94
     int rtcp_enabled;      // G43.4 RTCP刀尖跟随: 0=关闭, 1=开启
+    int vector_mode;       // P1 (2026-09-04): G43.5 刀轴矢量编程 (隐含 rtcp_enabled=1)
+                           // 1=I/J/K 为刀轴单位矢量, parser 解算旋转角后走既有 RTCP 管线
     int bspline_enabled;   // B-Spline平滑模式: 0=关闭(M50 P0), 1=开启(M50 P1)
     int pending_comp_mode; // 待激活的刀补模式: COMP_OFF/G41/G42, 配合 D 代码使用
 
@@ -61,6 +63,7 @@ typedef struct {
     double laser_power_pending;     // M67 E<n> 激光功率 (W)
     double laser_freq_pending;      // M68 E<n> 激光频率 (Hz)
     int    gas_select;              // 0=off, 1=N2, 2=O2, 3=Air (M10/M11/M12)
+    double laser_gas_pressure_pending; // P0-2: M13 P<bar> 辅助气压 (比例阀, 关光后吹气继续)
 
     // ---- P2': G52 局部坐标系 ----
     // local_offset[i] 叠加在 work_offsets[modal_wcs] 之上 (Fanuc 标准):
@@ -116,10 +119,26 @@ typedef struct{
     //                                          RunLoadedProgram 时切回 RUN, 同 filepath 再跑一遍。
     // 跨线程: SMC_API 写, parser_thread 读。x86 int 写原子, 用 atomic_load(acquire) 防缓存。
     int program_mode;
+
+    // ---- 断点续切 Phase 1 (2026-09-08): resume 状态域 ----
+    // 写者: SMC_ResumeSearch/ResumeStart (is_running=0 门控下配置);
+    // 读者: parser_thread + axis_ctrl (api_push_* 跳段早返回)。
+    // 均为 int/double, 配置期与执行期无重叠 (is_running 门控), 无需 _Atomic。
+    int resume_target_line;              // 目标边界物理行号 (line_no, 1-based)
+    int resume_active;                   // RUN 重放跳段进行中 (边界前导发出时 axis_ctrl 清零)
+    int resume_boundary_hit;             // RUN: 边界行前导已发 (防同边界行多段重复拦截)
+    double resume_target_pos[AXIS_NUM];  // SEARCH 冻结: 边界 G00 的机械目标位姿 (G53)
+    // 一致性指纹 (SMC_LoadProgram 记录, ResumeSearch/ResumeStart 校验;
+    // 文件被改或 WCS 偏置被改 → 拒绝续切, 要求重新 LoadProgram)
+    long   fp_file_size;                 // -1 = 记录失败
+    long   fp_file_mtime;
+    double fp_work_offsets[6][AXIS_NUM]; // G54-G59 偏置快照
+    double fp_local_offset[AXIS_NUM];    // G52 局部偏置快照
 }ParserControl_t;
 
 #define PROGRAM_MODE_RUN     0   // SMC_RunGCodeFile / SMC_RunLoadedProgram 路径
 #define PROGRAM_MODE_PREVIEW 1   // SMC_LoadProgram 路径
+#define PROGRAM_MODE_SEARCH  2   // 断点续切: SMC_ResumeSearch 快进重放 (校验边界+建立模态, 不入队)
 
 // Function declarations for G-code parsing
 int parse_gcode_line(const char *gcode_line);

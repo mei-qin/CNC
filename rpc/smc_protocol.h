@@ -59,6 +59,15 @@ typedef struct {
     double ratio;    /* 输出比例 (0-1) */
 } LaserCouplePoint_t;
 
+/* ---- P1-4 (2026-09-03): 渐进穿孔台阶表 (M76 P<级数> 逐级驱动) ---- */
+#define LASER_PIERCE_TABLE_MAX  8       /* 台阶上限 (对齐 movecontrol .ld 三级渐进典型值) */
+
+typedef struct {
+    double  power_w;   /* 本级功率 W (>=0) */
+    double  freq_hz;   /* 本级频率 Hz (>=0) */
+    int32_t dwell_ms;  /* 本级停留 ms (>=1) */
+} LaserPierceStep_t;   /* pack(1) 下 20B */
+
 /* ============================================================
  * 2. 命令类型枚举
  *    按功能段划分并预留空号, 便于未来追加新 API 而不打乱编号。
@@ -153,6 +162,16 @@ typedef enum {
 
     /* --- Set Origin Here 0x0066 (v1.5, 2026-08-28) --- */
     SMC_CMD_SET_ORIGIN_HERE          = 0x0066,  /* 当前位设为激活 WCS 零点 (main 时代 SetZero 语义) */
+
+    /* --- Laser P0/P1 (2026-09-03): 0x0067-0x0069 --- */
+    SMC_CMD_CONFIG_LASER_GAS         = 0x0067,  /* P0-2: 气压 AO 通道 + 量程 (M13 P<bar> 配套) */
+    SMC_CMD_CONFIG_LASER_MICRO_JOINT = 0x0068,  /* P1-5: 微连接段功率系数 mj_ratio */
+    SMC_CMD_CONFIG_LASER_PIERCE_TABLE = 0x0069, /* P1-4: 渐进穿孔台阶表 (M76 P<级数> 配套) */
+
+    /* --- 断点续切 Phase 1 (2026-09-08): 0x0070 ~ 0x0072 --- */
+    SMC_CMD_RESUME_SEARCH            = 0x0070, /* 校验目标行 G00 边界 + SEARCH 重放建立模态 (阻塞至完成) */
+    SMC_CMD_RESUME_START             = 0x0071, /* 从冻结边界起跑 (重定位前导 + 激光模态恢复 + 续切) */
+    SMC_CMD_GET_RESUME               = 0x0072, /* 查询 resume 状态 (ready/target_line/target_pos) */
 } SmcCmdType;
 
 /* ============================================================
@@ -358,6 +377,7 @@ typedef struct {
     double   power_w;           /* 当前输出功率 W (P-v 耦合后) */
     double   freq_hz;           /* 频率 Hz */
     int32_t  gas_select;        /* 0=off, 1=N2, 2=O2, 3=Air */
+    double   gas_pressure_bar;  /* P0-2: 辅助气压设定值 bar (M13 P, 0=未设定) */
     uint16_t interlock;         /* 互锁位图: bit0=door, bit1=estop_soft, bit2=laser_alm,
                                    bit3=water_temp, bit4=water_flow, bit5=gas_press,
                                    bit15=system_alarm; 0=正常 */
@@ -365,8 +385,9 @@ typedef struct {
     double   P_base_w;          /* 基准功率 (M67 设定, 不被 P-v 耦合覆盖) */
     double   v_actual_mm_s;     /* 当前周期瞬时速度 mm/s (RT 写, 耦合 update 推进) */
     int32_t  coupling_mode_rt;  /* 当前段耦合模式 (0=off, 1=查表) */
-    int32_t  is_piercing;       /* 是否在 G04 穿孔 dwell 中 (派生: is_waiting_mcode && current_mcode==64) */
+    int32_t  is_piercing;       /* 是否在穿孔中 (派生: is_waiting_mcode && current_mcode∈{64,76}; 64=G04 dwell, 76=渐进) */
     uint8_t  current_seg_flags; /* 当前段工艺标记: bit0=lead_in, bit1=micro_joint */
+    int32_t  hold_gate_off;     /* P0-1: feedhold 刹车/暂停中光闸强制关 (0/1, 不锁存 RESUMING 即清) */
     /* ---- 加工统计 (RT 累计, 跨程序不清零) ---- */
     int32_t  pierce_count;      /* 累计穿孔次数 (M64 段完成 ++) */
     int64_t  laser_on_time_ms;  /* 累计激光开启时间 ms (enable&&shutter&&!ekill 时累加) */
@@ -466,6 +487,33 @@ typedef struct {
 typedef struct {
     int32_t ret_code;   /* 0=ok, -1=load_done!=1 (LoadProgram 未完成), -2=is_running */
 } SmcRunLoadedProgramRes;
+
+/* ----- 断点续切 Phase 1 (2026-09-08) ----- */
+typedef struct {
+    int32_t target_line;   /* 目标边界物理行号 (line_no; 必须是含 G00 运动的行, 即轮廓进近行) */
+} SmcResumeSearchReq;
+typedef struct {
+    int32_t ret_code;      /* 0=ok(边界已冻结, 可 RESUME_START),
+                            * -1=parser 忙, -2=未 LoadProgram/文件或 WCS 指纹不符,
+                            * -3=行存在但非 G00 边界, -4=SafeLiftZ 未配置 (前导依赖),
+                            * -5=行不存在, -6=搜索超时 (5s) */
+    int32_t target_line;   /* 回显冻结的行号 */
+    double  target_pos[AXIS_NUM];  /* 边界 G00 机械目标位姿 (G53, ret_code=0 时有效) */
+} SmcResumeSearchRes;
+
+/* SMC_RESUME_START: 无 Req */
+typedef struct {
+    int32_t ret_code;      /* 0=ok, -1=resume_ready!=1 (未冻结), -2=parser 忙, -3=指纹不符(已作废冻结) */
+} SmcResumeStartRes;
+
+/* SMC_GET_RESUME: 无 Req */
+typedef struct {
+    int32_t ret_code;      /* 恒 0 */
+    int32_t resume_ready; /* 0/1 = g_program_resume_ready */
+    int32_t search_result;/* g_program_resume_result (0=pending,1=ok,2=非边界,3=行不存在) */
+    int32_t target_line;  /* g_parser_ctrl.resume_target_line */
+    double  target_pos[AXIS_NUM]; /* SEARCH 冻结位姿 */
+} SmcGetResumeRes;
 
 /* SMC_GET_PROGRAM_STRUCTURE: 无 Req, payload 直接是 SMC_ProgramStructure_t */
 typedef struct {
@@ -574,6 +622,32 @@ typedef struct {
     LaserCouplePoint_t points[LASER_COUPLE_TABLE_MAX];
 } SmcConfigLaserCoupleTableReq;
 typedef struct { int32_t ret_code; } SmcConfigLaserCoupleTableRes;
+
+/* SMC_CONFIG_LASER_GAS (0x0067, P0-2 2026-09-03): 气压 AO 通道 + 量程
+ * 气压 AO 不受 can_emit 门 (关光后吹气继续), 配套 M13 P<bar>。
+ * pack(1) 下 1 + 7(pad) + 8 = 16B */
+typedef struct {
+    uint8_t ch_ao_pressure;    /* 气压通道号 (0-3) */
+    uint8_t _pad[7];           /* 8B 对齐 (后随 double) */
+    double  pressure_max_bar;  /* 量程 bar, >0 生效 */
+} SmcConfigLaserGasReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserGasRes;
+
+/* SMC_CONFIG_LASER_MICRO_JOINT (0x0068, P1-5 2026-09-03): 微连接段功率系数
+ * SEG_FLAG_MICRO_JOINT 置位段 coupling ratio × mj_ratio; 配套 M77 P<ratio> */
+typedef struct {
+    double mj_ratio;   /* (0, 1], 默认 1.0 = 不衰减 */
+} SmcConfigLaserMicroJointReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserMicroJointRes;
+
+/* SMC_CONFIG_LASER_PIERCE_TABLE (0x0069, P1-4 2026-09-03): 渐进穿孔台阶表
+ * count: 1..LASER_PIERCE_TABLE_MAX; 配套 M76 P<级数> (级数 <= count)。
+ * pack(1) 下 4 + 8×20 = 164B */
+typedef struct {
+    int32_t           count;
+    LaserPierceStep_t steps[LASER_PIERCE_TABLE_MAX];
+} SmcConfigLaserPierceTableReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserPierceTableRes;
 
 /* ============================================================
  * P0-3: Safe Z Lift

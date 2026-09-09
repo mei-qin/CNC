@@ -728,6 +728,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_interpolator.hold_state = HOLD_NORMAL;
                     }
                 }
+
+                // ---- P0-1 (2026-09-03): feedhold 光闸 gate ----
+                // BRAKING/PAUSED 置 1 (光闸关 + M64/M76 计时冻结), NORMAL/RESUMING 清 0.
+                // gate 不锁存: 与 emergency_kill (报警锁存链) 语义正交;
+                // 报警路径两者同周期生效, alarm_reset 强置 HOLD_NORMAL → gate 自动清.
+                // @Context: 1ms Hard-RT Thread (EtherCAT)
+                // @Danger: 仅 int 赋值, 无 malloc/阻塞/math.h
+                g_laser_rt.hold_gate_off =
+                    (g_interpolator.hold_state == HOLD_BRAKING
+                     || g_interpolator.hold_state == HOLD_PAUSED) ? 1 : 0;
             }
 
             // ---- 无缝插补消费环 ----
@@ -968,6 +978,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     for(int j = 0; j < AXIS_NUM; j++){
                         g_coord_mgr.active_offset[j] = seg.wcs_offset_snap[j];
                     }
+                    // P1 (2026-09-07) G68.2: 倾斜面旋转快照同步 (RT 单写者镜像)
+                    g_coord_mgr.active_tilt = seg.is_tilt_active;
+                    for(int j = 0; j < 9; j++){
+                        g_coord_mgr.active_tilt_rot[j] = seg.wcs_rot_snap[j];
+                    }
 
                     // ---- Phase B1: 段级耦合配置同步 (cmd_type 分支前, M 段 + 运动段共用) ----
                     // 把入队时快照的 coupling_mode/v_thresh 同步到 g_laser_rt.*_rt 镜像.
@@ -1006,6 +1021,13 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         // 让 HMI 在穿孔 dwell 期间能读到正确的 lead_in 上下文.
                         g_interpolator.current_seg_flags_rt = seg.seg_flags;
                         laser_rt_apply_aux(&seg);
+                        // P1-4 (2026-09-03): M76 渐进穿孔启动 — 首台阶立即生效
+                        // (置于 apply_aux 之后: 台阶值覆盖段快照功率/频率,
+                        //  整体完成时由等待块恢复 laser_power_w_rt 快照)
+                        if (seg.m_code == 76) {
+                            g_interpolator.pierce_stage_idx = 0;
+                            laser_rt_apply_pierce_stage(0);
+                        }
                         break;
                     }
 
@@ -1279,9 +1301,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                 g_laser_rt.pierce_count,
                                 g_laser_rt.laser_on_time_ms,
                                 g_interpolator.current_seg_flags_rt,
-                                // is_piercing 派生: G04 dwell (M64) 等待期间为 1
+                                // is_piercing 派生: G04 dwell (M64) / M76 渐进穿孔等待期间为 1
                                 (g_interpolator.is_waiting_mcode &&
-                                 g_interpolator.current_mcode == 64) ? 1 : 0,
+                                 (g_interpolator.current_mcode == 64 ||
+                                  g_interpolator.current_mcode == 76)) ? 1 : 0,
+                                // P0-1: feedhold 光闸 gate
+                                g_laser_rt.hold_gate_off,
+                                // P0-2: 辅助气压设定
+                                g_laser_rt.gas_pressure_bar,
                                 // P0-3 SafeLift: 抬升状态机 2 字段
                                 g_interpolator.safe_lift_state,
                                 (g_safe_lift_cfg.enabled && g_safe_lift_cfg.z_axis_idx >= 0)
@@ -1341,7 +1368,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
             // ---- 非阻塞 M 代码等待计时 (阶段 2 保留) ----
             // 段加载逻辑已移到 while 消费环,此处仅保留 mcode_wait_timer 递增。
-            if(g_all_axis_op_ready && g_interpolator.is_waiting_mcode){
+            // P0-1: hold_gate_off 冻结门 — feedhold 刹车/暂停期间计时与完成判定
+            //       整体冻结 (闸关不计时), 防止暂停时 M64/M76 穿孔"盲走完"。
+            //       RESUMING 继续计时 (闸已开, 与 laser_on_time 累加语义一致)。
+            if(g_all_axis_op_ready && g_interpolator.is_waiting_mcode
+               && !g_laser_rt.hold_gate_off){
                 if(g_interpolator.mcode_wait_timer < INT32_MAX) {
                     g_interpolator.mcode_wait_timer++;
                 }
@@ -1362,25 +1393,57 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                              if(wait_target_ms > MCODE_WAIT_TIMEOUT_MS)
                                  wait_target_ms = MCODE_WAIT_TIMEOUT_MS;
                              break;
+                    // ---- P1-4 (2026-09-03): M76 渐进穿孔 ----
+                    // mcode_p_value_ms=级数 (parser 传), pierce_stage_idx=当前台阶,
+                    // 每级停留取台阶表; 台阶推进在下方完成判定分支。
+                    case 76: wait_target_ms = g_laser_cfg.pierce_table[
+                                     g_interpolator.pierce_stage_idx].dwell_ms;
+                             if(wait_target_ms < 1) wait_target_ms = 1;
+                             if(wait_target_ms > MCODE_WAIT_TIMEOUT_MS)
+                                 wait_target_ms = MCODE_WAIT_TIMEOUT_MS;
+                             break;
                     default: wait_target_ms=500;  break;
                 }
                 if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
                    g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
-                    g_interpolator.is_waiting_mcode=0;
-                    g_interpolator.mcode_wait_timer=0;
-                    // P0-Laser-Q: M64 (G04 dwell) 完成时累计穿孔次数
+                    // ---- P1-4 (2026-09-03): M76 台阶推进 ----
+                    // 未到最后一级: 切换下一级 (timer 清 0 复用本屏障, 不引入第二
+                    // 计时器); pierce_count 只在整体完成时 +1 (一次渐进穿孔计 1 次)。
                     // @Context: 1ms Hard-RT Thread
-                    // @Danger: 仅 int32 ++, 无 malloc/阻塞/math.h
-                    // 必须判 current_mcode==64: 该完成分支处理所有 M 段 (M0/M1/M60-M75),
-                    // 只有 M64 (G04 dwell 转换来的穿孔段) 才算穿孔.
-                    if (g_interpolator.current_mcode == 64) {
-                        g_laser_rt.pierce_count++;
-                    }
-                    // P2-A-3: 单段模式 re-arm (M 段完成时)
-                    // M 段 (M3/M5/M8/M64 dwell 等) 完成后, 若 single_block 模式,
-                    // 设 pause_request=1, 下个 cycle 进 HOLD_PAUSED 等 Cycle Start.
-                    if (g_interpolator.mode_flags & SMC_MODE_SINGLE_BLOCK) {
-                        g_interpolator.pause_request = 1;
+                    // @Danger: 仅 int 赋值 + apply_pierce_stage (数组读+赋值)
+                    if (g_interpolator.current_mcode == 76
+                        && g_interpolator.pierce_stage_idx
+                           < (int)(g_interpolator.mcode_p_value_ms + 0.5) - 1) {
+                        g_interpolator.pierce_stage_idx++;
+                        laser_rt_apply_pierce_stage(g_interpolator.pierce_stage_idx);
+                        g_interpolator.mcode_wait_timer = 0;
+                    } else {
+                        g_interpolator.is_waiting_mcode=0;
+                        g_interpolator.mcode_wait_timer=0;
+                        // P0-Laser-Q: M64 (G04 dwell) 完成时累计穿孔次数
+                        // @Context: 1ms Hard-RT Thread
+                        // @Danger: 仅 int32 ++, 无 malloc/阻塞/math.h
+                        // 必须判 current_mcode==64: 该完成分支处理所有 M 段 (M0/M1/M60-M75),
+                        // 只有 M64 (G04 dwell 转换来的穿孔段) 才算穿孔.
+                        if (g_interpolator.current_mcode == 64) {
+                            g_laser_rt.pierce_count++;
+                        }
+                        // P1-4: M76 整体完成 — 计数 + 回 -1 + 恢复段快照切割参数
+                        // (穿孔期 apply_pierce_stage 覆盖了 M67/M68 值, 此处切回;
+                        //  laser_*_w_rt 在 M 段加载时已从 seg.aux 快照, 单写者本线程)
+                        if (g_interpolator.current_mcode == 76) {
+                            g_laser_rt.pierce_count++;
+                            g_interpolator.pierce_stage_idx = -1;
+                            g_laser_rt.P_base_w = g_interpolator.laser_power_w_rt;
+                            g_laser_rt.power_w  = g_interpolator.laser_power_w_rt;
+                            g_laser_rt.freq_hz  = g_interpolator.laser_freq_hz_rt;
+                        }
+                        // P2-A-3: 单段模式 re-arm (M 段完成时)
+                        // M 段 (M3/M5/M8/M64 dwell 等) 完成后, 若 single_block 模式,
+                        // 设 pause_request=1, 下个 cycle 进 HOLD_PAUSED 等 Cycle Start.
+                        if (g_interpolator.mode_flags & SMC_MODE_SINGLE_BLOCK) {
+                            g_interpolator.pause_request = 1;
+                        }
                     }
                 }
             }
@@ -1389,11 +1452,37 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // H-1 修复: 不再读 g_coord_mgr.work_offsets[idx] (那张表可被 parser 中途写污染),
             // 改读 RT 单写者的 active_offset (段消费时已 = seg.wcs_offset_snap)。
             // G53 段的 active_offset 全零,等价于"逻辑坐标 = 机械坐标",不再需要分支。
+            // P1 (2026-09-07) G68.2: 倾斜面激活时 XYZ 反推 p = Rᵀ·(g53 − offset)
+            //   (R 行主序, 列=[u v n]; Rᵀ 取列即行 — 纯乘加, 无 math.h libcall);
+            //   旋转轴 B/C 仍线性减法; 未激活时走原语句 (字节等价)。
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: 仅数组读 + 乘加赋值, 无 malloc/阻塞/math.h/printf
             if(g_all_axis_op_ready){
                 for(int j=0;j<AXIS_NUM;j++){
                     g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
-                    g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j]
-                                                       - g_coord_mgr.active_offset[j];
+                }
+                if(!g_coord_mgr.active_tilt){
+                    for(int j=0;j<AXIS_NUM;j++){
+                        g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j]
+                                                           - g_coord_mgr.active_offset[j];
+                    }
+                }else{
+                    int xi = g_axis_map['X' - 'A'];
+                    int yi = g_axis_map['Y' - 'A'];
+                    int zi = g_axis_map['Z' - 'A'];
+                    for(int j=0;j<AXIS_NUM;j++){
+                        g_coord_mgr.current_logical_pos[j]=g_coord_mgr.current_g53_pos[j]
+                                                           - g_coord_mgr.active_offset[j];
+                    }
+                    if(xi >= 0 && yi >= 0 && zi >= 0){
+                        const double *R = g_coord_mgr.active_tilt_rot;
+                        double dx = g_coord_mgr.current_g53_pos[xi] - g_coord_mgr.active_offset[xi];
+                        double dy = g_coord_mgr.current_g53_pos[yi] - g_coord_mgr.active_offset[yi];
+                        double dz = g_coord_mgr.current_g53_pos[zi] - g_coord_mgr.active_offset[zi];
+                        g_coord_mgr.current_logical_pos[xi] = R[0]*dx + R[3]*dy + R[6]*dz;
+                        g_coord_mgr.current_logical_pos[yi] = R[1]*dx + R[4]*dy + R[7]*dz;
+                        g_coord_mgr.current_logical_pos[zi] = R[2]*dx + R[5]*dy + R[8]*dz;
+                    }
                 }
             }
 
@@ -1631,9 +1720,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // laser_on_time_ms: enable && shutter && !emergency_kill 时每 cycle += 1 (1ms)
             //   enable=主使能 (M3), shutter=激光闸 (M62), 两者都 1 才真出光 (Phase A 设计)
             //   emergency_kill 时禁累加 (急停后不计入加工时长)
+            //   P0-1: hold_gate_off 期间禁累加 (feedhold 光闸已关, 非真出光)
             // @Context: 1ms Hard-RT Thread
             // @Danger: 仅 int64 += 1, 无 malloc/阻塞/math.h
-            if (g_laser_rt.enable && g_laser_rt.shutter && !g_laser_rt.emergency_kill) {
+            if (g_laser_rt.enable && g_laser_rt.shutter && !g_laser_rt.emergency_kill
+                && !g_laser_rt.hold_gate_off) {
                 g_laser_rt.laser_on_time_ms += 1;
             }
 

@@ -6,13 +6,16 @@
  *  关键不变量:
  *    1. g_preview_write_seq 单调不减 (writer 推进, reader 只读)
  *    2. ring slot [N % CAP] 在 write_seq > N 时已被写过, 内容稳定直到 write_seq 推到 N+CAP
- *    3. writer 是 single-producer, ring slot 不会被并发写
+ *    3. 生产者经 g_preview_push_lock 互斥 (2026-09-08 加固): parser 线程
+ *       (直通/刀补回调) 与 bspline 线程 (拟合子段) 都可能走 api_push_trajectory_impl
+ *       的 PREVIEW 分支调 Push, "seq 读→slot 写→seq store" 三步整体原子
  *    4. reader 检查 from_seq + CAP > write_seq 才读, 保证 slot 未被覆盖
  *
  *  内存序:
  *    Push: memcpy (relaxed) + atomic_store(write_seq, release)
- *    ReadSince: atomic_load(write_seq, acquire) + memcpy + 再次 atomic_load 验证
- *    release/acquire 配对确保 reader 看到 ring slot 内容之前 write_seq 已更新
+ *    ReadSince: atomic_load(write_seq, acquire) + memcpy + acquire fence + 再次 atomic_load 验证
+ *    release/acquire 配对确保 reader 看到 ring slot 内容之前 write_seq 已更新;
+ *    二次校验前的 fence 不可省 — acquire load 不阻止 payload 拷贝下移 (见 ReadSince 内注释)
  * ===================================================================== */
 
 #include "preview_streamer.h"
@@ -24,16 +27,34 @@
 static TrajectorySegment_t g_preview_ring[PREVIEW_RING_CAPACITY];
 static _Alignas(64) _Atomic uint64_t g_preview_write_seq = 0;
 
+/* 加固 (2026-09-08): push 自旋锁。
+ * 单写者前提原本依赖跨模块纪律 (parser 与 bspline_thread 的 preview push 靠
+ * BSpline_Flush 顺序屏障串行), 属"约定安全"而非"结构安全"。改为模块内自旋互斥:
+ * "seq 读 → slot 写 → seq store" 三步作为整体原子执行, 多生产者下不再依赖调用方。
+ * Push 永不在 RT 线程调用 (头文件契约), 自旋等待不违反实时性红线。
+ * 锁序: queue_spinlock (axis_ctrl 临界区) → 本锁, 单向, 无死锁环。 */
+static atomic_flag g_preview_push_lock = ATOMIC_FLAG_INIT;
+
 int PreviewStreamer_Init(void)
 {
     memset(g_preview_ring, 0, sizeof(g_preview_ring));
     atomic_store_explicit(&g_preview_write_seq, 0, memory_order_release);
+    atomic_flag_clear_explicit(&g_preview_push_lock, memory_order_release);
     return 0;
 }
 
 void PreviewStreamer_Push(const TrajectorySegment_t *seg)
 {
     if (seg == NULL) return;
+
+    while (atomic_flag_test_and_set_explicit(&g_preview_push_lock,
+                                             memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
+        __asm__ volatile("pause" ::: "memory");
+#elif defined(__aarch64__)
+        __asm__ volatile("yield" ::: "memory");
+#endif
+    }
 
     uint64_t seq = atomic_load_explicit(&g_preview_write_seq, memory_order_relaxed);
     uint32_t idx = (uint32_t)(seq % PREVIEW_RING_CAPACITY);
@@ -43,6 +64,8 @@ void PreviewStreamer_Push(const TrajectorySegment_t *seg)
 
     /* release: 保证上面的 memcpy 在 write_seq 推进之前对 reader 可见 */
     atomic_store_explicit(&g_preview_write_seq, seq + 1, memory_order_release);
+
+    atomic_flag_clear_explicit(&g_preview_push_lock, memory_order_release);
 }
 
 int PreviewStreamer_ReadSince(uint64_t from_seq,
@@ -87,7 +110,16 @@ int PreviewStreamer_ReadSince(uint64_t from_seq,
     /* 二次检查: 读期间 writer 是否覆盖了 from_seq?
      * 极端情况: writer 在本函数执行期间推了 CAP+ 段, from_seq slot 已被覆盖。
      * 此时 out_buf 内容不可信, 返回 -1 让 client 重连。
-     * 实际触发条件: writer 速率 >> reader 速率 + CAP 太小, v1 不优化。 */
+     * 实际触发条件: writer 速率 >> reader 速率 + CAP 太小, v1 不优化。
+     *
+     * ARM-safe 补齐 (2026-09-08): 校验 load 前必须 acquire fence。
+     * acquire load 只保证"其后操作不提前", 不阻止上面的 payload 拷贝被
+     * 编译器/CPU 下移到本 load 之后 (C11 允许不同对象间如此重排, AArch64
+     * 允许独立地址 load-load 乱序) — 若 now 取值先于拷贝落定, 撕裂段可
+     * 绕过本校验。fence 把 payload 拷贝钉死在校验 load 之前, 与
+     * snapshot_hub.c ReadLatest 读侧 fence 同一模式。x86 TSO 下两者等价
+     * (此前实测无异常即因此), 此处为弱序架构 (AArch64) 正确性补齐。 */
+    atomic_thread_fence(memory_order_acquire);
     uint64_t now = atomic_load_explicit(&g_preview_write_seq, memory_order_acquire);
     if (now > (uint64_t)PREVIEW_RING_CAPACITY &&
         from_seq + PREVIEW_RING_CAPACITY <= now) {

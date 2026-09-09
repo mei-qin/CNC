@@ -40,6 +40,7 @@
 #include "snapshot_hub.h"      /* SnapshotHub_ReadLatest */
 #include "event_logger.h"      /* EventLogger_ReadSince / GetWriteSeq */
 #include "smc_api.h"           /* SMC_* API */
+#include "laser_ctrl.h"        /* Laser (2026-09-03): g_laser_cfg 量程 (SetPower/SetGas 校验) */
 #include "axis_cfg.h"          /* AXIS_NUM / FeedHoldState_t */
 #include "smc_protocol.h"      /* SMC_MODE_SINGLE_BLOCK */
 #include "gcode_parser.h"      /* ParserControl_t */
@@ -116,6 +117,22 @@ typedef enum {
     OV_CFG_CENTRI_ACC,       /* 全局 Double: 最大向心加速度 */
     OV_CFG_DIRTY,            /* 全局 Int32: 档案脏标志 */
     OV_CFG_WRITE_PROTECT,    /* 全局 Boolean RW: 写保护 (仿 Fanuc PWE) */
+    /* ---- Laser (2026-09-03): CNC.Laser 状态面 (契约 §11, SMC_GetLaserState 同源) ---- */
+    OV_LASER_ENABLE,         /* Int32: 主使能 (M3=1) */
+    OV_LASER_SHUTTER,        /* Int32: 光闸 (M62=1) */
+    OV_LASER_POWER_W,        /* Double: 当前功率 W (P-v 耦合后) */
+    OV_LASER_FREQ_HZ,        /* Double: 频率 Hz */
+    OV_LASER_GAS_SELECT,     /* Int32: 0=off 1=N2 2=O2 3=Air */
+    OV_LASER_GAS_PRESSURE,   /* Double: 气压设定 bar (M13) */
+    OV_LASER_INTERLOCK,      /* Int32: 互锁位图 */
+    OV_LASER_EKILL,          /* Int32: 急停锁存 */
+    OV_LASER_P_BASE,         /* Double: 基准功率 W */
+    OV_LASER_V_ACTUAL,       /* Double: 瞬时速度 mm/s */
+    OV_LASER_COUPLING_MODE,  /* Int32: 段级耦合模式 */
+    OV_LASER_IS_PIERCING,    /* Int32: 穿孔中 (M64/M76) */
+    OV_LASER_SEG_FLAGS,      /* Int32: 段工艺标记 bit0/b1 */
+    OV_LASER_PIERCE_COUNT,   /* Int32: 累计穿孔次数 */
+    OV_LASER_ON_TIME,        /* Int64: 累计出光 ms */
     OV_KIND_COUNT
 } OpcVarKind;
 
@@ -140,7 +157,16 @@ typedef enum {
     OM_CONFIG_SET_PLANNER,
     OM_CONFIG_SET_KINEMATICS,
     OM_CONFIG_SET_PPU,
-    OM_CONFIG_SAVE_PROFILE
+    OM_CONFIG_SAVE_PROFILE,
+    /* ---- Laser (2026-09-03): CNC.Laser 方法 (Boolean out, 运行时工艺参数,
+     *      刻意不入 config_cb — 不受 WriteProtect 写保护, 对齐 Fanuc HMI
+     *      运行中调功率语义) ---- */
+    OM_LASER_SET_POWER,
+    OM_LASER_SET_FREQ,
+    OM_LASER_SET_GAS,
+    OM_LASER_SET_COUPLING,
+    OM_LASER_CONFIG_GAS_RANGE,
+    OM_LASER_CONFIG_MICRO_JOINT
 } OpcMethodKind;
 
 /* P3: 配置写保护 (server 级开关, 仿 Fanuc PWE 参数写使能)。
@@ -378,6 +404,64 @@ opcua_ds_read(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
     char buf[160];
 
     switch ((OpcVarKind)ctx->kind) {
+
+    /* ---- Laser (2026-09-03): Int32 组 (SMC_GetLaserState 同源, 未配置全零) ---- */
+    case OV_LASER_ENABLE:
+    case OV_LASER_SHUTTER:
+    case OV_LASER_GAS_SELECT:
+    case OV_LASER_INTERLOCK:
+    case OV_LASER_EKILL:
+    case OV_LASER_COUPLING_MODE:
+    case OV_LASER_IS_PIERCING:
+    case OV_LASER_SEG_FLAGS:
+    case OV_LASER_PIERCE_COUNT: {
+        SmcGetLaserStateRes r;
+        memset(&r, 0, sizeof(r));      /* 未配置 (ret=-1) 时全零呈现 */
+        (void)SMC_GetLaserState(&r);
+        UA_Int32 v = 0;
+        switch ((OpcVarKind)ctx->kind) {
+        case OV_LASER_ENABLE:       v = (UA_Int32)r.enable;          break;
+        case OV_LASER_SHUTTER:      v = (UA_Int32)r.shutter;         break;
+        case OV_LASER_GAS_SELECT:   v = (UA_Int32)r.gas_select;      break;
+        case OV_LASER_INTERLOCK:    v = (UA_Int32)r.interlock;       break;
+        case OV_LASER_EKILL:        v = (UA_Int32)r.emergency_kill;  break;
+        case OV_LASER_COUPLING_MODE:v = (UA_Int32)r.coupling_mode_rt;break;
+        case OV_LASER_IS_PIERCING:  v = (UA_Int32)r.is_piercing;     break;
+        case OV_LASER_SEG_FLAGS:    v = (UA_Int32)r.current_seg_flags;break;
+        default:                    v = (UA_Int32)r.pierce_count;    break;
+        }
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT32]);
+        break;
+    }
+    /* ---- Laser: Double 组 ---- */
+    case OV_LASER_POWER_W:
+    case OV_LASER_FREQ_HZ:
+    case OV_LASER_GAS_PRESSURE:
+    case OV_LASER_P_BASE:
+    case OV_LASER_V_ACTUAL: {
+        SmcGetLaserStateRes r;
+        memset(&r, 0, sizeof(r));
+        (void)SMC_GetLaserState(&r);
+        UA_Double v = 0.0;
+        switch ((OpcVarKind)ctx->kind) {
+        case OV_LASER_POWER_W:      v = (UA_Double)r.power_w;          break;
+        case OV_LASER_FREQ_HZ:      v = (UA_Double)r.freq_hz;          break;
+        case OV_LASER_GAS_PRESSURE: v = (UA_Double)r.gas_pressure_bar; break;
+        case OV_LASER_P_BASE:       v = (UA_Double)r.P_base_w;         break;
+        default:                    v = (UA_Double)r.v_actual_mm_s;    break;
+        }
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
+        break;
+    }
+    /* ---- Laser: Int64 出光时长 ---- */
+    case OV_LASER_ON_TIME: {
+        SmcGetLaserStateRes r;
+        memset(&r, 0, sizeof(r));
+        (void)SMC_GetLaserState(&r);
+        UA_Int64 v = (UA_Int64)r.laser_on_time_ms;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT64]);
+        break;
+    }
 
     case OV_MACHINE_STATUS: {
         UA_Int32 v = (UA_Int32)derive_machine_status();
@@ -916,6 +1000,85 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
         ok = true;
         break;
     }
+
+    /* ==================== Laser (2026-09-03): 运行时工艺参数 ==================== */
+    case OM_LASER_SET_POWER: {
+        /* in: Double powerW — 写 parser pending (下段快照生效, 与 M67 同一写入点)。
+         * @Thread-Safety: server 线程写 / parser 线程 api_push 快照读, double
+         * 非原子撕裂窗口 ms 级, AO 侧量程钳制 (65535 cap) 兜底 — Fanuc HMI
+         * 运行中调功率同语义, 接受此工程折衷。 */
+        if (inputSize != 1 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        {
+            double w = *(UA_Double *)input[0].data;
+            if (w < 0.0 || w > g_laser_cfg.power_max_w) { ok = false; break; }
+            g_state.laser_power_pending = w;
+            ok = true;
+        }
+        break;
+    }
+    case OM_LASER_SET_FREQ: {
+        /* in: Double freqHz — 与 M68 同一写入点 */
+        if (inputSize != 1 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        {
+            double f = *(UA_Double *)input[0].data;
+            if (f < 0.0 || f > g_laser_cfg.freq_max_hz) { ok = false; break; }
+            g_state.laser_freq_pending = f;
+            ok = true;
+        }
+        break;
+    }
+    case OM_LASER_SET_GAS: {
+        /* in: Int32 select(0-3), Double pressureBar — 与 M10-12/M13 同写入点 */
+        if (inputSize != 2 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_INT32]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        {
+            UA_Int32 sel = *(UA_Int32 *)input[0].data;
+            double p     = *(UA_Double *)input[1].data;
+            if (sel < 0 || sel > 3) { ok = false; break; }
+            /* pressure>0 但量程未配 (max=0) → 拒绝 (与 M13 防呆一致) */
+            if (p != 0.0 && (p < 0.0 || p > g_laser_cfg.pressure_max_bar)) {
+                ok = false; break;
+            }
+            g_state.gas_select = (int)sel;
+            g_state.laser_gas_pressure_pending = p;
+            ok = true;
+        }
+        break;
+    }
+    case OM_LASER_SET_COUPLING: {
+        /* in: Int32 mode(0/1), Double vThresh — 直调 SMC_ConfigLaserCoupling */
+        if (inputSize != 2 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_INT32]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        ok = (SMC_ConfigLaserCoupling(*(UA_Int32 *)input[0].data,
+                                       *(UA_Double *)input[1].data) == 0);
+        break;
+    }
+    case OM_LASER_CONFIG_GAS_RANGE: {
+        /* in: Int32 ch(0-3), Double maxBar — 直调 SMC_ConfigLaserGas (RPC 0x0067 同源) */
+        if (inputSize != 2 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_INT32]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        ok = (SMC_ConfigLaserGas((uint8_t)*(UA_Int32 *)input[0].data,
+                                  *(UA_Double *)input[1].data) == 0);
+        break;
+    }
+    case OM_LASER_CONFIG_MICRO_JOINT: {
+        /* in: Double ratio((0,1]) — 直调 SMC_ConfigLaserMicroJoint (M77/RPC 0x0068 同源) */
+        if (inputSize != 1 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        ok = (SMC_ConfigLaserMicroJoint(*(UA_Double *)input[0].data) == 0);
+        break;
+    }
     }
 
     return UA_Variant_setScalarCopy(output, &ok, &UA_TYPES[UA_TYPES_BOOLEAN]);
@@ -1420,6 +1583,76 @@ static void build_config_nodes(UA_Server *s, const UA_NodeId ns_cnc)
                       "explicit save machine profile", OM_CONFIG_SAVE_PROFILE, NULL, 0);
 }
 
+/* @Context: Non-RealTime Background Thread (server 线程启动期一次)
+ * P0-3 (2026-09-03): CNC.Laser 激光面 — 契约 §11。
+ * 状态 15 变量全只读 (DataSource 现拉 SMC_GetLaserState, 与 RPC 0x0033 同源);
+ * 6 方法 Boolean out (opcua_method_cb, 运行时工艺参数不走 config_cb 写保护)。
+ * ctx 池余量: 变量 192 用 ~114 → +15 OK; 方法 32 用 ~24 → +6 OK。 */
+static void build_laser_nodes(UA_Server *s, const UA_NodeId ns_cnc)
+{
+    UA_NodeId ns_laser = add_obj(s, "CNC.Laser", ns_cnc,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT), "Laser");
+
+    add_var(s, "Laser.Enable",        ns_laser, "Enable",        &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_ENABLE,       -1, false, -1);
+    add_var(s, "Laser.Shutter",       ns_laser, "Shutter",       &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_SHUTTER,      -1, false, -1);
+    add_var(s, "Laser.PowerW",        ns_laser, "PowerW",        &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_LASER_POWER_W,      -1, false, -1);
+    add_var(s, "Laser.FreqHz",        ns_laser, "FreqHz",        &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_LASER_FREQ_HZ,      -1, false, -1);
+    add_var(s, "Laser.GasSelect",     ns_laser, "GasSelect",     &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_GAS_SELECT,   -1, false, -1);
+    add_var(s, "Laser.GasPressure",   ns_laser, "GasPressure",   &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_LASER_GAS_PRESSURE, -1, false, -1);
+    add_var(s, "Laser.Interlock",     ns_laser, "Interlock",     &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_INTERLOCK,    -1, false, -1);
+    add_var(s, "Laser.EmergencyKill", ns_laser, "EmergencyKill", &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_EKILL,        -1, false, -1);
+    add_var(s, "Laser.BasePowerW",    ns_laser, "BasePowerW",    &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_LASER_P_BASE,       -1, false, -1);
+    add_var(s, "Laser.ActualSpeed",   ns_laser, "ActualSpeed",   &UA_TYPES[UA_TYPES_DOUBLE].typeId,  OV_LASER_V_ACTUAL,     -1, false, -1);
+    add_var(s, "Laser.CouplingMode",  ns_laser, "CouplingMode",  &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_COUPLING_MODE,-1, false, -1);
+    add_var(s, "Laser.IsPiercing",    ns_laser, "IsPiercing",    &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_IS_PIERCING,  -1, false, -1);
+    add_var(s, "Laser.SegFlags",      ns_laser, "SegFlags",      &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_SEG_FLAGS,    -1, false, -1);
+    add_var(s, "Laser.PierceCount",   ns_laser, "PierceCount",   &UA_TYPES[UA_TYPES_INT32].typeId,   OV_LASER_PIERCE_COUNT, -1, false, -1);
+    add_var(s, "Laser.OnTimeMs",      ns_laser, "OnTimeMs",      &UA_TYPES[UA_TYPES_INT64].typeId,   OV_LASER_ON_TIME,      -1, false, -1);
+
+    {
+        UA_Argument in[1] = { arg_in_double("powerW", "laser base power (W)") };
+        add_method(s, "Laser.SetPower", ns_laser, "SetPower",
+                   "set laser base power (W, next-segment effective)",
+                   OM_LASER_SET_POWER, in, 1);
+    }
+    {
+        UA_Argument in[1] = { arg_in_double("freqHz", "laser frequency (Hz)") };
+        add_method(s, "Laser.SetFrequency", ns_laser, "SetFrequency",
+                   "set laser frequency (Hz)", OM_LASER_SET_FREQ, in, 1);
+    }
+    {
+        UA_Argument in[2] = {
+            arg_in_int32("select",       "0=off 1=N2 2=O2 3=Air"),
+            arg_in_double("pressureBar", "assist gas pressure (bar)"),
+        };
+        add_method(s, "Laser.SetGas", ns_laser, "SetGas",
+                   "select gas and set pressure (next-segment effective)",
+                   OM_LASER_SET_GAS, in, 2);
+    }
+    {
+        UA_Argument in[2] = {
+            arg_in_int32("mode",    "0=off 1=table lookup"),
+            arg_in_double("vThresh", "low-speed threshold (mm/s)"),
+        };
+        add_method(s, "Laser.SetCoupling", ns_laser, "SetCoupling",
+                   "set power-speed coupling", OM_LASER_SET_COUPLING, in, 2);
+    }
+    {
+        UA_Argument in[2] = {
+            arg_in_int32("channel", "AO channel (0-3)"),
+            arg_in_double("maxBar", "pressure range (bar, >0)"),
+        };
+        add_method(s, "Laser.ConfigGasRange", ns_laser, "ConfigGasRange",
+                   "configure gas pressure AO channel and range",
+                   OM_LASER_CONFIG_GAS_RANGE, in, 2);
+    }
+    {
+        UA_Argument in[1] = { arg_in_double("ratio", "micro-joint power ratio (0,1]") };
+        add_method(s, "Laser.ConfigMicroJoint", ns_laser, "ConfigMicroJoint",
+                   "set micro-joint power ratio", OM_LASER_CONFIG_MICRO_JOINT, in, 1);
+    }
+}
+
 /* @Context: Non-RealTime Background Thread (server 线程启动期一次) */
 static void build_address_space(UA_Server *s)
 {
@@ -1537,6 +1770,9 @@ static void build_address_space(UA_Server *s)
 
     /* ---- P3: CNC.Config 配置面 (契约 §10) ---- */
     build_config_nodes(s, ns_cnc);
+
+    /* ---- Laser: CNC.Laser 激光面 (契约 §11, 2026-09-03) ---- */
+    build_laser_nodes(s, ns_cnc);
 }
 
 /* =====================================================================

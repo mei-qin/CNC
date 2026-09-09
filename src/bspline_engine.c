@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdatomic.h>
 
 // ================== 静态全局状态 ==================
 
@@ -23,6 +24,20 @@ static pthread_mutex_t bspline_mutex;
 static pthread_cond_t  bspline_cond;
 static volatile int bspline_flush_request    = 0;
 static volatile int bspline_shutdown_request = 0;
+
+/* 2026-09-08 顺序屏障修复: drain 在途标志。
+ * 背景: bspline_drain_queue 在"拷贝到工作缓冲"阶段就推进 tail (dirty_count 提前
+ * 归零), 而子段 push 在 bspline_mutex 锁外后置执行 —— 仅凭 dirty_count==0 判定
+ * flush 完成会在 push 进行中提前放行 (线程正排空时调用方连 request 都不设,
+ * 首次轮询即返回), 破坏所有依赖 BSpline_Flush 作顺序屏障的调用点:
+ *   G00/圆弧旁路 (gcode_parser.c:2411)、G40 (:997)、WCS 切换 (:1085)、
+ *   M 代码屏障 (:2058)、M30/程序收尾 (:2710)、PREVIEW 单写者前提 (axis_ctrl.c:438)。
+ * 语义: 1 = bspline_thread 已取走脏点、子段 push 尚未全部完成。
+ * 置位: 线程主循环取到 snapshot_count>0 后, 在 bspline_mutex 内 (先于解锁,
+ *       与 tail 推进同一临界区, Flush 不可能观察到"dirty==0 且无 drain"的假完成);
+ * 清零: bspline_drain_queue 返回后, release (与 Flush 轮询的 acquire 配对,
+ *       保证 Flush 返回后调用方的后续 push 严格晚于本批最后一次 push)。 */
+static _Atomic int bspline_drain_active = 0;
 
 // ================== 静态工作缓冲区 (无 malloc) ==================
 
@@ -67,6 +82,7 @@ void BSpline_Init(void)
     pthread_cond_init(&bspline_cond, NULL);
     bspline_flush_request    = 0;
     bspline_shutdown_request = 0;
+    atomic_store_explicit(&bspline_drain_active, 0, memory_order_relaxed);
     printf("[BSpline] 引擎初始化完成 (step=%.2fmm, wake=%d, core=%d)\n",
            g_bspline_config.step_size_mm,
            g_bspline_config.wake_threshold,
@@ -213,13 +229,19 @@ void BSpline_Flush(void)
     }
     pthread_mutex_unlock(&bspline_mutex);
 
-    // 等待 flush 完成 (排空队列)
+    // 等待 flush 完成: 脏点全部消费 (dirty_count==0) 且子段已全部下发 (!drain_active)。
+    // 2026-09-08 修复: 原判据只看 dirty_count —— 但 drain 在拷贝阶段就推进 tail,
+    // push 在锁外后置, flush 可能在 push 进行中提前返回, 架空所有顺序屏障调用点。
+    // drain_active 置位在锁内/清零为 release, 与此处 acquire 配对后:
+    // Flush 返回 ⟹ 本批子段 push 全部完成且对调用方可见。
     int wait = 500; // 最多 5 秒
     while (wait > 0) {
         pthread_mutex_lock(&bspline_mutex);
         dirty_count = (g_dirty_queue.head - g_dirty_queue.tail
                        + BSPLINE_DIRTY_QUEUE_SIZE) % BSPLINE_DIRTY_QUEUE_SIZE;
-        int flush_done = (dirty_count == 0 && !bspline_flush_request);
+        int flush_done = (dirty_count == 0 && !bspline_flush_request
+                          && !atomic_load_explicit(&bspline_drain_active,
+                                                   memory_order_acquire));
         pthread_mutex_unlock(&bspline_mutex);
         if (flush_done) break;
         osal_usleep(10000);
@@ -289,11 +311,19 @@ OSAL_THREAD_FUNC bspline_thread_func(void *arg)
 
         int snapshot_count = dirty_count;
         bspline_flush_request = 0;
+        /* 2026-09-08: 锁内置 in-flight 标志 (见文件头 bspline_drain_active 注释)。
+         * 必须在解锁前置位 —— drain 内 tail 推进发生在此之后的锁外阶段,
+         * 若置位晚于解锁, Flush 可能在间隙里观察到 "dirty==0 且无 drain" 假完成。 */
+        if (snapshot_count > 0) {
+            atomic_store_explicit(&bspline_drain_active, 1, memory_order_relaxed);
+        }
 
         pthread_mutex_unlock(&bspline_mutex);
 
         if (snapshot_count > 0) {
             bspline_drain_queue(snapshot_count);
+            /* release 清零: 与 BSpline_Flush 轮询的 acquire 配对 */
+            atomic_store_explicit(&bspline_drain_active, 0, memory_order_release);
         }
 
         // 处理后再次检查队列: 若仍有残余点则立即继续 (防止滞留)

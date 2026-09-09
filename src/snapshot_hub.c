@@ -161,6 +161,11 @@ void SnapshotHub_Publish(uint32_t cycle)
     if (g_parser_ctrl.abort_request)         fl |= SMC_SNAP_FLAG_ABORT_REQ;
     if (p->hold_state != (int32_t)HOLD_NORMAL) fl |= SMC_SNAP_FLAG_HOLD;
     if (p->is_waiting_mcode)                 fl |= SMC_SNAP_FLAG_WAIT_MCODE;
+    /* 断点续切 (2026-09-08): SEARCH 已冻结边界, UI 显示"可续切"。
+     * relaxed 足够 (最终一致; ready 从 0→1 单向翻转, 无撕裂风险) */
+    if (atomic_load_explicit(&g_program_resume_ready, memory_order_relaxed)) {
+        fl |= SMC_SNAP_FLAG_RESUME_READY;
+    }
     p->flags = fl;
 
     /* payload 内 snapshot_seq = 写完成后的稳定 seq (s+2) */

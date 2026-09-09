@@ -100,9 +100,10 @@ int sim_engine_init(const char *output_path, int use_binary)
                 "gas_select,laser_emergency_kill,laser_interlock");
         // Phase B1: 功率-速度耦合速度列
         fprintf(g_sim_logger.fp, ",laser_v_actual_mm_s");
-        // P0-Laser-Q: 状态查询闭环 4 列
+        // P0-Laser-Q: 状态查询闭环 4 列 + P0-1 光闸 gate 1 列 + P0-2 气压 1 列
         fprintf(g_sim_logger.fp,
-                ",pierce_count,laser_on_time_ms,current_seg_flags,is_piercing");
+                ",pierce_count,laser_on_time_ms,current_seg_flags,is_piercing,"
+                "laser_hold_gate_off,gas_pressure_bar");
         // P0-3 SafeLift: 抬升状态机 2 列
         fprintf(g_sim_logger.fp, ",safe_lift_state,safe_lift_z_cmd");
         // P0-1 Homing + JOG: 状态机 4 列
@@ -223,6 +224,10 @@ void *sim_flush_thread_func(void *arg)
                             (long long)r->laser_on_time_ms,
                             (unsigned)r->current_seg_flags,
                             r->is_piercing);
+                    // P0-1: feedhold 光闸 gate 1 列
+                    fprintf(L->fp, ",%d", r->laser_hold_gate_off);
+                    // P0-2: 辅助气压 1 列
+                    fprintf(L->fp, ",%.3f", r->laser_gas_pressure_bar);
                     // P0-3 SafeLift: 抬升状态机 2 列
                     fprintf(L->fp, ",%d,%.3f",
                             r->safe_lift_state, r->safe_lift_z_cmd);

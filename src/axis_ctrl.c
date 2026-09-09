@@ -19,6 +19,9 @@ CommandQueue_t g_cmd_queue={0};
 static double plan_cursor[AXIS_NUM]={0};
 CoordManager_t g_coord_mgr={COORD_G54,{0},{0},{0}};
 PlannerConfig_t g_planner_config={0.05, 500.0};
+/* P0 RTCP 奇异点阈值: 编译期默认保证不调 setter 也有保护;
+ * 运行期由 SMC_ConfigSingularityRmax (kernel_init_hw 档案) 覆盖 */
+double g_rtcp_singularity_rmax = 30.0;
 
 /* ---- P0-b v1: parser → axis_ctrl 段元数据传递 (定义在此, extern 在 global_def.h) ----
  * g_seg_id_counter: 段 ID 单调递增, atomic_fetch_add 在 api_push_trajectory_impl
@@ -45,14 +48,30 @@ uint64_t         g_program_last_seg_id = 0;
 int32_t          g_program_total_lines = 0;
 int32_t          g_program_num_o_labels = 0;
 int32_t          g_program_num_n_labels = 0;
+
+/* ---- 断点续切 Phase 1 (2026-09-08): SEARCH 状态 (定义在此, extern 在 global_def.h) ----
+ * parser_thread (SEARCH 收尾) 唯一写者; SMC_ResumeSearch/Start + snapshot_hub 读。
+ * result: 0=未启动/进行中, 1=边界冻结成功, 2=行存在但非 G00 边界, 3=行不存在。 */
+_Atomic int      g_program_resume_ready  = 0;
+_Atomic int      g_program_resume_result = 0;
 /************************ 五轴系统初始化（核心配置，修改此函数即可调整轴参数） ************************/
+// @Context: Non-RealTime Background Thread (parser 线程经 api_push_trajectory_impl 调用)
+// @Safe: printf + EventLogger_Push 允许。越界拒绝时置系统报警 (对齐 G28 中间点
+//        parser 级先例 gcode_parser.c: 软限位→alarm→中止文件), 事件 0x0024 仅在
+//        拒绝分支发出 — 后续 push 被 alarm 前置检查短路, 天然单次不刷环。
 static int check_soft_limits(double target_pos[AXIS_NUM]){
     for(int i=0;i<AXIS_NUM;i++){
         if(g_axis[i].enable_soft_limit){
             if(target_pos[i]>g_axis[i].soft_limit_pos||target_pos[i]<g_axis[i].soft_limit_neg){
+                char ev_buf[64];
                 printf("[软限位] %s 目标位置%.2f 超出范围 [%.2f, %.2f]\n",
                        g_axis[i].axis_name, target_pos[i],
                        g_axis[i].soft_limit_neg, g_axis[i].soft_limit_pos);
+                snprintf(ev_buf, sizeof(ev_buf), "%s target %.2f SL [%.1f,%.1f]",
+                         g_axis[i].axis_name, target_pos[i],
+                         g_axis[i].soft_limit_neg, g_axis[i].soft_limit_pos);
+                EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0024, i, ev_buf);
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                 return 0;
             }
         }
@@ -74,6 +93,42 @@ double api_get_cursor(int axis_idx){
 
 void wait_motion_done(){
     while(g_interpolator.is_moving) osal_usleep(10000);
+}
+
+// ===================================================================
+// P1 G68.2 (2026-09-07): 「先等运动真正开始, 再等它结束」的同步等待。
+//
+// 竞态背景: api_push_trajectory() 只是把段放进 SPSC 命令队列, 而
+//   g_interpolator.is_moving 是由 RT 线程在**真正开始消费该段时**才置 1
+//   (ecat_core.c: `if (seg.T_total > 0.5) { ... is_moving = 1; }`)。
+//   因此 push 之后立刻 `while(is_moving) sleep(...)` 存在窗口:
+//   若 RT 尚未取到该段, is_moving 仍为 0, 等待**立即返回**, parser 会在
+//   定位段还没走完时就去解析下一行。
+//
+// 实测后果 (P1 G68.2 规范 §4):
+//   - TC-4 圆弧禁止 / TC-5 固定循环禁止: G68.2 自动定位段刚入队, 下一行的
+//     G02/G81 立刻触发 0x0028 报警并锁存 g_sys_alarm_state, RT 侧放弃已入队的
+//     定位段 → CSV 零数据行, B 轴根本没走到 45 (spec 要求「定位段已执行」)。
+//   - TC-8 G28 中间点: 等待提前返回后立刻 axis_homing_multi, 回零 kickoff
+//     握手与仍在飞的运动抢 RT, 2s 握手超时 → FAULT 回滚, 中间点被截断。
+//
+// 修法: 先等 is_moving 置 1 (有上限), 再等它归 0。
+//   若超时仍未启动 (零长度段走 Snap 分支不会置 is_moving / 轴未使能),
+//   退化为原语义直接返回 —— 不改变既有行为, 只是不再错误地提前放行。
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: 阻塞等待允许; 有超时上限, 不会永久挂死。
+// ===================================================================
+#define MOTION_START_TIMEOUT_MS 500
+void wait_motion_settle(void){
+    int waited = 0;
+    while(!atomic_load_explicit(&g_interpolator.is_moving, memory_order_acquire)
+          && waited < MOTION_START_TIMEOUT_MS){
+        osal_usleep(2000);
+        waited += 2;
+    }
+    while(atomic_load_explicit(&g_interpolator.is_moving, memory_order_acquire)){
+        osal_usleep(10000);
+    }
 }
 
 void api_set_zero(int axis_idx){
@@ -170,9 +225,33 @@ static inline void snapshot_wcs_offset(CoordSystem_t wcs, double out[AXIS_NUM])
         if(g_state.local_offset_active){
             for(int i = 0; i < AXIS_NUM; i++) out[i] += g_state.local_offset[i];
         }
+        // P1 (2026-09-07) G68.2: 倾斜面原点并入总平移 (与 G52 同为父系平移, 可交换)。
+        // RT 反推统一 p = Rᵀ·(g53 − active_offset), tilt=0 时退化现行减法。
+        // 注: 标准推队路径恒传 g_state.modal_wcs (idx>=0), G53 段也走此分支保持
+        //     logical 连续; 显式 COORD_G53 直调 (idx<0) 不叠 origin, 维持零基准。
+        if(g_coord_mgr.tilt_active){
+            for(int i = 0; i < AXIS_NUM; i++) out[i] += g_coord_mgr.tilt_origin[i];
+        }
     }else{
         // G53 或未定义 WCS: 零基准, 不叠加 G52
         for(int i = 0; i < AXIS_NUM; i++) out[i] = 0.0;
+    }
+}
+
+// @Context: Non-RealTime Background Thread (与 snapshot_wcs_offset 同上下文, 三处盖章点共用)
+// @Thread-Safety: 读 g_coord_mgr.tilt_* (parser 单写者, 本函数与盖章同线程)。
+// P1 G68.2: 段级倾斜面快照 (B1 教训: RT 反推每段一致, 勿读 parser 模态)。
+// tilt 未激活时盖 0 + 单位阵, 保证 RT 退化路径确定。
+static inline void stamp_tilt_snapshot(TrajectorySegment_t *seg)
+{
+    seg->is_tilt_active = g_coord_mgr.tilt_active ? 1 : 0;
+    if (g_coord_mgr.tilt_active) {
+        for (int i = 0; i < 9; i++) seg->wcs_rot_snap[i] = g_coord_mgr.tilt_rot[i];
+    } else {
+        for (int i = 0; i < 9; i++) seg->wcs_rot_snap[i] = 0.0;
+        seg->wcs_rot_snap[0] = 1.0;   // [0][0]
+        seg->wcs_rot_snap[4] = 1.0;   // [1][1]
+        seg->wcs_rot_snap[8] = 1.0;   // [2][2]
     }
 }
 
@@ -303,6 +382,81 @@ int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],
 //      parser 调用方传 g_state.modal_wcs; bspline 调用方传 DirtyPoint_t.wcs。
 // wcs_offset_snap: 段入队瞬间 work_offsets[wcs-1] 的快照。RT 拷到 active_offset,
 //                  用于 current_logical_pos 推导,隔离 parser 中途改 work_offsets 的污染。
+
+// @Context: Non-RealTime Background Thread (parser, api_push_trajectory_impl 边界拦截内)
+// @Safe: 4 次入队 (可阻塞于队列满等待) + 1 次 M 码入队 + printf。
+// 断点续切重定位前导 (Phase 1, 2026-09-08):
+//   从当前实际机床位置 (current_g53_pos, RT 每周期维护, 非 RT best-effort 读,
+//   与 macro_eval #5061 同模式; 调用时 RT 必为 IDLE — 门控保证) 安全移动到
+//   续切起点 target (边界 G00 的机械目标, G53):
+//     0) M13 P<气压> 段 —— 激光模态物理恢复。api_push_mcode 快照 g_state 全部
+//        laser pending 字段 (enable/shutter/power/freq/gas/pressure), RT 消费 M 段
+//        时 laser_rt_apply_aux 整快照生效 (laser_ctrl.c), 单段即恢复完整模态;
+//        放最前让气压在前导行程内建立。
+//     1) Z 抬升至 SafeZ (g_safe_lift_cfg, 其余轴保持) — 速度 lift_speed
+//     2) XY/AB 在 SafeZ 高度平移到 target 非 Z 分量 — 速度取参与轴 max_speed 最小值
+//     3) Z 下降到 target 高度 (穿孔/切入高度) — 速度 lift_speed
+//   软限位检查由后续 api_push_trajectory 内部 check_soft_limits 覆盖。
+//   已知限制 (Phase 1): RTCP 模态下的 G00 若被微段展开, 前导只定位到首微段目标
+//   (平面激光 G00 直达不受影响); 边界行本身不再入队 (由前导替代)。
+static void emit_resume_prelude(const double target_pos[AXIS_NUM])
+{
+    double cur[AXIS_NUM];
+    for (int i = 0; i < AXIS_NUM; i++) {
+        cur[i] = g_coord_mgr.current_g53_pos[i];
+    }
+
+    int zi = g_safe_lift_cfg.z_axis_idx;
+    double safe_z = g_safe_lift_cfg.safe_z_target_mm;
+    double vz = g_safe_lift_cfg.lift_speed_mm_s;
+    if (vz <= 1e-6) vz = 20.0;   // 配置兜底 (SMC_ConfigSafeLiftZ 默认 20)
+
+    printf("[RESUME] 重定位前导: cur=(%.2f,%.2f,%.2f) -> target=(%.2f,%.2f,%.2f) SafeZ=%.2f\n",
+           AXIS_NUM > 2 ? cur[0] : 0, AXIS_NUM > 2 ? cur[1] : 0, AXIS_NUM > 2 ? cur[2] : 0,
+           AXIS_NUM > 2 ? target_pos[0] : 0, AXIS_NUM > 2 ? target_pos[1] : 0,
+           AXIS_NUM > 2 ? target_pos[2] : 0, safe_z);
+
+    // 0) 激光模态物理恢复 (气压段, 全量快照)
+    api_push_mcode(13, 0.0, g_state.laser_gas_pressure_pending, 0.0, 0.0);
+
+    // 1) Z 抬升至 SafeZ
+    if (zi >= 0 && zi < AXIS_NUM && fabs(cur[zi] - safe_z) > 1e-6) {
+        double t[AXIS_NUM];
+        memcpy(t, cur, sizeof(t));
+        t[zi] = safe_z;
+        api_push_trajectory(t, vz, DEFAULT_ACC, DEFAULT_DEC);
+        cur[zi] = safe_z;
+    }
+
+    // 2) XY/AB 安全高度平移 (非 Z 分量)
+    double vxy = 0.0;
+    int moving = 0;
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (i == zi) continue;
+        if (fabs(target_pos[i] - cur[i]) > 1e-9) {
+            vxy = (!moving || g_axis[i].max_speed < vxy) ? g_axis[i].max_speed : vxy;
+            moving = 1;
+        }
+    }
+    if (moving) {
+        if (vxy <= 1e-6) vxy = 100.0;   // sim 无轴配置兜底
+        double t[AXIS_NUM];
+        memcpy(t, cur, sizeof(t));
+        for (int i = 0; i < AXIS_NUM; i++) {
+            if (i != zi) t[i] = target_pos[i];
+        }
+        api_push_trajectory(t, vxy, DEFAULT_ACC, DEFAULT_DEC);
+        for (int i = 0; i < AXIS_NUM; i++) {
+            if (i != zi) cur[i] = target_pos[i];
+        }
+    }
+
+    // 3) Z 下降至目标高度
+    if (zi >= 0 && zi < AXIS_NUM && fabs(target_pos[zi] - cur[zi]) > 1e-6) {
+        api_push_trajectory(target_pos, vz, DEFAULT_ACC, DEFAULT_DEC);
+    }
+}
+
 static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
                                      double speed_sec_mm, double acc_sec_mm,
                                      double dec_sec_mm,
@@ -354,6 +508,7 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
         for (int i = 0; i < AXIS_NUM; i++) {
             pv_seg.wcs_offset_snap[i] = wcs_offset_snap[i];
         }
+        stamp_tilt_snapshot(&pv_seg);   // P1 G68.2: preview 段与执行段同布局 (v4)
         pv_seg.seg_id = atomic_fetch_add_explicit(&g_seg_id_counter, 1,
                                                    memory_order_relaxed);
         pv_seg.line_no = g_current_line_no;
@@ -381,6 +536,73 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
         }
 
         return 0;   // 不入 motion queue
+    }
+
+    // ---- 断点续切 Phase 1 (2026-09-08): SEARCH 重放校验模式 ----
+    // SMC_ResumeSearch 触发: 快进重放到目标行, 不入队不推 9529。
+    // 目标行首个运动推送时校验 G00 边界并冻结机械目标位姿:
+    //   motion_mode==0 (模态/显式 G00) → result=1 (有效边界)
+    //   其他 (G01/G02/G03)            → result=2 (非边界, ResumeSearch 返回 -3)
+    // 行号比较用 g_current_line_no (物理行号, parse_gcode_line 每行入口刷新)。
+    if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH) {
+        if (g_current_line_no == g_parser_ctrl.resume_target_line &&
+            atomic_load_explicit(&g_program_resume_result, memory_order_relaxed) == 0) {
+            if (g_state.motion_mode == 0) {
+                for (int i = 0; i < AXIS_NUM; i++) {
+                    g_parser_ctrl.resume_target_pos[i] = target_pos[i];
+                }
+                atomic_store_explicit(&g_program_resume_result, 1, memory_order_release);
+            } else {
+                atomic_store_explicit(&g_program_resume_result, 2, memory_order_release);
+            }
+        }
+        // 全部行 (含目标行自身/后续微段): 仅推进虚拟光标
+        for (int i = 0; i < AXIS_NUM; i++) {
+            plan_cursor[i] = target_pos[i];
+        }
+        return 0;
+    }
+
+    // ---- 断点续切 Phase 1: RUN 重放跳段 / 边界拦截 ----
+    // SMC_ResumeStart 配置 resume_active=1 后, parser 从头重放:
+    //   line < target : 已执行区间 — 仅推进 plan_cursor (G91 链/续切衔接依赖),
+    //                   不入 motion queue 不推 9529 (UI 历史里已有这些段)
+    //   line == target: 边界 G00 行 — 先重同步光标到实际机床位置 (跳段期间光标
+    //                   走的是虚拟路径, 前导必须从实际位置规划), 再发重定位前导
+    //                   (内含激光模态恢复), 本行自身不再入队 (前导已到达其目标)
+    //   line > target : resume_active 已在前导时清零, 正常入队 (防御分支兜底:
+    //                   边界行无运动推送时补发前导到 plan_cursor = 虚拟终点)
+    if (g_parser_ctrl.program_mode == PROGRAM_MODE_RUN &&
+        g_parser_ctrl.resume_active) {
+        if (g_current_line_no < g_parser_ctrl.resume_target_line) {
+            for (int i = 0; i < AXIS_NUM; i++) {
+                plan_cursor[i] = target_pos[i];
+            }
+            return 0;
+        }
+        if (g_current_line_no == g_parser_ctrl.resume_target_line) {
+            if (!g_parser_ctrl.resume_boundary_hit) {
+                g_parser_ctrl.resume_boundary_hit = 1;
+                g_parser_ctrl.resume_active = 0;   // 前导段走正常入队路径
+                api_sync_planner_cursor();         // 虚拟光标 → 实际机床位置
+                emit_resume_prelude(target_pos);
+            }
+            // 边界行多段推送 (RTCP 微段展开等): 后续段仅推进光标 (前导已定位)
+            for (int i = 0; i < AXIS_NUM; i++) {
+                plan_cursor[i] = target_pos[i];
+            }
+            return 0;
+        }
+        // line > target
+        if (!g_parser_ctrl.resume_boundary_hit) {
+            // 边界行未产生运动推送 (纯 modal 行): 补前导至虚拟终点
+            g_parser_ctrl.resume_boundary_hit = 1;
+            g_parser_ctrl.resume_active = 0;
+            api_sync_planner_cursor();
+            emit_resume_prelude(plan_cursor);
+        } else {
+            g_parser_ctrl.resume_active = 0;
+        }
     }
 
     // ---- 第一步：计算原始偏差（mm 或 deg）----
@@ -536,6 +758,7 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     for(int i = 0; i < AXIS_NUM; i++){
         seg->wcs_offset_snap[i] = wcs_offset_snap[i];  // H-1: 冻结入队瞬间的偏置向量
     }
+    stamp_tilt_snapshot(seg);   // P1 G68.2: 段级倾斜面快照 (RT 反推用)
     seg->m_code = 0;
     seg->s_value = 0.0;
     seg->total_distance = dist;
@@ -546,6 +769,9 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->aux_laser_coupling_mode = atomic_load_explicit(&g_laser_cfg.coupling_mode,
                                                         memory_order_acquire);
     seg->aux_laser_v_thresh      = atomic_load_explicit(&g_laser_cfg.v_thresh_mm_s,
+                                                        memory_order_acquire);
+    // P1-5: 微连接系数段级快照 (微连接段是运动段, 必须在此快照)
+    seg->aux_laser_mj_ratio      = atomic_load_explicit(&g_laser_cfg.mj_ratio,
                                                         memory_order_acquire);
 
     for(int i=0;i<AXIS_NUM;i++){
@@ -606,7 +832,8 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     // ---- P0-b v1: 段元数据填充 + fork 副本到 PreviewStreamer ----
     // 必须在 write_head 推进之前完成, 保证 RT 消费者看到的 seg 字段完整
     // (RT 通过 is_ready + read_tail acquire 看到 seg_id/line_no/motion_type).
-    // PreviewStreamer_Push 内部仅 memcpy + atomic store, 无锁, 不显著延长 spinlock 持有时间.
+    // PreviewStreamer_Push 内部自旋锁 (2026-09-08 多生产者加固) + memcpy + atomic store,
+    // 临界区极短, 不显著延长 queue_spinlock 持有时间.
     // 设计上 PreviewStreamer 是只读 fork 副本, 不影响 motion queue 行为.
     seg->seg_id = atomic_fetch_add_explicit(&g_seg_id_counter, 1, memory_order_relaxed);
     seg->line_no = g_current_line_no;
@@ -637,6 +864,18 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
         return -1;
     }
     if(!g_all_axis_op_ready) return -1;
+
+    // ---- 断点续切 Phase 1 (2026-09-08): 跳段期间物理 M 码不重放 ----
+    // SEARCH 全程 / RUN 的 line<target 区间: 模态已由 parser 更新 g_state,
+    // 物理段不重放; 边界处的模态恢复由 emit_resume_prelude 的单条 M13 段
+    // 全量快照承担 (laser_rt_apply_aux 对 M 段整快照生效)。
+    // 注意: line==target 时 resume_active 已在轨迹边界拦截中清零 → 正常入队。
+    if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH ||
+        (g_parser_ctrl.program_mode == PROGRAM_MODE_RUN &&
+         g_parser_ctrl.resume_active &&
+         g_current_line_no < g_parser_ctrl.resume_target_line)) {
+        return 0;
+    }
 
     // === queue_spinlock 保护的入队临界区 (与 api_push_trajectory_impl 同模式) ===
     int head, next_head;
@@ -707,11 +946,17 @@ int api_push_mcode(int m_code, double s_value, double p_value, double q_value, d
     seg->aux_laser_power_w = g_state.laser_power_pending;
     seg->aux_laser_freq_hz = g_state.laser_freq_pending;
     seg->aux_gas_select    = g_state.gas_select;
+    // P0-2: M13 辅助气压快照 (仅 M 段链路; 运动段保持模态, 与 power/freq 同语义)
+    seg->aux_laser_gas_pressure = g_state.laser_gas_pressure_pending;
     // Phase B1: 段级耦合配置快照 (修复架构 BUG — 不再让 RT 读全局 g_laser_cfg)
     seg->aux_laser_coupling_mode = atomic_load_explicit(&g_laser_cfg.coupling_mode,
                                                         memory_order_acquire);
     seg->aux_laser_v_thresh      = atomic_load_explicit(&g_laser_cfg.v_thresh_mm_s,
                                                         memory_order_acquire);
+    // P1-5: 微连接系数段级快照 (运动段才消费, 但 M 段也快照保持一致)
+    seg->aux_laser_mj_ratio      = atomic_load_explicit(&g_laser_cfg.mj_ratio,
+                                                        memory_order_acquire);
+    stamp_tilt_snapshot(seg);   // P1 G68.2: M 段同样盖章 (RT 每段同步)
 
     // relaxed 推进 write_head: 由 spinlock release 建立可见性。
     atomic_store_explicit(&g_cmd_queue.write_head, next_head, memory_order_relaxed);

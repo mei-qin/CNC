@@ -67,6 +67,11 @@ extern "C" {
  * DRIVE=4:   0x0001 sync err / 0x0002 SW_ERROR / 0x0003 follow err hard / 0x0004 follow err warn
  * LASER=3:   0x0010 safety door / 0x0011 estop soft / 0x0012 laser ALM / 0x0013 water/gas
  * PARSER=1:  0x0020 M3/M4 rpm<=0 / 0x0021 M67/M68 oob / 0x0022 G04 neg / 0x0023 M70/M71 oob
+ *            0x0024 软限位拒绝 (api push 级, value=轴idx) / 0x0025 旋转轴 wrap 应用 (value=轴idx)
+ *            0x0026 RTCP 奇异点报警 (value=R_max*10)
+ *            0x0027 G43.5 矢量编程报警 (value: 0=不可达 1=IJK×轴字冲突 2=零矢量 3=圆弧禁止)
+ *            0x0028 G68.2 倾斜面报警 (value: 0=不可达 1=法向非法 2=圆弧禁止 3=固定循环禁止 4=定位被拒)
+ *            0x0029 倾斜面激活 (INFO) / 0x002A 倾斜面取消 (INFO, G69/M30)
  *            0x0030 LoadProgram start / 0x0031 LoadProgram done
  *            0x0032 RunLoadedProgram start / 0x0033 program done (M30) / 0x0034 abort
  * MANUAL=6:  0x0040 ClearAlarm req / 0x0041 alarm cleared (RT confirmed)

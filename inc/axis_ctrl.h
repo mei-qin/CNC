@@ -46,6 +46,8 @@ void api_move_relative(int axis_idx,double distance,double speed);
 void api_move_line_3d(double target_x,double target_y,double target_z,double speed_pulse_per_sec);
 void api_move_3d_relative(double dx,double dy,double dz,double speed);
 void wait_motion_done();
+// P1 G68.2: 先等运动开始 (上限 500ms) 再等结束 — 消除 push 后的 is_moving 竞态
+void wait_motion_settle(void);
 void api_push_abs(double tx,double ty,double tz,double speed);
 void api_push_rel(double tx,double ty,double tz,double speed);
 void api_sync_planner_cursor();

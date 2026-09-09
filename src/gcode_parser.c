@@ -104,6 +104,116 @@ static void apply_rtcp_to_pos(double pos[AXIS_NUM])
     pos[idx_z] = joint[2];
 }
 
+// ====================================================================
+// P0: 旋转轴 G90 最短路径解缠绕 (wrap-to-nearest)
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: 纯数学 (fmod/fabs), 无副作用。
+// 语义: 仅 G90 逻辑坐标调用; G91 增量精确执行; G53 机械绝对直通 (逃生通道)。
+// 边界约定: delta 折到 (-180, +180], ±180 归正方向 (与 test_rtcp_math.nc
+//           C180 边界用例兼容: +180 保持不动)。
+// 与软限位交互: wrap 后目标超限而 ±360° 候选在限内 → 选合法候选;
+//               全非法 → 保持最短值, 交 check_soft_limits 0x0024 报警。
+// ====================================================================
+static double wrap_rotary_shortest(int axis_idx, double machine_cur,
+                                   double machine_tgt, int *wrapped)
+{
+    *wrapped = 0;
+    double d = fmod(machine_tgt - machine_cur, 360.0);
+    if (d <= -180.0)    d += 360.0;   // (-360,-180] → (0,180]; -180 归正方向
+    else if (d > 180.0) d -= 360.0;   // (180,360) → (-180,0); +180 保持
+    double best = machine_cur + d;
+
+    // 本就是最短表示 (含 ±360 整数倍的 fmod 残差): 原值返回, 不发事件
+    if (fabs(machine_tgt - best) < 1e-9) return machine_tgt;
+
+    // 软限位候选选择 (机械域, 与 api 层 check_soft_limits 同一坐标系)
+    if (g_axis[axis_idx].enable_soft_limit) {
+        double lo = g_axis[axis_idx].soft_limit_neg;
+        double hi = g_axis[axis_idx].soft_limit_pos;
+        double cand_p = best + 360.0, cand_m = best - 360.0;
+        int ok_best = (best  >= lo - 1e-9 && best  <= hi + 1e-9);
+        int ok_p    = (cand_p >= lo - 1e-9 && cand_p <= hi + 1e-9);
+        int ok_m    = (cand_m >= lo - 1e-9 && cand_m <= hi + 1e-9);
+        if (!ok_best) {
+            if (ok_p && ok_m) {
+                // 行程 >720° 特例: 双候选合法, 取离原始目标近者
+                best = (fabs(cand_p - machine_tgt) <= fabs(cand_m - machine_tgt))
+                       ? cand_p : cand_m;
+            } else if (ok_p) {
+                best = cand_p;
+            } else if (ok_m) {
+                best = cand_m;
+            }
+            // 全非法: 保持 best (最短), 交软限位 0x0024 报警
+        }
+    }
+
+    *wrapped = 1;
+    return best;
+}
+
+// ====================================================================
+// P1 (2026-09-04): G43.5 矢量编程报警 — 事件 0x0027
+// value: 0=矢量不可达/构型不支持 1=IJK 与旋转轴字冲突 2=零矢量 3=圆弧禁止
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: printf + EventLogger_Push 允许。调用方负责 return -1 中止文件。
+// ====================================================================
+static void g435_vector_alarm(int reason, int src_line)
+{
+    static const char *msg[4] = {
+        "G43.5 orientation unreachable/config unsupported",
+        "G43.5 I/J/K conflicts with rotary axis words",
+        "G43.5 zero tool-axis vector",
+        "G43.5 arc (G02/G03) banned in vector mode",
+    };
+    printf("[Parser][ALARM] %s, 源行 %d\n", msg[reason & 3], src_line);
+    atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+    EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0027, reason, msg[reason & 3]);
+}
+
+// ====================================================================
+// P1 (2026-09-07): G68.2 倾斜面报警 — 事件 0x0028
+// value: 0=姿态不可达/构型不支持 1=法向非法(零矢量) 2=圆弧禁止 3=固定循环禁止 4=定位段被拒
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: printf + EventLogger_Push 允许。调用方负责 return -1 中止文件。
+// ====================================================================
+static void g682_alarm(int reason, int src_line)
+{
+    static const char *msg[5] = {
+        "G68.2 orientation unreachable/config unsupported",
+        "G68.2 zero/invalid tilt normal vector",
+        "G68.2 arc (G02/G03) banned on tilted plane",
+        "G68.2 fixed cycle (G73/G81-G83) banned on tilted plane",
+        "G68.2 auto-positioning move rejected",
+    };
+    // 注: 索引必须用 reason 本身。早期写作 msg[reason & 4] 会把 reason=1/2/3
+    //     全部折叠成 msg[0] ("orientation unreachable"), 掩盖真实拒绝原因
+    //     (P1 G682 规范 §4 TC-4 圆弧禁止时实测打印串即错, value 却是对的)。
+    printf("[Parser][ALARM] %s, 源行 %d\n", msg[reason], src_line);
+    atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+    EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0028, reason, msg[reason]);
+}
+
+// ====================================================================
+// P1 (2026-09-07): 倾斜面 XYZ 旋转 helper (行主序 R, 列=[u v n])
+// @Context: Non-RealTime Background Thread (parser 成形点/捕获块调用)
+// @Safe: 纯乘加, 无 math.h libcall
+// ====================================================================
+static void tilt_apply_rot(const double p_in[3], double p_out[3])
+{
+    const double *R = g_coord_mgr.tilt_rot;
+    p_out[0] = R[0]*p_in[0] + R[1]*p_in[1] + R[2]*p_in[2];
+    p_out[1] = R[3]*p_in[0] + R[4]*p_in[1] + R[5]*p_in[2];
+    p_out[2] = R[6]*p_in[0] + R[7]*p_in[1] + R[8]*p_in[2];
+}
+static void tilt_apply_rotT(const double p_in[3], double p_out[3])
+{
+    const double *R = g_coord_mgr.tilt_rot;
+    p_out[0] = R[0]*p_in[0] + R[3]*p_in[1] + R[6]*p_in[2];
+    p_out[1] = R[1]*p_in[0] + R[4]*p_in[1] + R[7]*p_in[2];
+    p_out[2] = R[2]*p_in[0] + R[5]*p_in[1] + R[8]*p_in[2];
+}
+
 // @Context: Non-RealTime Background Thread (parser 调用)
 // @Safe: 纯坐标变换,可使用 math.h。采样预估离线进行,与 RT 线程无关。
 //
@@ -125,12 +235,32 @@ static void apply_rtcp_to_pos(double pos[AXIS_NUM])
 //     R 值失去物理意义,但保守的 10.0 兜底仍能保护)
 //
 // 返回 R_max ≥ 1.0 (保守路径返回 ≥ 10.0)
+//
+// tip_only 选择【分母】定义 —— 两种度量的物理语义不同,不可混用:
+//
+//   tip_only=0 (运动学度量 R_kin, 既有行为, 保持不变):
+//     分母 = 全轴编程位移,旋转轴 delta 按 equivalent_radius 折算成弧长。
+//     语义: "物理轴比编程进给快多少倍" → 用于自适应打碎步长与进给压制,
+//           保证物理轴速度不超过编程进给。改动它会改变既有轨迹 → 禁止改。
+//
+//   tip_only=1 (奇异点度量 R_sing, P0-RTCP):
+//     分母 = 纯刀尖线位移 (XYZ),旋转轴变化【不】计入。
+//     语义: "刀尖微小位移是否要求巨大物理补偿" —— 旋转轴摆动是【因】
+//           (姿态变化),若把它折算进分母,分母会被放大到主导量级,
+//           把 R 稀释到 <2,奇异点永远检测不到 (TC-5 实测 1.179 vs 阈值 30)。
+//     与圆弧侧 r_seg = step_dist / arc_logical_step 的定义保持一致 ——
+//     圆弧侧 arc_logical_step 本就是纯刀尖弧长,不含旋转轴折算。
+//
+// 退化语义: 刀尖静止 (纯姿态重定位) 时 tip_only=1 的分母 ≈ 0 → 走退化分支
+//           返回 RTCP_R_MAX_DEGENERATE (10.0),不报警。这与 spec §5 对
+//           L3_kinematics_rtcp / test_rtcp_math 的期望一致。
 #define RTCP_JACOBIAN_SAMPLES_MIN  21
 #define RTCP_JACOBIAN_SAMPLES_MAX  200
 #define RTCP_JACOBIAN_SPACING_MM   5.0
 #define RTCP_R_MAX_DEGENERATE      10.0  // 退化路径保守值
 static double estimate_max_jacobian_ratio(double start_pos[AXIS_NUM],
-                                          double end_pos[AXIS_NUM])
+                                          double end_pos[AXIS_NUM],
+                                          int tip_only)
 {
     // ---- 入口防御: 旋转轴半径配置检查 (审计攻击面 3) ----
     // 若旋转轴 equivalent_radius=0,其 delta 以原始角度值参与距离计算,
@@ -146,9 +276,12 @@ static double estimate_max_jacobian_ratio(double start_pos[AXIS_NUM],
         }
     }
 
-    // ---- 计算逻辑总距离 (含旋转轴弧长折算,与打碎逻辑一致) ----
+    // ---- 计算逻辑总距离 ----
+    // tip_only=1: 跳过旋转轴,只累计刀尖线位移 (见函数头注释)。
+    // tip_only=0: 含旋转轴弧长折算,与打碎逻辑一致 (既有行为)。
     double logical_total_sq = 0.0;
     for(int j = 0; j < AXIS_NUM; j++){
+        if(tip_only && g_axis[j].axis_type == 1) continue;
         double delta = end_pos[j] - start_pos[j];
         if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
             delta = delta * (PI / 180.0) * g_axis[j].equivalent_radius;
@@ -243,7 +376,30 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
     }
 
     // ---- 1. Jacobian 预估 (21 点采样) ----
-    double R_max = estimate_max_jacobian_ratio(start_pos, end_pos);
+    // R_kin (tip_only=0): 运动学度量, 供下方自适应步长 + 进给压制使用。
+    //   必须保持既有定义 —— 改动它会改变所有既有 RTCP 轨迹的步长与进给,
+    //   直接破坏 §5 回归的 byte-identical 判据。
+    double R_max = estimate_max_jacobian_ratio(start_pos, end_pos, 0);
+
+    // ---- 1.5 P0 奇异点硬报警 (专用度量 R_sing) ----
+    // 物理含义: 旋转轴接近奇异位形时, 微小刀尖位移要求巨大的物理轴补偿运动,
+    //          R_sing (物理步长 / 刀尖线位移 峰值) 急剧上升。硬报警防止奇异段执行。
+    // 必须用 tip_only=1 的独立度量: 若沿用 R_kin, 其分母含旋转轴 eq_radius
+    //          折算 (B 摆 45° 即 62.8mm), 会把 R 稀释到 ~1.18, 奇异点永远
+    //          检测不到 —— 这是 TC-5 失败的根因 (实测 R=1.18 vs 阈值 30)。
+    // 刀尖静止 (纯姿态重定位) 时 R_sing 走退化分支 =10.0, 不报警,
+    //          与 spec §5 对 L3_kinematics_rtcp / test_rtcp_math 的期望一致。
+    double R_sing = estimate_max_jacobian_ratio(start_pos, end_pos, 1);
+    if(g_rtcp_singularity_rmax > 0.0 && R_sing > g_rtcp_singularity_rmax){
+        char ev_buf[64];
+        snprintf(ev_buf, sizeof(ev_buf), "RTCP singular R_max=%.1f>%.1f",
+                 R_sing, g_rtcp_singularity_rmax);
+        printf("[RTCP] 奇异点报警: %s (中止文件)\n", ev_buf);
+        EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0026,
+                         (int32_t)(R_sing * 10.0), ev_buf);
+        atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+        return -1;   // 打碎前拦截, 零段入队
+    }
 
     // ---- 2. 全局逻辑进给压制 (R_max > 1.0 时) ----
     // 物理含义: 若物理轴运动比逻辑刀尖快 R_max 倍,则把刀尖进给等比降低,
@@ -454,6 +610,11 @@ int parse_gcode_line(const char *gcode_line)
     int has_axis[AXIS_NUM]={0};
     double val_axis[AXIS_NUM]={0};
     double offset_i=0.0,offset_j=0.0,offset_k=0.0; // 圆弧偏移：非模态，逐行清零
+                                                        // P1: G43.5 模态下兼作刀轴矢量分量
+    int has_ijk_word=0;   // P1: 本行出现 I/J/K 字 (矢量解算触发条件; 缺分量=0)
+    int is_g682_block=0;  // P1 (2026-09-07): G68.2 倾斜面 (字母循环后捕获+自动定位)
+    int is_g683_block=0;  // P1: G68.3 欧拉角倾斜面
+    int is_g69_block=0;   // P1: G69 取消倾斜面
     int m_code=-1;
     double s_value=0.0;
     double t_value=0.0;  // P1': T 代码 (刀号)
@@ -708,10 +869,36 @@ int parse_gcode_line(const char *gcode_line)
             continue;
         }
 
-        // 括号注释 (...) — 支持 M03(LSON) 等紧贴写法
+        // 括号注释 (...) — 深度计数匹配, 支持嵌套括号与 M03(LSON) 等紧贴写法
+        // @Fix 旧实现扫描到第一个 ')' 即闭合, 注释内出现嵌套 '(' 时会提前结束,
+        //      注释剩余正文 (可能含 M30 / G53 / 轴地址字) 被当作真指令解析。
+        //      实测: "(4. 无 0x0024 (软限位未拒绝), 无报警, 程序正常 M30)"
+        //      → 泄漏 M30 提前触发安全停, 后续真实运动段全部被吞 (零段入队)。
+        // @Thread-Safety 仅访问栈上指针 p 与局部 depth, 无共享状态
         if(*p=='('){
-            while(*p!=')' && *p!='\0') p++;
-            if(*p==')') p++;
+            // @Fix (2026-09-04) 真正实现深度计数 —— 旧代码仍是"扫描到第一个 ')'",
+            //   注释里写了深度计数但实现没跟上 (修复曾在基线比对时被回退丢失)。
+            //   真实故障: tests/gcode/test_rtcp_singular_arc.nc 第 5 行
+            //     "( 本机有效 RTCP 臂 = pivot_z(200) - tool_len(150) = 50mm, B100 ..."
+            //   → 在 "pivot_z(200)" 的 ')' 处提前闭合, 残留正文里的 "B100" / "X0.03"
+            //     被当作真指令字解析, 污染 modal。TC-6 因 B 被预设而全程未触发
+            //     奇异报警 (clean 版同参数实测 r=104.3>30 正常报警)。
+            // @Safe 注释不跨行: 遇 '\n'/'\r' 强制结束 (未闭合的 '(' 不会吞掉后续真指令)。
+            //   Fanuc 语义一致。TC-6 第 5 行本身就是未闭合注释 (行尾无 ')')。
+            // @Thread-Safety 仅访问栈上指针 p 与局部 depth, 无共享状态。
+            int depth = 0;
+            while(*p != '\0' && *p != '\n' && *p != '\r'){
+                if(*p == '('){
+                    depth++;
+                    p++;
+                } else if(*p == ')'){
+                    depth--;
+                    p++;
+                    if(depth <= 0) break;   // 配对闭合, 已消耗 ')'
+                } else {
+                    p++;
+                }
+            }
             continue;
         }
         // 分号 / 百分号：后续全部忽略
@@ -856,8 +1043,34 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value==9.0)  { g_state.exact_stop_this_block = 1; }
                 else if(value==61.0) { g_state.modal_exact_stop = 1; }
                 else if(value==64.0) { g_state.modal_exact_stop = 0; }
-                else if(fabs(value - 43.4) < 0.05) g_state.rtcp_enabled = 1; // G43.4 开启RTCP
-                else if(value >= 49.0 && value < 50.0) g_state.rtcp_enabled = 0; // G49 关闭RTCP
+                // P1 (2026-09-04): G43.5 刀轴矢量编程 — I/J/K 为刀轴单位矢量,
+                // 字母循环后解算旋转角 (与 43.4 判据无重叠: 差 0.1 > 0.05)
+                else if(fabs(value - 43.5) < 0.05){
+                    g_state.rtcp_enabled = 1;
+                    g_state.vector_mode  = 1;
+                }
+                else if(fabs(value - 43.4) < 0.05){
+                    g_state.rtcp_enabled = 1;
+                    g_state.vector_mode  = 0;   // 显式降级回角度编程
+                }
+                else if(value >= 49.0 && value < 50.0){
+                    g_state.rtcp_enabled = 0; // G49 关闭RTCP
+                    g_state.vector_mode  = 0;
+                }
+                // ---- P1 (2026-09-07): G68.2/G68.3 倾斜面 / G69 取消 ----
+                // 参数捕获延迟到字母循环后 (G68.2 需 I/J/K/Q; G68.3 需 X/Y/Z 欧拉角)
+                else if(fabs(value - 68.2) < 0.05){
+                    is_g682_block   = 1;
+                    is_non_motion_g = 1;
+                }
+                else if(fabs(value - 68.3) < 0.05){
+                    is_g683_block   = 1;
+                    is_non_motion_g = 1;
+                }
+                else if(value >= 69.0 && value < 70.0){
+                    is_g69_block    = 1;
+                    is_non_motion_g = 1;
+                }
                 else if(fabs(value - 54.1) < 0.05){
                     // P5': G54.1 Pn 扩展 WCS — 字母循环后处理 (需读 P)
                     // 必须在 G54-G59 范围检查之前匹配, 否则会被误判为 G54
@@ -892,9 +1105,9 @@ int parse_gcode_line(const char *gcode_line)
                 else if(value == 99.0) g_state.cycle_retract_mode = 99;
                 break;
             case 'F':g_state.feedrate_mm_min=value;has_f=1;break;
-            case 'I':offset_i=value;has_move=1;break;
-            case 'J':offset_j=value;has_move=1;break;
-            case 'K':offset_k=value;has_move=1;break;
+            case 'I':offset_i=value;has_move=1;has_ijk_word=1;break;
+            case 'J':offset_j=value;has_move=1;has_ijk_word=1;break;
+            case 'K':offset_k=value;has_move=1;has_ijk_word=1;break;
             case 'L':
                 // Phase 2B M5: M98 L<重复次数>; 其他语境下 L 暂未使用
                 if(value < 0 || value > MAX_M98_REPEAT){
@@ -965,27 +1178,44 @@ int parse_gcode_line(const char *gcode_line)
                 // 红线 #4: Feedhold 用 time_scale, 禁止直接置 is_moving=0 或清队列
                 // 恢复路径: HMI 发 SMC_ResumeProcessing → api_motion_resume() + is_paused=0
                 else if(m_code == 0){
-                    int src_line = g_current_program ?
-                                   g_current_program->lines[g_pc].line_no : -1;
-                    g_parser_ctrl.is_paused = 1;
-                    api_motion_pause();
-                    printf("[Parser] M0 程序暂停 (源行 %d, 已发 motion_pause)\n", src_line);
-                    m_code = -1;  // 不入队
+                    // 断点续切 (2026-09-08): SEARCH 重放 / RUN 跳段区间内的 M0 属
+                    // "已执行区间", 不暂停 (目标边界在其后)
+                    if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH ||
+                        (g_parser_ctrl.program_mode == PROGRAM_MODE_RUN &&
+                         g_parser_ctrl.resume_active &&
+                         g_current_line_no < g_parser_ctrl.resume_target_line)) {
+                        m_code = -1;
+                    } else {
+                        int src_line = g_current_program ?
+                                       g_current_program->lines[g_pc].line_no : -1;
+                        g_parser_ctrl.is_paused = 1;
+                        api_motion_pause();
+                        printf("[Parser] M0 程序暂停 (源行 %d, 已发 motion_pause)\n", src_line);
+                        m_code = -1;  // 不入队
+                    }
                 }
                 // P0-2: M1 可选停 — 受 g_optional_stop_enabled 开关控制
                 // 开关关 (默认): M1 视为 no-op (兼容现有 NC 程序)
                 // 开关开 (HMI 显式启用): M1 等价 M0, 走真暂停路径
                 else if(m_code == 1){
-                    int src_line = g_current_program ?
-                                   g_current_program->lines[g_pc].line_no : -1;
-                    if (g_optional_stop_enabled) {
-                        g_parser_ctrl.is_paused = 1;
-                        api_motion_pause();
-                        printf("[Parser] M1 可选停生效 (源行 %d, 已发 motion_pause)\n", src_line);
+                    // 断点续切: 同 M0 门控
+                    if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH ||
+                        (g_parser_ctrl.program_mode == PROGRAM_MODE_RUN &&
+                         g_parser_ctrl.resume_active &&
+                         g_current_line_no < g_parser_ctrl.resume_target_line)) {
+                        m_code = -1;
                     } else {
-                        printf("[Parser] M1 optional stop 跳过 (开关关, 源行 %d)\n", src_line);
+                        int src_line = g_current_program ?
+                                       g_current_program->lines[g_pc].line_no : -1;
+                        if (g_optional_stop_enabled) {
+                            g_parser_ctrl.is_paused = 1;
+                            api_motion_pause();
+                            printf("[Parser] M1 可选停生效 (源行 %d, 已发 motion_pause)\n", src_line);
+                        } else {
+                            printf("[Parser] M1 optional stop 跳过 (开关关, 源行 %d)\n", src_line);
+                        }
+                        m_code = -1;
                     }
-                    m_code = -1;
                 }
                 // P0-1: M2/M30 安全停 5 步流程
                 // 旧行为: 直接 is_running=0, 后果 RT 队列里残留运动继续走、spindle/coolant 不关
@@ -993,6 +1223,21 @@ int parse_gcode_line(const char *gcode_line)
                 // 抢写 RT 镜像是 RT 单写者例外: 此时队列已空, RT 不会再消费任何 M 段,
                 // 写者已 quiescent, parser 安全抢写一次 (与 api_motion_resume 同级别操作)
                 else if(m_code == 2 || m_code == 30){
+                    // 断点续切 (2026-09-08):
+                    //   SEARCH 中途遇 M2/M30 → 目标行不可达 (原程序到此为止),
+                    //     result=3 终止搜索 (ResumeSearch 返回 -5)
+                    //   RUN 跳段区间 (line<target) 的 M2/M30 不触发安全停 —
+                    //     SEARCH 已保证该情形不可达, 此处防御性跳过
+                    if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH) {
+                        atomic_store_explicit(&g_program_resume_result, 3,
+                                              memory_order_release);
+                        m_code = -1;
+                    } else if (g_parser_ctrl.program_mode == PROGRAM_MODE_RUN &&
+                               g_parser_ctrl.resume_active &&
+                               g_current_line_no < g_parser_ctrl.resume_target_line) {
+                        m_code = -1;
+                    }
+                    else {
                     int src_line = g_current_program ?
                                    g_current_program->lines[g_pc].line_no : -1;
                     printf("[Parser] M%d 程序结束 → 安全停流程启动 (源行 %d)\n",
@@ -1038,6 +1283,8 @@ int parse_gcode_line(const char *gcode_line)
                     g_state.cycle_retract_mode = 0;          // G98/G99
                     g_state.bspline_enabled    = 0;          // M50 P1
                     g_state.rtcp_enabled       = 0;          // G43.4
+                    g_state.vector_mode        = 0;          // G43.5 (P1)
+                    g_coord_mgr.tilt_active    = 0;          // G68.2/G68.3 (P1)
                     g_state.pending_comp_mode  = COMP_OFF;   // G41/G42
                     g_state.local_offset_active= 0;          // G52
                     g_state.modal_ext_wcs_p    = 0;          // G54.1 Pn
@@ -1046,8 +1293,12 @@ int parse_gcode_line(const char *gcode_line)
                     g_state.laser_power_pending   = 0.0;
                     g_state.laser_freq_pending    = 0.0;
                     g_state.gas_select            = 0;
+                    g_state.laser_gas_pressure_pending = 0.0;   // P0-2
                     // Laser B4: 清段级工艺标记 modal (防跨程序泄漏)
                     g_state.laser_seg_flags       = 0;
+                    // P1-5: 微连接系数回默认 1.0 (程序级 modal, 不跨程序泄漏)
+                    atomic_store_explicit(&g_laser_cfg.mj_ratio, 1.0,
+                                          memory_order_release);
 
                     // P2-A: M30/M2 重置 override (默认行为, 除非 OVERRIDE_PERSIST 置位)
                     // 工业惯例: 每次新程序从 100% 开始, 防上次调机残留倍率影响下一件.
@@ -1090,6 +1341,7 @@ int parse_gcode_line(const char *gcode_line)
                     g_laser_rt.power_w    = 0.0;
                     g_laser_rt.freq_hz    = 0.0;
                     g_laser_rt.gas_select = 0;
+                    g_laser_rt.gas_pressure_bar = 0.0;   // P0-2: 气压同步归零
                     // P0-Laser: 触发 RT 下个 cycle 强制记录一条 sim_engine 采样,
                     // 让 CSV 末尾出现归零状态 (否则 should_log=0 → sim_engine_push 不调).
                     atomic_store_explicit(&g_sim_force_log, 1, memory_order_release);
@@ -1099,6 +1351,7 @@ int parse_gcode_line(const char *gcode_line)
                     printf("[Parser] M%d 安全停完成 (耗时 %.1fs)\n",
                            m_code, wait_ms / 1000.0);
                     m_code = -1;   // 不入队
+                    }  // 断点续切门控 else 块结束
                 }
                 // P0-3: M3/M4 S 值保护 — 拒绝 spindle_rpm<=0 的主轴启动
                 // 后果场景: 操作员忘写 S, M3 入队后 RT 等 2 秒主轴"启动"(实际没转),
@@ -1151,11 +1404,12 @@ int parse_gcode_line(const char *gcode_line)
                 // 注: P 值处理在字母循环之后 (line 1406+ if(m_code>=0) 块内) —
                 //     字母循环顺序保证 P 在 M 之后解析, 此处只识别 m_code 不读 p_value
                 //     (避免字母顺序 BUG: case 'M' 内读 p_value 时 P 字母尚未解析)
-                else if(m_code == 70 || m_code == 71){
+                else if(m_code == 70 || m_code == 71 || m_code == 77){
                     // 模态 M 代码, m_code 保持原值, 处理延迟到字母循环后 (与 M50 同模式)
                 }
                 else if(m_code == 62 || m_code == 63 || m_code == 67 ||
-                        m_code == 68 || m_code == 10 || m_code == 11 || m_code == 12){
+                        m_code == 68 || m_code == 10 || m_code == 11 ||
+                        m_code == 12 || m_code == 13){
                     if(g_laser_cfg.do_slave_id < 0){
                         // 未配置激光: 静默忽略 (不入队, 不报警)
                         m_code = -1;
@@ -1171,6 +1425,8 @@ int parse_gcode_line(const char *gcode_line)
                     else if(m_code == 10){ g_state.gas_select = 1; }  // N2
                     else if(m_code == 11){ g_state.gas_select = 2; }    // O2
                     else if(m_code == 12){ g_state.gas_select = 3; }    // Air
+                    // P0-2: M13 P<bar> 气压值在 case 'P' 校验+写 pending
+                    // (字母循环 M→P 顺序, 与 M67/M68 的 E 字段同模式; 无 P 保持模态)
                 }
                 // ---- Laser Phase B4: 引线/微连接段标记 (modal, M72-M75) ----
                 // @Context: M72-M75 是 CAM 段级工艺标记, 不依赖激光硬件配置 (do_slave_id).
@@ -1200,6 +1456,24 @@ int parse_gcode_line(const char *gcode_line)
                 if(g_state.active_cycle == 82) g_state.cycle_dwell_ms = value;
                 // Phase B2: G04 P<ms> 捕获 (与 G82 dwell 字段独立, 避免模态污染)
                 if(is_g04_block) g04_dwell_ms = value;
+                // P0-2 (2026-09-03): M13 P<bar> 辅助气压 (与 M67 E 同校验模式)
+                // 量程默认 0 → 未 RPC 配置 (0x0067) 时任何 P>0 都报警 (防呆)
+                if(m_code == 13){
+                    if(value < 0.0 || value > g_laser_cfg.pressure_max_bar){
+                        int src_line = g_current_program ?
+                                       g_current_program->lines[g_pc].line_no : -1;
+                        printf("[Parser][ALARM] M13 P=%.2f 越界 (0-%.2f bar), 源行 %d\n",
+                               value, g_laser_cfg.pressure_max_bar, src_line);
+                        atomic_store_explicit(&g_sys_alarm_state, 1,
+                                              memory_order_release);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0021,
+                                         (int32_t)(value * 1000),
+                                         "M13 gas pressure out of range");
+                        m_code = -1;
+                    } else {
+                        g_state.laser_gas_pressure_pending = value;
+                    }
+                }
                 break;
             case 'Q':
                 q_value=value;
@@ -1277,6 +1551,72 @@ int parse_gcode_line(const char *gcode_line)
         }
     }
 
+    // ---- P1 (2026-09-04): G43.5 刀轴矢量 — 字母循环后姿态解算 ----
+    // 仲裁顺序固定: ①圆弧禁止(先于冲突, 防弧 IJK 误触冲突) ②IJK×旋转轴字冲突
+    // ③零矢量 ④闭式解算 ⑤写入 val_axis/has_axis。
+    // 解算角写入后天然流经 wrap 最短路径 + 软限位 0x0024 + 奇异点 0x0026 管线
+    // (P0 三件套即解算器的安全网); has_move 已由 case 'I' 置 1, 走标准运动门控。
+    // 纯 IJK 行 (无 XYZ) = 姿态重定位段 (逻辑零位移走退化分支, 不触奇异报警)。
+    if (g_state.vector_mode && !is_g65_block && !is_g66_block
+        && !is_g682_block && !is_g683_block && !is_g69_block) {
+        int src_line = g_current_program ? g_current_program->lines[g_pc].line_no : -1;
+        if (g_state.motion_mode == 2 || g_state.motion_mode == 3) {
+            g435_vector_alarm(3, src_line);          // 圆弧在矢量模态下禁止
+            return -1;
+        }
+        if (has_ijk_word) {
+            int r1 = g_kin_config.rot_1_idx;
+            int r2 = g_kin_config.rot_2_idx;
+            if (r1 < 0 || r2 < 0) {                  // 运动学未配置 (KIN_NONE)
+                g435_vector_alarm(0, src_line);
+                return -1;
+            }
+            if (has_axis[r1] || has_axis[r2]) {      // IJK 与 B/C 轴字互斥
+                g435_vector_alarm(1, src_line);
+                return -1;
+            }
+            double mag = sqrt(offset_i * offset_i + offset_j * offset_j
+                              + offset_k * offset_k);
+            if (mag < 1e-9) {
+                g435_vector_alarm(2, src_line);
+                return -1;
+            }
+            double u[3]     = { offset_i, offset_j, offset_k };
+            // P1 G68.2 联动: 倾斜面激活时矢量按倾斜面系解释 → 变换到机床系再解算
+            // (法向 I0 J0 K1 = 垂直斜面, 符合 3+2 直觉)
+            if (g_coord_mgr.tilt_active) {
+                double u_m[3];
+                tilt_apply_rot(u, u_m);
+                u[0] = u_m[0]; u[1] = u_m[1]; u[2] = u_m[2];
+            }
+            double cur1     = g_state.current_pos[r1];
+            double cur2     = g_state.current_pos[r2];
+            double s1 = 0.0, s2 = 0.0;
+            int n_solved = 0;
+            if (Kinematics_SolveOrientation(u, cur1, cur2, &s1, &s2, &n_solved)
+                != KIN_ORIENT_OK) {
+                g435_vector_alarm(0, src_line);      // 不可达 / 构型不支持
+                return -1;
+            }
+            // 矢量是绝对姿态语义; G91 下转增量 (等效 target = s)
+            val_axis[r1] = g_state.is_absolute ? s1 : (s1 - cur1);
+            has_axis[r1] = 1;
+            if (n_solved >= 2) {
+                val_axis[r2] = g_state.is_absolute ? s2 : (s2 - cur2);
+                has_axis[r2] = 1;
+            }
+            printf("[Parser] G43.5 矢量解算: I%.4f J%.4f K%.4f → %s=%.3f%s (chain=%d)\n",
+                   offset_i, offset_j, offset_k,
+                   g_axis[r1].axis_name, s1,
+                   (n_solved >= 2) ? "" : " [rot2 保持]", g_kin_config.chain_order);
+            if (n_solved >= 2) {
+                printf("[Parser] G43.5            %s=%.3f (双解取近)\n",
+                       g_axis[r2].axis_name, s2);
+            }
+            offset_i = offset_j = offset_k = 0.0;    // 防御性清残留
+        }
+    }
+
     // ---- P2': G52 局部坐标系捕获 (字母循环结束后) ----
     // Fanuc 语义: G52 X_ Y_ Z_ 设定局部偏置绝对值, 未指定轴归零
     // 全零 (X0 Y0 Z0) 视为取消 local_offset_active
@@ -1291,6 +1631,109 @@ int parse_gcode_line(const char *gcode_line)
         g_state.local_offset_active = !all_zero;
         printf("[Parser] G52 局部坐标系 %s\n",
                g_state.local_offset_active ? "激活" : "取消");
+    }
+
+    // ---- P1 (2026-09-07): G68.2/G68.3 倾斜面捕获 + 旋转轴自动定位 ----
+    // 顺序在 G52 之后: 倾斜面原点在捕获后的总平移 (w+G52+origin) 中生效。
+    // 自动定位复用 G43.5 姿态解算器 (法向 = R 第 3 列), 定位完成后再激活 —
+    // 定位段本身不套 R (激活前), 语义对齐 CYCLE800。
+    // @Context: Non-RealTime Background Thread @Safe: 阻塞等待 + 数学允许
+    if(is_g682_block || is_g683_block || is_g69_block){
+        int src_line = g_current_program ? g_current_program->lines[g_pc].line_no : -1;
+        int wcs_idx = (g_state.modal_wcs >= COORD_G54 &&
+                       g_state.modal_wcs <= COORD_G59) ? (g_state.modal_wcs - 1) : -1;
+
+        if(is_g69_block){
+            if(g_coord_mgr.tilt_active){
+                g_coord_mgr.tilt_active = 0;
+                printf("[Parser] G69: 倾斜面已取消\n");
+                EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x002A, 0,
+                                 "tilt plane cancelled");
+            }
+            return 0;   // 本行结束, 不走运动门控
+        }
+
+        double R[9];
+        int build_ok = 1;
+        if(is_g682_block){
+            double n_in[3] = { offset_i, offset_j, offset_k };
+            build_ok = (Kinematics_BuildTiltFrame(n_in, q_value, R) == 0);
+        } else {
+            // G68.3: X/Y/Z 为固定角 (extrinsic X→Y→Z, 度), 直接读 val_axis
+            int xi = g_axis_map['X' - 'A'];
+            int yi = g_axis_map['Y' - 'A'];
+            int zi = g_axis_map['Z' - 'A'];
+            if(xi < 0 || yi < 0 || zi < 0){ g682_alarm(1, src_line); return -1; }
+            Kinematics_BuildEulerXYZ(has_axis[xi] ? val_axis[xi] : 0.0,
+                                     has_axis[yi] ? val_axis[yi] : 0.0,
+                                     has_axis[zi] ? val_axis[zi] : 0.0, R);
+        }
+        if(!build_ok){ g682_alarm(1, src_line); return -1; }
+
+        // 倾斜面原点 (仅 G68.2 有; G68.3 的 XYZ 已用作欧拉角)
+        for(int i = 0; i < AXIS_NUM; i++){
+            g_coord_mgr.tilt_origin[i] =
+                (is_g682_block && has_axis[i] && g_axis[i].axis_type != 1)
+                ? val_axis[i] : 0.0;
+        }
+
+        // ---- 自动定位: 解算法向姿态并生成 G0 级定位段 ----
+        int r1 = g_kin_config.rot_1_idx;
+        int r2 = g_kin_config.rot_2_idx;
+        if(r1 < 0 || r2 < 0){ g682_alarm(0, src_line); return -1; }
+        double n_machine[3] = { R[2], R[5], R[8] };   // R 第 3 列 = 法向在机床系的像
+        double cur1 = g_state.current_pos[r1];
+        double cur2 = g_state.current_pos[r2];
+        double s1 = 0.0, s2 = 0.0;
+        int n_solved = 0;
+        if(Kinematics_SolveOrientation(n_machine, cur1, cur2, &s1, &s2, &n_solved)
+           != KIN_ORIENT_OK){
+            g682_alarm(0, src_line); return -1;
+        }
+        // 定位段目标 (机械域): 线性轴取实际机械现位 (api_get_cursor = planner 游标,
+        // 倾斜面已激活时换面也不丢旧旋转/原点量), 旋转轴取解算绝对角
+        {
+            double pos_target[AXIS_NUM];
+            for(int i = 0; i < AXIS_NUM; i++){
+                pos_target[i] = api_get_cursor(i);
+            }
+            pos_target[r1] = s1;
+            if(n_solved >= 2) pos_target[r2] = s2;
+            if(api_push_trajectory(pos_target, 6000.0, DEFAULT_ACC, DEFAULT_DEC) < 0){
+                g682_alarm(4, src_line); return -1;   // 软限位/队列拒绝
+            }
+        }
+        // 同步等待定位完成 (G28 先例: parser 阻塞, RT 持续消费)
+        // P1: 改用 wait_motion_settle — 先等 is_moving 置 1 再等归 0。原写法在 RT
+        //     尚未取段时立即返回, 下一行 (如被禁的 G02) 会抢先报警锁存, RT 放弃
+        //     已入队的定位段 → TC-4/TC-5 的 CSV 零数据行 (spec 要求定位段已执行)。
+        wait_motion_settle();
+        api_sync_planner_cursor();
+        // 旋转轴逻辑位同步 (s 为机械绝对角, logical = s − w)
+        for(int k = 0; k < 2; k++){
+            int r = (k == 0) ? r1 : r2;
+            if(r < 0) continue;
+            if(k == 1 && n_solved < 2) continue;
+            double w;
+            if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
+                w = g_coord_mgr.work_offsets_ext[g_state.modal_ext_wcs_p - 1][r];
+            } else {
+                w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][r] : 0.0;
+            }
+            if(g_state.local_offset_active) w += g_state.local_offset[r];
+            g_state.current_pos[r] = ((k == 0) ? s1 : s2) - w;
+        }
+
+        // ---- 激活 ----
+        memcpy(g_coord_mgr.tilt_rot, R, sizeof(double) * 9);
+        g_coord_mgr.tilt_active = 1;
+        printf("[Parser] %s 倾斜面激活: 法向=(%.3f,%.3f,%.3f) Q=%.1f%s\n",
+               is_g682_block ? "G68.2" : "G68.3",
+               n_machine[0], n_machine[1], n_machine[2], q_value,
+               (n_solved >= 2) ? "" : " [rot2 保持]");
+        EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0029,
+                         (int32_t)((s1 + s2) * 10.0), "tilt plane activated");
+        return 0;   // 不走运动门控
     }
 
     // ---- Phase 2B M5: M98 子程序调用 (字母循环结束后统一处理) ----
@@ -1380,6 +1823,7 @@ int parse_gcode_line(const char *gcode_line)
 
             double target_pos[AXIS_NUM];
             double machine_target_pos[AXIS_NUM];
+            double w_arr[AXIS_NUM];
             for(int i = 0; i < AXIS_NUM; i++){
                 double w;
                 if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
@@ -1388,6 +1832,10 @@ int parse_gcode_line(const char *gcode_line)
                     w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
                 }
                 if(g_state.local_offset_active && wcs_idx >= 0) w += g_state.local_offset[i];
+                // P1 G68.2: 倾斜面原点并入总平移 (与 snapshot_wcs_offset 同步)
+                if(g_coord_mgr.tilt_active && wcs_idx >= 0)
+                    w += g_coord_mgr.tilt_origin[i];
+                w_arr[i] = w;
 
                 double start_pos = g_state.current_pos[i];
                 double machine_start = start_pos + w;
@@ -1401,6 +1849,19 @@ int parse_gcode_line(const char *gcode_line)
                     // G90: val_axis 是 WCS 逻辑坐标
                     target_pos[i] = has_axis[i] ? val_axis[i] : start_pos;
                     machine_target = target_pos[i] + w;
+                    // P0: 旋转轴最短路径 (G28 中间点也是运动目标, 与主路径同语义)
+                    if(has_axis[i] && g_axis[i].axis_type == 1 && g_axis[i].rot_wrap_enable){
+                        int wrapped = 0;
+                        double m_tgt = wrap_rotary_shortest(i, machine_start, machine_target, &wrapped);
+                        if(wrapped){
+                            char ev_buf[64];
+                            snprintf(ev_buf, sizeof(ev_buf), "G28 mid %s wrap %.2f -> %.2f",
+                                     g_axis[i].axis_name, machine_target, m_tgt);
+                            machine_target = m_tgt;
+                            target_pos[i] = m_tgt - w;
+                            EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0025, i, ev_buf);
+                        }
+                    }
                 } else {
                     // G91: val_axis 是增量
                     target_pos[i] = start_pos + (has_axis[i] ? val_axis[i] : 0);
@@ -1408,15 +1869,53 @@ int parse_gcode_line(const char *gcode_line)
                 }
                 machine_target_pos[i] = machine_target;
             }
+            // P1 G68.2: 倾斜面激活时中间点 XYZ 套旋转 (Fanuc 语义: 中间点经 WCS)
+            // G53 子分支 (机械绝对) 正向直通不套 R, 仅反推已在上方分支逐轴处理 —
+            // 反推的 Rᵀ 修正此处统一覆写 XYZ 的 target_pos。
+            if(g_coord_mgr.tilt_active && !is_G53_this_block){
+                int xi = g_axis_map['X' - 'A'];
+                int yi = g_axis_map['Y' - 'A'];
+                int zi = g_axis_map['Z' - 'A'];
+                if(xi >= 0 && yi >= 0 && zi >= 0){
+                    const double t3[3] = { target_pos[xi], target_pos[yi], target_pos[zi] };
+                    double mt[3];
+                    tilt_apply_rot(t3, mt);
+                    machine_target_pos[xi] = mt[0] + w_arr[xi];
+                    machine_target_pos[yi] = mt[1] + w_arr[yi];
+                    machine_target_pos[zi] = mt[2] + w_arr[zi];
+                }
+            }
+            if(g_coord_mgr.tilt_active && is_G53_this_block){
+                int xi = g_axis_map['X' - 'A'];
+                int yi = g_axis_map['Y' - 'A'];
+                int zi = g_axis_map['Z' - 'A'];
+                if(xi >= 0 && yi >= 0 && zi >= 0){
+                    const double d3[3] = {
+                        machine_target_pos[xi] - w_arr[xi],
+                        machine_target_pos[yi] - w_arr[yi],
+                        machine_target_pos[zi] - w_arr[zi]
+                    };
+                    double tp[3];
+                    tilt_apply_rotT(d3, tp);
+                    target_pos[xi] = tp[0];
+                    target_pos[yi] = tp[1];
+                    target_pos[zi] = tp[2];
+                }
+            }
 
             // 软限位检查 (与 axis_ctrl.c:check_soft_limits 同语义, 但该函数 static 不可直接调)
             for(int i = 0; i < AXIS_NUM; i++){
                 if(g_axis[i].enable_soft_limit){
                     if(machine_target_pos[i] > g_axis[i].soft_limit_pos ||
                        machine_target_pos[i] < g_axis[i].soft_limit_neg){
+                        char ev_buf[64];
                         printf("[Parser] G28 中间点 %s=%.3f 超软限位 [%.2f, %.2f]\n",
                                g_axis[i].axis_name, machine_target_pos[i],
                                g_axis[i].soft_limit_neg, g_axis[i].soft_limit_pos);
+                        snprintf(ev_buf, sizeof(ev_buf), "G28 mid %s=%.2f SL [%.1f,%.1f]",
+                                 g_axis[i].axis_name, machine_target_pos[i],
+                                 g_axis[i].soft_limit_neg, g_axis[i].soft_limit_pos);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0024, i, ev_buf);
                         atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
                         return -1;
                     }
@@ -1431,8 +1930,10 @@ int parse_gcode_line(const char *gcode_line)
                            ? g_state.feedrate_mm_min : 1000.0;
             printf(" (speed=%.1f mm/min)\n", speed);
 
-            // 入队中间点运动段 (复用现有 api_push_trajectory, 内部处理 WCS 入队)
-            int rc = api_push_trajectory(target_pos, speed, DEFAULT_ACC, DEFAULT_DEC);
+            // 入队中间点运动段 — 推机械域目标 (与主运动分发 :api_push_trajectory(machine_target_pos)
+            // 同语义; 原实现误推逻辑域 target_pos, w≠0 时中间点错位 — P1 (2026-09-07) 修正,
+            // w=0 (默认 SetZero) 时两者相等, 既有 g28 用例行为不变)
+            int rc = api_push_trajectory(machine_target_pos, speed, DEFAULT_ACC, DEFAULT_DEC);
             if(rc < 0){
                 printf("[Parser] G28 中间点入队失败 (rc=%d)\n", rc);
                 atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
@@ -1441,9 +1942,10 @@ int parse_gcode_line(const char *gcode_line)
 
             // 同步等待运动段完成 (parser_thread 阻塞, RT 持续消费 queue)
             // 与 axis_homing_multi 同模式, Non-RT 安全
-            while(atomic_load_explicit(&g_interpolator.is_moving, memory_order_acquire)){
-                osal_usleep(10000);  // 10ms
-            }
+            // P1: 改用 wait_motion_settle — 原写法在 RT 尚未取段时立即返回,
+            //     导致 axis_homing_multi 与仍在飞的中间点运动抢 RT,
+            //     kickoff 握手 2s 超时 → FAULT 回滚, 中间点被截断 (TC-8)。
+            wait_motion_settle();
             // 同步 plan_cursor (避免后续段基于过期位置, 与 JOG/SafeLift 同模式)
             api_sync_planner_cursor();
             // 更新 parser current_pos (中间点已到达, 后续 G28 homing 不影响 current_pos)
@@ -1639,6 +2141,54 @@ int parse_gcode_line(const char *gcode_line)
                 printf("[Parser] 激光 v_thresh = %.2f mm/s\n", p_value);
             }
             // M71 不入队
+        }
+        // P1-5 (2026-09-03): M77 P<ratio> 微连接段功率系数 (modal, 不入队)
+        // SEG_FLAG_MICRO_JOINT (M74/M75 包裹) 段 coupling ratio × ratio → 降功率不切穿。
+        // 入队时快照到 seg.aux_laser_mj_ratio (与 M70/M71 同 B1 段级快照模式)。
+        else if (m_code == 77) {
+            if (g_laser_cfg.do_slave_id < 0) {
+                // 未配置激光: 静默忽略
+            } else if (p_value <= 0.0 || p_value > 1.0) {
+                int src_line = g_current_program ?
+                               g_current_program->lines[g_pc].line_no : -1;
+                printf("[Parser][ALARM] M77 P=%.3f 越界 (0-1], 源行 %d\n",
+                       p_value, src_line);
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0023,
+                                 (int32_t)(p_value * 1000), "M77 mj ratio P oob");
+            } else {
+                atomic_store_explicit(&g_laser_cfg.mj_ratio, p_value,
+                                      memory_order_release);
+                printf("[Parser] 微连接功率系数 = %.3f\n", p_value);
+            }
+            // M77 不入队
+        }
+        // P1-4 (2026-09-03): M76 P<级数> 渐进穿孔 (queued M 段, 台阶表由 RPC 0x0069 配)
+        // 逐级 {功率/频率/停留} 驱动, 整体完成 pierce_count++ 并恢复 M67/M68 切割参数。
+        // hold 冻结: P0-1 gate 拦 timer++ → 暂停时台阶不推进 (闸关不计时)。
+        else if (m_code == 76) {
+            int stages = (int)(p_value + 0.5);
+            if (g_laser_cfg.do_slave_id < 0) {
+                // 未配置激光: 静默忽略
+            } else if (fabs(p_value - (double)stages) > 1e-6 || stages < 1
+                       || stages > g_laser_cfg.pierce_table_len) {
+                int src_line = g_current_program ?
+                               g_current_program->lines[g_pc].line_no : -1;
+                printf("[Parser][ALARM] M76 P=%.2f 级数非法 (1-%d 整数), 源行 %d\n",
+                       p_value, g_laser_cfg.pierce_table_len, src_line);
+                atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0023,
+                                 (int32_t)(p_value * 1000), "M76 pierce stages oob");
+                return -1;
+            } else {
+                // p_value 复用 dwell_ms 通道传级数 (RT: mcode_p_value_ms)
+                if(api_push_mcode(76, 0.0, (double)stages, 0.0, 0.0) < 0){
+                    printf("[Parser] M76 入队失败(报警)，中止当前文件！\n");
+                    return -1;
+                }
+                printf("[Parser] M76 渐进穿孔: %d 级\n", stages);
+            }
+            m_code = -1;   // 已手动入队, 不走默认路径
         } else {
             if(api_push_mcode(m_code, s_value, p_value, q_value, r_value) < 0){
                 printf("[Parser] M代码入队失败(报警)，中止当前文件！\n");
@@ -1651,6 +2201,12 @@ int parse_gcode_line(const char *gcode_line)
     // ---- Phase 2A.2: 固定循环优先路径 (在常规运动门控前拦截) ----
     // 固定循环激活时, XY 运动展开为钻孔循环; 跳过常规 G00/G01/G02/G03 分发
     if(has_move && !is_non_motion_g && g_state.active_cycle != 0){
+        // P1 G68.2: 倾斜面激活时固定循环禁止 (Z 轴硬编码假设, 二期专项支持)
+        if(g_coord_mgr.tilt_active){
+            g682_alarm(3, g_current_program ?
+                             g_current_program->lines[g_pc].line_no : -1);
+            return -1;
+        }
         int z_idx_fc = g_axis_map['Z' - 'A'];
         if(z_idx_fc < 0){
             printf("[Parser] 固定循环要求 Z 轴已映射！拒绝执行\n");
@@ -1735,6 +2291,9 @@ int parse_gcode_line(const char *gcode_line)
             // P2': back-calc 用的 w 必须用 effective offset (WCS+G52),
             //       否则下一行正常模式下 start_pos 与 machine_start 会对不上 G52 量
             // P5': w 优先取 ext WCS (G54.1 Pn), 否则 regular WCS (G54-G59)
+            // P1 G68.2: w 含 tilt_origin; 正向直通不套 R (机械坐标天然 bypass),
+            //           反推 target = Rᵀ·(machine − w) 保证逻辑域连续
+            double w_arr[AXIS_NUM];
             for(int i=0;i<AXIS_NUM;i++){
                 double w;
                 if(g_state.modal_ext_wcs_p >= 1 && g_state.modal_ext_wcs_p <= 48){
@@ -1743,11 +2302,42 @@ int parse_gcode_line(const char *gcode_line)
                     w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
                 }
                 if(g_state.local_offset_active && wcs_idx >= 0) w += g_state.local_offset[i];
+                if(g_coord_mgr.tilt_active && wcs_idx >= 0) w += g_coord_mgr.tilt_origin[i];
+                w_arr[i] = w;
                 start_pos[i] = g_state.current_pos[i];
                 machine_start_pos[i] = start_pos[i] + w;
                 machine_target_pos[i] = has_axis[i] ? val_axis[i] : machine_start_pos[i];
                 // 反推逻辑坐标 (在 WCS+G52 空间), 保证下一行回到正常模式时起点不撕裂
                 target_pos[i] = machine_target_pos[i] - w;
+            }
+            // P1 G68.2: 倾斜面激活时 XYZ 三轴覆写
+            //   machine_start = R·start + w (逻辑 start 的机械像, 与正常分支一致)
+            //   target = Rᵀ·(machine_target − w)
+            if(g_coord_mgr.tilt_active){
+                int xi = g_axis_map['X' - 'A'];
+                int yi = g_axis_map['Y' - 'A'];
+                int zi = g_axis_map['Z' - 'A'];
+                if(xi >= 0 && yi >= 0 && zi >= 0){
+                    const double s3[3] = { start_pos[xi], start_pos[yi], start_pos[zi] };
+                    const double d3[3] = {
+                        machine_target_pos[xi] - w_arr[xi],
+                        machine_target_pos[yi] - w_arr[yi],
+                        machine_target_pos[zi] - w_arr[zi]
+                    };
+                    double ms[3], tp[3];
+                    tilt_apply_rot(s3, ms);
+                    tilt_apply_rotT(d3, tp);
+                    machine_start_pos[xi] = ms[0] + w_arr[xi];
+                    machine_start_pos[yi] = ms[1] + w_arr[yi];
+                    machine_start_pos[zi] = ms[2] + w_arr[zi];
+                    // 未指定轴的 machine_target = machine_start (保持现位语义)
+                    if(!has_axis[xi]) machine_target_pos[xi] = machine_start_pos[xi];
+                    if(!has_axis[yi]) machine_target_pos[yi] = machine_start_pos[yi];
+                    if(!has_axis[zi]) machine_target_pos[zi] = machine_start_pos[zi];
+                    target_pos[xi] = tp[0];
+                    target_pos[yi] = tp[1];
+                    target_pos[zi] = tp[2];
+                }
             }
         }else{
             // 正常模式：val_axis 是逻辑坐标，按 G90/G91 计算
@@ -1759,6 +2349,7 @@ int parse_gcode_line(const char *gcode_line)
                     target_pos[i] = g_state.current_pos[i] + (has_axis[i] ? val_axis[i] : 0);
                 }
             }
+            double w_arr[AXIS_NUM];
             for(int i=0;i<AXIS_NUM;i++){
                 // P2': push 时也需包含 G52 stacking, 与 snapshot_wcs_offset 保持一致,
                 // 否则 RT 用 snap 反推 logical 会撕裂 G52 量
@@ -1770,8 +2361,50 @@ int parse_gcode_line(const char *gcode_line)
                     w = (wcs_idx >= 0) ? g_coord_mgr.work_offsets[wcs_idx][i] : 0.0;
                 }
                 if(g_state.local_offset_active) w += g_state.local_offset[i];
+                // P1 G68.2: 倾斜面原点并入总平移 — 与 axis_ctrl.c snapshot_wcs_offset 同步!
+                if(g_coord_mgr.tilt_active) w += g_coord_mgr.tilt_origin[i];
+                w_arr[i] = w;
                 machine_target_pos[i] = target_pos[i] + w;
                 machine_start_pos[i] = start_pos[i] + w;
+
+                // P0: 旋转轴 G90 最短路径解缠绕 (G91/G53 不进此分支:
+                // G53 在上方分支直通, G91 由 is_absolute 条件排除)
+                if(g_state.is_absolute && has_axis[i] &&
+                   g_axis[i].axis_type == 1 && g_axis[i].rot_wrap_enable){
+                    int wrapped = 0;
+                    double m_tgt = wrap_rotary_shortest(i, machine_start_pos[i],
+                                                        machine_target_pos[i], &wrapped);
+                    if(wrapped){
+                        char ev_buf[64];
+                        snprintf(ev_buf, sizeof(ev_buf), "%s wrap %.2f -> %.2f",
+                                 g_axis[i].axis_name, machine_target_pos[i], m_tgt);
+                        machine_target_pos[i] = m_tgt;
+                        target_pos[i] = m_tgt - w;   // 保持逻辑/机械反推一致 (旋转轴, R 不作用)
+                        printf("[Parser] %s\n", ev_buf);
+                        EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0025, i, ev_buf);
+                    }
+                }
+            }
+            // P1 G68.2: 倾斜面激活时 XYZ 线性轴覆写 machine = R·p + w
+            // (R 只作用线性轴, B/C 角度不旋转; w 已含 tilt_origin; G91 逻辑域计算
+            //  在上方 target 成形完成, 此处统一变换, 无需分支处理)
+            if(g_coord_mgr.tilt_active){
+                int xi = g_axis_map['X' - 'A'];
+                int yi = g_axis_map['Y' - 'A'];
+                int zi = g_axis_map['Z' - 'A'];
+                if(xi >= 0 && yi >= 0 && zi >= 0){
+                    const double t3[3] = { target_pos[xi], target_pos[yi], target_pos[zi] };
+                    const double s3[3] = { start_pos[xi], start_pos[yi], start_pos[zi] };
+                    double mt[3], ms[3];
+                    tilt_apply_rot(t3, mt);
+                    tilt_apply_rot(s3, ms);
+                    machine_target_pos[xi] = mt[0] + w_arr[xi];
+                    machine_target_pos[yi] = mt[1] + w_arr[yi];
+                    machine_target_pos[zi] = mt[2] + w_arr[zi];
+                    machine_start_pos[xi] = ms[0] + w_arr[xi];
+                    machine_start_pos[yi] = ms[1] + w_arr[yi];
+                    machine_start_pos[zi] = ms[2] + w_arr[zi];
+                }
             }
         }
 
@@ -1836,6 +2469,12 @@ int parse_gcode_line(const char *gcode_line)
         }
 
         if(g_state.motion_mode==2 || g_state.motion_mode==3){
+            // P1 G68.2: 倾斜面激活时圆弧禁止 (平面重映射列二期; 0x0028 reason=2)
+            if(g_coord_mgr.tilt_active){
+                g682_alarm(2, g_current_program ?
+                             g_current_program->lines[g_pc].line_no : -1);
+                return -1;
+            }
             double off_1st, off_2nd;
             switch(g_state.active_plane){
                 case 18: off_1st=offset_k; off_2nd=offset_i; break;
@@ -1934,7 +2573,13 @@ int parse_gcode_line(const char *gcode_line)
                     printf("[Parser] 刀补引擎入队失败(报警)，中止当前文件！\n");
                     return -1;
                 }
-            } else if(!will_bypass_bspline){
+            } else if(!will_bypass_bspline &&
+                      // 断点续切 (2026-09-08): 跳段区间不喂蓄水池 — bspline 延迟推送
+                      // 携带的是"推送时刻"的行号, 会以当前 line_no 混入已执行区间;
+                      // 改走直通路径由 impl 跳段分支统一丢弃
+                      g_parser_ctrl.program_mode != PROGRAM_MODE_SEARCH &&
+                      !(g_parser_ctrl.program_mode == PROGRAM_MODE_RUN &&
+                        g_parser_ctrl.resume_active)){
                 // G01 + B-Spline 模式: 通过平滑引擎入队
                 if(BSpline_PushDirtyPoint(machine_target_pos, speed_mm_sec, g93_T_sec) < 0){
                     printf("[Parser] B-Spline入队失败(报警)，中止当前文件！\n");
@@ -1998,13 +2643,18 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             }
 
             printf("[Parser] Processing file: %s (mode=%s)\n", g_parser_ctrl.filepath,
-                   g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? "PREVIEW" : "RUN");
+                   g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? "PREVIEW" :
+                   (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH ? "SEARCH" : "RUN"));
 
-            /* P1-b: 程序生命周期事件 - 解析启动 */
+            /* P1-b: 程序生命周期事件 - 解析启动
+             * 断点续切 (2026-09-08): SEARCH 启动走 0x0039 (重放校验, 区分于 preview/run) */
             EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER,
-                             g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? 0x0030 : 0x0032,
+                             g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? 0x0030 :
+                             (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH ? 0x0039 : 0x0032),
                              0, g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ?
-                                "LoadProgram start (preview)" : "RunLoadedProgram start");
+                                "LoadProgram start (preview)" :
+                                (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH ?
+                                 "ResumeSearch start (replay)" : "RunLoadedProgram start"));
 
             // ---- P0-b v2: 程序级统计清零 (每次启动 parser 都清, 不论 RUN/PREVIEW) ----
             // bbox 用 ±1e18 哨兵, 首段必然更新; 无运动段的程序保留哨兵, UI 自查。
@@ -2019,7 +2669,11 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             g_program_total_lines = 0;
             g_program_num_o_labels = 0;
             g_program_num_n_labels = 0;
-            atomic_store_explicit(&g_program_load_done, 0, memory_order_release);
+            // 断点续切: SEARCH 不清 load_done — 它是 UI 的 LoadProgram 状态信号,
+            // 搜索只是校验, 不改变"已加载待运行/续切"语义
+            if (g_parser_ctrl.program_mode != PROGRAM_MODE_SEARCH) {
+                atomic_store_explicit(&g_program_load_done, 0, memory_order_release);
+            }
 
             // ---- Phase 2B M1: 全文加载替代 fgets 流 ----
             // 一次性把文件读入内存, 建立 N 标签表, 供 PC 游标遍历 + GOTO 跳转
@@ -2088,6 +2742,21 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                     break;
                 }
 
+                // ---- 断点续切 (2026-09-08): SEARCH 重放的退出条件 ----
+                // result!=0: 目标行已完整解析 (1=边界冻结 / 2=非G00边界)
+                //            或 SEARCH 中途遇 M2/M30 (3=目标不可达) — 均止于整行解析后
+                // 当前行 == 目标行且 result 仍为 0: 该行无任何运动推送 (纯 modal 行)
+                //   → 非 G00 边界, finalize 时统一映射 result=2
+                if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH) {
+                    if (atomic_load_explicit(&g_program_resume_result,
+                                             memory_order_acquire) != 0) {
+                        break;
+                    }
+                    if (prog->lines[g_pc].line_no == g_parser_ctrl.resume_target_line) {
+                        break;
+                    }
+                }
+
                 // 跳转信号消费: parse_gcode_line 内部设置 g_pc_jump_pending
                 if(g_pc_jump_pending){
                     g_pc = g_pc_jump_target;
@@ -2095,6 +2764,57 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 } else {
                     g_pc++;
                 }
+            }
+
+            // ---- 断点续切: SEARCH 模式收尾 (2026-09-08) ----
+            // 不走下方 M30 级清理 (SEARCH 未入队任何段: 无需 flush/无需模态复位 —
+            // g_state 保留重放建立的边界模态, 供 UI 参考; 正式续切由 ResumeStart
+            // 从头重放重建, 不依赖此处状态)。
+            if (g_parser_ctrl.program_mode == PROGRAM_MODE_SEARCH) {
+                int r = atomic_load_explicit(&g_program_resume_result,
+                                             memory_order_acquire);
+                if (g_parser_ctrl.abort_request || abort_file) {
+                    // 搜索被中止: 映射 3 (行不可达), 让阻塞的 ResumeSearch 拿到确定返回
+                    atomic_store_explicit(&g_program_resume_result, 3,
+                                          memory_order_release);
+                    EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x0038,
+                                     g_parser_ctrl.resume_target_line,
+                                     "ResumeSearch aborted");
+                } else if (r == 1) {
+                    // 边界行完整解析后 result=1: 冻结完成, 可 ResumeStart
+                    // 注: 若刀补引擎在边界处仍激活, Phase 1 拒绝 (补偿引擎缓冲的
+                    // 跨行输出与跳段行号语义冲突; 激光程序不走刀补, 不受影响)
+                    if (CutterComp_GetMode() != COMP_OFF) {
+                        atomic_store_explicit(&g_program_resume_result, 2,
+                                              memory_order_release);
+                        EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x0038,
+                                         g_parser_ctrl.resume_target_line,
+                                         "ResumeSearch rejected (cutter comp active at boundary)");
+                    } else {
+                        atomic_store_explicit(&g_program_resume_ready, 1,
+                                              memory_order_release);
+                        EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0036,
+                                         g_parser_ctrl.resume_target_line,
+                                         "ResumeSearch done (G00 boundary frozen)");
+                    }
+                } else {
+                    // r==0 (行存在但无运动推送) → 2; r==2/3 原样
+                    if (r == 0) r = 2;
+                    atomic_store_explicit(&g_program_resume_result, r,
+                                          memory_order_release);
+                    EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x0038,
+                                     g_parser_ctrl.resume_target_line,
+                                     r == 2 ? "ResumeSearch rejected (not a G00 boundary)"
+                                            : "ResumeSearch rejected (line not found)");
+                }
+                Program_Free(prog);
+                g_current_program = NULL;
+                // 回落 PREVIEW 语义: GetProgramStructure 的 is_loaded 状态机不受
+                // 未知模式影响; UI 用 snapshot RESUME_READY 位区分"待续切"
+                g_parser_ctrl.program_mode = PROGRAM_MODE_PREVIEW;
+                g_parser_ctrl.is_running = 0;
+                g_parser_ctrl.abort_request = 0;
+                continue;   // 回 while(1) 主循环 (is_running=0 → 休眠)
             }
 
             Program_Free(prog);
@@ -2499,7 +3219,34 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
     }
 
     double angle_step = total_angle / num_segments;
+    // P0: 圆弧微段逻辑步长 (循环不变量) — 奇异点逐微段检查用
+    // arc_logical_step     : 含旋转轴折算 (helical_length 原定义), 供速度/时间预算。
+    // arc_logical_step_tip : 纯刀尖弧长 (跳过旋转轴折算), 仅供奇异点检查 ——
+    //   P0-Fix (2026-09-04): 旧实现 r_seg 分母用 helical_length, 其中旋转轴折算
+    //   (TC-6: B60°×80mm=83.78mm) 占主导, 把纯弧长 6.28mm 稀释 ~13 倍,
+    //   r_seg≈1.x 永远够不到阈值 —— 与直线侧 R_sing 的 root cause (分母含旋转
+    //   折算稀释) 完全同构。修复后分母 = 刀尖真实弧长, 分子仍为物理全轴步长
+    //   (含折算), 语义 = "单位刀尖位移要求的物理轴运动倍数"。
+    // @Context: parser 线程 (非 RT), 循环不变量, 无共享状态访问
+    // @Safe: 纯算术, 无 malloc/阻塞
+    double non_plane_tip_sq = 0.0;
+    for(int j = 0; j < AXIS_NUM; j++){
+        if(j != ax1 && j != ax2 && g_axis[j].axis_type != 1){
+            double delta = end_pos[j] - start_pos[j];
+            non_plane_tip_sq += delta * delta;
+        }
+    }
+    double helical_length_tip = sqrt(arc_length * arc_length + non_plane_tip_sq);
+    double arc_logical_step     = helical_length / (double)num_segments;
+    double arc_logical_step_tip = helical_length_tip / (double)num_segments;
     double next_pos[AXIS_NUM];
+    /* P0-Fix (2026-09-03): 上一微段的物理坐标 (RTCP 逆解后), 用于计算【微段自身】
+     * 物理步长。不可用 api_get_cursor() 代替 —— 那是规划游标, parser 领先 RT
+     * (队列积压) 时会滞后数百个微段, 使 delta 变成"累计位移"而非单段步长,
+     * 令 r_seg 被放大约队列长度倍 → 末段 (强制对齐 end_pos) 必然误报奇异点。
+     * 与直线侧 estimate_max_jacobian_ratio() 的纯几何定义保持一致。 */
+    double prev_phys[AXIS_NUM];
+    int    have_prev_phys = 0;
 
     // ---- 6. 逐点插补 ----
     for(int i = 1; i <= num_segments; i++){
@@ -2538,6 +3285,57 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
                 phys_dist_sq += delta * delta;
             }
             double phys_dist = sqrt(phys_dist_sq);
+
+            // P0 奇异点硬报警: 逐微段 phys/log 比, 与直线侧 R_max 同定义同阈值。
+            // 圆弧无预估采样, 微段级检查密度更高; 中途报警时前段已入队,
+            // alarm 置位后 RT 走 HOLD_BRAKING 安全停车 (既有语义)。
+            //
+            // P0-Fix (2026-09-03): r_seg 必须用【本微段自身】物理步长 (相邻采样点
+            // 之差), 不能用 phys_dist (相对滞后规划游标)。否则队列积压时
+            // r_seg 被放大约队列长度倍。
+            //
+            // 末段 (i == num_segments) 豁免: 该段被强制对齐到 end_pos 以消除浮点
+            // 累积误差。当 end_pos 与圆弧几何不自洽 (例: G02 X10 Y10 I5 J0 ——
+            // 圆心(5,0) 半径 5, 而终点(10,10) 到圆心距离 11.18 ≠ 5, 不在圆上) 时,
+            // 末段会出现毫米级位置瞬跳 (实测 6.18mm), 这是几何修正而非 Jacobian
+            // 奇异, 用它做比值必然误报 (实测 r=970.8>30 触发报警急停, 运动腰斩)。
+            // 注: 该瞬跳本身是既有缺陷 (G93 路径豁免短板限幅 → 超速), 独立跟踪。
+            if(g_rtcp_singularity_rmax > 0.0 && arc_logical_step > 1e-9
+               && i < num_segments){
+                double step_pos[AXIS_NUM];
+                if(!have_prev_phys){
+                    memcpy(step_pos, start_pos, sizeof(step_pos));
+                    apply_rtcp_to_pos(step_pos);   // 起点物理坐标 (首微段基准)
+                    have_prev_phys = 1;
+                } else {
+                    memcpy(step_pos, prev_phys, sizeof(step_pos));
+                }
+                double step_sq = 0.0;
+                for(int j = 0; j < AXIS_NUM; j++){
+                    double d = next_pos[j] - step_pos[j];
+                    if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0){
+                        d = d * (PI / 180.0) * g_axis[j].equivalent_radius;
+                    }
+                    step_sq += d * d;
+                }
+                double step_dist = sqrt(step_sq);
+                memcpy(prev_phys, next_pos, sizeof(prev_phys));
+
+                // P0-Fix (2026-09-04): 分母改用 arc_logical_step_tip (纯刀尖弧长),
+                // 旧分母 arc_logical_step 含旋转轴折算会把 r 稀释 ~13 倍 (见上)。
+                double r_seg = step_dist / arc_logical_step_tip;
+                if(r_seg > g_rtcp_singularity_rmax){
+                    char ev_buf[64];
+                    snprintf(ev_buf, sizeof(ev_buf), "RTCP arc singular r=%.1f>%.1f seg %d/%d",
+                             r_seg, g_rtcp_singularity_rmax, i, num_segments);
+                    printf("[RTCP] 圆弧奇异点报警: %s (中止文件)\n", ev_buf);
+                    EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0026,
+                                     (int32_t)(r_seg * 10.0), ev_buf);
+                    atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+                    return -1;
+                }
+            }
+
             seg_speed = (dt_per_seg > 1e-9) ? phys_dist / dt_per_seg : 1e-6;
             if(seg_speed < 1e-6) seg_speed = 1e-6;
         } else {

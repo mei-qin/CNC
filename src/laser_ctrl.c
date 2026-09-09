@@ -109,6 +109,9 @@ void laser_ctrl_init(void)
     // AO 通道偏移默认
     g_laser_cfg.ch_ao_power = 0;
     g_laser_cfg.ch_ao_freq  = 1;
+    // P0-2: 气压通道默认 2 (功率 0 / 频率 1 之后); 量程 0 = 未配置不输出
+    g_laser_cfg.ch_ao_pressure  = 2;
+    g_laser_cfg.pressure_max_bar = 0.0;
 
     // 物理量程默认
     g_laser_cfg.power_max_w = 3000.0;
@@ -125,12 +128,22 @@ void laser_ctrl_init(void)
     g_laser_cfg.couple_table[1].ratio  = 1.0;
     g_laser_cfg.couple_table_len = 2;
 
+    // P1-5: 微连接功率系数默认 1.0 (不衰减, 兼容既有程序)
+    atomic_store_explicit(&g_laser_cfg.mj_ratio, 1.0, memory_order_release);
+
+    // P1-4: 渐进穿孔默认表 1 级 (全功率 500ms — 与 G04+M67 组合的既有语义等价)
+    g_laser_cfg.pierce_table[0].power_w  = 3000.0;
+    g_laser_cfg.pierce_table[0].freq_hz  = 2000.0;
+    g_laser_cfg.pierce_table[0].dwell_ms = 500;
+    g_laser_cfg.pierce_table_len = 1;
+
     // RT 状态归零
     g_laser_rt.enable           = 0;
     g_laser_rt.shutter          = 0;
     g_laser_rt.power_w          = 0.0;
     g_laser_rt.freq_hz          = 0.0;
     g_laser_rt.gas_select       = 0;
+    g_laser_rt.gas_pressure_bar = 0.0;   // P0-2: 气压设定归零
     g_laser_rt.emergency_kill   = 0;
     g_laser_rt.interlock_status = 0;
     // Phase B1: P_base / v_actual 归零
@@ -139,6 +152,8 @@ void laser_ctrl_init(void)
     // P0-Laser-Q: 加工统计归零 (跨程序累计, 仅 init 阶段清零一次)
     g_laser_rt.pierce_count     = 0;
     g_laser_rt.laser_on_time_ms = 0;
+    // P0-1: feedhold 光闸 gate 归零 (运行期由 HOLD 状态机每 cycle 重写, 此处仅初始化语义)
+    g_laser_rt.hold_gate_off    = 0;
 }
 
 // =====================================================================
@@ -217,6 +232,15 @@ void laser_rt_coupling_update(void)
     }
 
     double ratio = laser_lookup_ratio(v_curr_mm_s);
+
+    // P1-5 (2026-09-03): 微连接段功率系数
+    // SEG_FLAG_MICRO_JOINT 置位段 (M74/M75 包裹): ratio × mj_ratio → 降功率不切穿。
+    // 引线段 (bit0) 不调 — 引线在废料区, 保持全功率。
+    if (g_laser_rt.current_seg_flags & SEG_FLAG_MICRO_JOINT) {
+        ratio *= g_laser_rt.mj_ratio_rt;
+        if (ratio > 1.0) ratio = 1.0;
+        if (ratio < 0.0) ratio = 0.0;
+    }
     g_laser_rt.power_w = g_laser_rt.P_base_w * ratio;
 
     // === B1 末端诊断 (验证 v_actual 链路, 验证后删除) ===
@@ -279,6 +303,21 @@ void laser_rt_apply_aux(const TrajectorySegment_t *seg)
     g_laser_rt.P_base_w   = seg->aux_laser_power_w;   // 基准功率 (耦合 update 的参考)
     g_laser_rt.freq_hz    = seg->aux_laser_freq_hz;
     g_laser_rt.gas_select = seg->aux_gas_select;
+    // P0-2: M13 辅助气压 (仅 M 段同步, 运动段模态保持)
+    g_laser_rt.gas_pressure_bar = seg->aux_laser_gas_pressure;
+}
+
+// @Context: 1ms Hard-RT Thread (M76 段加载 + 等待块台阶推进)
+// @Danger:   仅数组读 + 字段赋值 (无 math.h/阻塞/malloc/printf)
+// P1-4 (2026-09-03): 写入第 idx 级穿孔台阶 (功率/频率)。
+// 穿孔期 is_moving=0 → coupling_update 直接 return, 台阶值稳定输出 (与 M64 同机理);
+// 整体完成时由等待块恢复 g_interpolator.laser_*_w_rt 段快照 (切割参数)。
+void laser_rt_apply_pierce_stage(int idx)
+{
+    if (idx < 0 || idx >= g_laser_cfg.pierce_table_len) return;
+    g_laser_rt.P_base_w = g_laser_cfg.pierce_table[idx].power_w;
+    g_laser_rt.power_w  = g_laser_cfg.pierce_table[idx].power_w;
+    g_laser_rt.freq_hz  = g_laser_cfg.pierce_table[idx].freq_hz;
 }
 
 // @Context: 1ms Hard-RT Thread (ecat_thread_rt cycle 尾, ecx_send_processdata 前)
@@ -297,7 +336,7 @@ void laser_rt_flush_pdos(void)
     if (can_emit) {
         do_val |= (uint16_t)(1u << g_laser_cfg.bit_laser_enable);
     }
-    if (g_laser_rt.shutter && !g_laser_rt.emergency_kill) {
+    if (g_laser_rt.shutter && !g_laser_rt.emergency_kill && !g_laser_rt.hold_gate_off) {
         do_val |= (uint16_t)(1u << g_laser_cfg.bit_laser_shutter);
     }
     // 气阀: gas_select 决定哪一路接通 (互斥, M10/M11/M12 切换)
@@ -333,6 +372,20 @@ void laser_rt_flush_pdos(void)
         laser_hw_write_ao(g_laser_cfg.ao_slave_id, g_laser_cfg.ch_ao_power, power_raw);
         laser_hw_write_ao(g_laser_cfg.ao_slave_id, g_laser_cfg.ch_ao_freq,  freq_raw);
     }
+
+    // 3. P0-2: 气压 AO (第 3 路, 比例阀 0-10V)
+    // 刻意不受 can_emit 门 — 切割工艺要求关光后吹气继续 (冷却/防渣堵嘴)。
+    // 仅量程门 (pressure_max_bar<=0 = 未配置不输出) + 上下 clamp, 单次乘除无 libcall。
+    if (g_laser_cfg.ao_slave_id >= 0 && g_laser_cfg.pressure_max_bar > 0.0) {
+        double scaled_p = g_laser_rt.gas_pressure_bar * 65535.0
+                          / g_laser_cfg.pressure_max_bar;
+        uint16_t pressure_raw;
+        if (scaled_p <= 0.0)        pressure_raw = 0;
+        else if (scaled_p >= 65535.0) pressure_raw = 65535;
+        else                        pressure_raw = (uint16_t)(scaled_p + 0.5);
+        laser_hw_write_ao(g_laser_cfg.ao_slave_id, g_laser_cfg.ch_ao_pressure,
+                          pressure_raw);
+    }
 }
 
 // @Context: 1ms Hard-RT Thread (safety_gate 内部 / 报警路径直调)
@@ -353,6 +406,9 @@ void laser_rt_sync_config(const TrajectorySegment_t *seg)
 {
     g_laser_rt.coupling_mode_rt = seg->aux_laser_coupling_mode;
     g_laser_rt.v_thresh_rt      = seg->aux_laser_v_thresh;
+    // P1-5: seg_flags + 微连接系数段级镜像 (M 段/运动段统一, 单点覆盖 ecat_core.c:977)
+    g_laser_rt.current_seg_flags = seg->seg_flags;
+    g_laser_rt.mj_ratio_rt       = seg->aux_laser_mj_ratio;
 }
 
 // @Context: 1ms Hard-RT Thread (alarm_reset 路径调)

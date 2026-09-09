@@ -16,6 +16,8 @@
 #include <ctype.h>
 #include <string.h>
 #include <pthread.h>            /* P0-1 fix: RPC 触发 homing 的 Non-RT worker 线程 */
+#include <sys/stat.h>           /* 断点续切: LoadProgram 指纹 (file size/mtime) */
+#include <math.h>               /* 断点续切: fabs (指纹偏置比较) */
 
 // 底层轴房间号自动分配计数器
 static int g_allocated_axis_count = 0;
@@ -345,6 +347,38 @@ int SMC_ConfigSoftLimit(char axis_letter, int enable, double neg_limit_mm, doubl
     return 0;
 }
 
+// P0: 旋转轴 G90 最短路径解缠绕开关 (仅 parser 层消费)。
+// @Context: Non-RealTime Background Thread (初始化阶段调用)
+// @Thread-Safety: 停机期配置, 运行期 parser 只读
+int SMC_ConfigRotWrapEnable(char axis_letter, int enable){
+    int idx = axis_lookup(axis_letter);
+    if(idx < 0) {
+        printf("[SMC_API] 轴 '%c' 未配置，无法设置旋转轴 wrap！\n", toupper((unsigned char)axis_letter));
+        return -1;
+    }
+    if(g_axis[idx].axis_type != 1) {
+        printf("[SMC_API] %s 非旋转轴，wrap 无意义，拒绝！\n", g_axis[idx].axis_name);
+        return -1;
+    }
+    g_axis[idx].rot_wrap_enable = enable ? 1 : 0;
+    return 0;
+}
+
+// P0: RTCP 奇异点检测阈值 (R_max = 物理步长/逻辑步长 峰值)。
+// rmax <= 0 显式禁用检测 (g_rtcp_singularity_rmax = 0)。
+// @Context: Non-RealTime Background Thread (初始化阶段调用)
+// @Thread-Safety: 停机期配置, 运行期 parser 只读
+int SMC_ConfigSingularityRmax(double rmax){
+    if(rmax <= 0.0) {
+        g_rtcp_singularity_rmax = 0.0;
+        printf("[SMC_API] RTCP 奇异点检测已禁用 (rmax=%.2f)\n", rmax);
+        return 0;
+    }
+    g_rtcp_singularity_rmax = rmax;
+    printf("[SMC_API] RTCP 奇异点阈值 = %.2f\n", rmax);
+    return 0;
+}
+
 int SMC_ConfigGantrySyncAlarm(char axis_letter, int enable, int32_t tolerance_pulse, int32_t max_error_pulse, int time_ms){
     int idx = axis_lookup(axis_letter);
     if(idx < 0) {
@@ -409,6 +443,9 @@ int SMC_ConfigAxisDynamics(char axis_letter, int type, double max_v, double max_
     }
     g_axis[idx].axis_type          = type;
     g_axis[idx].equivalent_radius  = equivalent_radius;
+    /* P0: 旋转轴 wrap 默认随 axis_type 开启 (INI rot_wrap_enable=0 或
+     * SMC_ConfigRotWrapEnable 可单独关闭); 线性轴恒 0 */
+    g_axis[idx].rot_wrap_enable    = (type == 1) ? 1 : 0;
     __sync_synchronize();
     g_axis[idx].max_speed = max_v;
     g_axis[idx].max_acc   = max_a;
@@ -472,6 +509,22 @@ void SMC_ConfigKinematics(int type,
            type, r1_idx, r1_axis, r2_idx, r2_axis);
     /* 与 ConfigKinematicsOffset 连续调用时, 影子已同值 → no-op, 无重复审计 */
     param_store_notify_kinematics(tool_off[2], pivot_off[0], pivot_off[1], pivot_off[2]);
+}
+
+// P1 (2026-09-04): 配置双摆头链序 — G43.5 姿态解算与 Kinematics_Inverse 装配共用。
+// 注意须在 SMC_ConfigKinematics 之后调 (后者不写 chain_order, 但顺序即规范)。
+// @Context: Non-RealTime Background Thread (初始化阶段)
+// @Thread-Safety: 停机期配置, parser 运行期只读。boot 级参数, 不入 param_store notify。
+void SMC_ConfigKinematicsChain(int chain_order)
+{
+    if (chain_order != 0 && chain_order != 1) {
+        printf("[SMC_API] ConfigKinematicsChain chain_order=%d 非法 (0 或 1), 忽略\n",
+               chain_order);
+        return;
+    }
+    g_kin_config.chain_order = chain_order;
+    printf("[SMC_API] 双摆头链序: %s\n",
+           chain_order ? "R2 外层 (C外B内腕)" : "R1 外层 (B外C内, 已交付默认)");
 }
 
 // ================== 坐标与状态 ==================
@@ -550,6 +603,9 @@ void SMC_GoZero(char axis_letter, double speed) {
 // ================== G代码加工 ==================
 int SMC_RunGCodeFile(const char *filepath) {
     if (g_parser_ctrl.is_running) return -1;
+    // 直跑路径同样作废续切冻结 (同 LoadProgram 理由)
+    atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
+    atomic_store_explicit(&g_program_resume_result, 0, memory_order_release);
     strncpy(g_parser_ctrl.filepath, filepath, sizeof(g_parser_ctrl.filepath)-1);
     g_parser_ctrl.abort_request = 0;
     g_parser_ctrl.is_paused = 0;
@@ -578,11 +634,36 @@ int SMC_LoadProgram(const char *filepath) {
     if (filepath == NULL || filepath[0] == '\0') return -2;
     if (g_parser_ctrl.is_running) return -1;
 
+    // 新程序加载 → 作废上一程序的续切冻结 (防 ResumeStart 误触旧边界)
+    atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
+    atomic_store_explicit(&g_program_resume_result, 0, memory_order_release);
+
     strncpy(g_parser_ctrl.filepath, filepath, sizeof(g_parser_ctrl.filepath) - 1);
     g_parser_ctrl.filepath[sizeof(g_parser_ctrl.filepath) - 1] = '\0';
     g_parser_ctrl.abort_request = 0;
     g_parser_ctrl.is_paused = 0;
     g_parser_ctrl.program_mode = PROGRAM_MODE_PREVIEW;   // P0-b v2: preview 模式
+
+    // ---- 断点续切 (2026-09-08): 一致性指纹记录 ----
+    // 续切前校验: 文件本体 (size+mtime) + WCS 偏置 (G54-G59 + G52) 任一被改 →
+    // 拒绝续切 (几何已变, 必须重新 LoadProgram)。防"中途改 G54 → 续切错位"经典事故。
+    // 注: Load 与 Run 之间改偏置是合法工作流 (RunLoadedProgram 不校验指纹);
+    //     只有"续切"要求与加载时刻一致 — 续的是同一件活的未完部分。
+    {
+        struct stat st;
+        if (stat(g_parser_ctrl.filepath, &st) == 0) {
+            g_parser_ctrl.fp_file_size  = (long)st.st_size;
+            g_parser_ctrl.fp_file_mtime = (long)st.st_mtime;
+        } else {
+            g_parser_ctrl.fp_file_size  = -1;
+            g_parser_ctrl.fp_file_mtime = -1;
+        }
+        memcpy(g_parser_ctrl.fp_work_offsets, g_coord_mgr.work_offsets,
+               sizeof(double) * 6 * AXIS_NUM);
+        memcpy(g_parser_ctrl.fp_local_offset, g_state.local_offset,
+               sizeof(double) * AXIS_NUM);
+    }
+
     g_parser_ctrl.is_running = 1;                         // 触发 parser_thread
     return 0;
 }
@@ -599,6 +680,117 @@ int SMC_RunLoadedProgram(void) {
     g_parser_ctrl.is_paused = 0;
     g_parser_ctrl.is_running = 1;
     return 0;
+}
+
+// ================== 断点续切 Phase 1 (2026-09-08) ==================
+
+// 指纹校验 (文件本体 + WCS 偏置): 与 LoadProgram 记录一致返回 0, 不符返回 -1
+// @Context: Non-RealTime Background Thread (RPC client thread, is_running=0 门控下)
+static int resume_fingerprint_check(void)
+{
+    struct stat st;
+    if (g_parser_ctrl.fp_file_size < 0) return -1;
+    if (stat(g_parser_ctrl.filepath, &st) != 0) return -1;
+    if ((long)st.st_size != g_parser_ctrl.fp_file_size ||
+        (long)st.st_mtime != g_parser_ctrl.fp_file_mtime) return -1;
+
+    for (int c = 0; c < 6; c++) {
+        for (int i = 0; i < AXIS_NUM; i++) {
+            if (fabs(g_coord_mgr.work_offsets[c][i] -
+                     g_parser_ctrl.fp_work_offsets[c][i]) > 1e-9) return -1;
+        }
+    }
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (fabs(g_state.local_offset[i] -
+                 g_parser_ctrl.fp_local_offset[i]) > 1e-9) return -1;
+    }
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 断点续切第一步: 校验 target_line 是合法 G00 边界 + SEARCH 重放建立模态。
+// 阻塞至 parser 完成重放 (整文件重放, 毫秒~百毫秒级; 5s 兜底), RPC 线程可阻塞。
+// 成功后 g_program_resume_ready=1, 可调 SMC_ResumeStart。
+int SMC_ResumeSearch(int32_t target_line)
+{
+    if (g_parser_ctrl.is_running) return -1;
+    if (g_parser_ctrl.filepath[0] == '\0') return -2;
+    // 判据不能用 g_program_load_done: 它是 "已加载待运行" 语义, gcode_parser
+    // 在 RUN 模式启动时即清零 (gcode_parser.c PROGRAM_MODE_RUN 分支), 因此
+    // "LoadProgram → RunLoadedProgram 完整跑 → ResumeSearch" 这条**正常续切
+    // 路径**下该标志恒为 0, 会误判成 -2 (未加载/指纹不符)。
+    // 改用 "程序结构仍有效": LoadProgram 已解析出行数 (RUN 结束后仍保留)。
+    if (g_program_total_lines <= 0) return -2;
+    // 任何新的定位请求都会作废上一次的冻结结果。指纹不符 / 目标越界等失败
+    // 路径也必须同步清除, 否则 GetResumeState 返回陈旧的 ready=1, 误导 UI
+    // 认为续切仍可用 (实际要等 ResumeStart 复查指纹返 -3 才兜底)。
+    atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
+    atomic_store_explicit(&g_program_resume_result, 0, memory_order_release);
+    g_parser_ctrl.resume_target_line = 0;
+    memset(g_parser_ctrl.resume_target_pos, 0, sizeof(double) * AXIS_NUM);
+    // 重定位前导依赖 SafeLiftZ 的 SafeZ 高度与 Z 轴索引
+    if (!g_safe_lift_cfg.enabled || g_safe_lift_cfg.z_axis_idx < 0) return -4;
+    if (resume_fingerprint_check() != 0) return -2;
+    if (target_line < 1 || target_line > g_program_total_lines) return -5;
+
+    // 触发 SEARCH 重放 (parser_thread)
+    g_parser_ctrl.resume_target_line  = target_line;
+    g_parser_ctrl.resume_active       = 0;   // SEARCH 用 target_line 比较, active 仅 RUN 用
+    g_parser_ctrl.resume_boundary_hit = 0;
+    g_parser_ctrl.abort_request = 0;
+    g_parser_ctrl.is_paused = 0;
+    g_parser_ctrl.program_mode = PROGRAM_MODE_SEARCH;
+    g_parser_ctrl.is_running = 1;
+
+    // 阻塞等结果 (parser 写 g_program_resume_result)
+    for (int wait = 0; wait < 500; wait++) {           // 最多 5s
+        int r = atomic_load_explicit(&g_program_resume_result, memory_order_acquire);
+        if (r != 0) {
+            return (r == 1) ? 0 : (r == 2 ? -3 : -5);
+        }
+        osal_usleep(10000);
+    }
+    return -6;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 断点续切第二步: 从冻结边界起跑。parser 从头重放, 已执行区间由 axis_ctrl
+// 跳段分支丢弃, 边界行拦截生成重定位前导 (激光模态恢复 + SafeZ 抬升/平移/下降)。
+int SMC_ResumeStart(void)
+{
+    if (g_parser_ctrl.is_running) return -2;
+    if (!atomic_load_explicit(&g_program_resume_ready, memory_order_acquire)) return -1;
+    // 指纹复查: search 之后文件/WCS 又被改 → 冻结作废
+    if (resume_fingerprint_check() != 0) {
+        atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
+        return -3;
+    }
+
+    atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);  // 消费
+    g_parser_ctrl.resume_active       = 1;   // parser/axis_ctrl 跳段开关
+    g_parser_ctrl.resume_boundary_hit = 0;
+    g_parser_ctrl.program_mode = PROGRAM_MODE_RUN;
+    g_parser_ctrl.abort_request = 0;
+    g_parser_ctrl.is_paused = 0;
+    g_parser_ctrl.is_running = 1;
+
+    EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0037,
+                     g_parser_ctrl.resume_target_line, "ResumeStart (from frozen boundary)");
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 查询续切状态 (0x0072): UI 轮询 ready 位 / 校验冻结目标
+void SMC_GetResumeState(SmcGetResumeRes *out)
+{
+    if (out == NULL) return;
+    memset(out, 0, sizeof(*out));
+    out->ret_code = 0;
+    out->resume_ready  = atomic_load_explicit(&g_program_resume_ready, memory_order_acquire);
+    out->search_result = atomic_load_explicit(&g_program_resume_result, memory_order_acquire);
+    out->target_line   = g_parser_ctrl.resume_target_line;
+    memcpy(out->target_pos, g_parser_ctrl.resume_target_pos,
+           sizeof(double) * AXIS_NUM);
 }
 
 int SMC_GetProgramStructure(SmcGetProgramStructureRes *out) {
@@ -828,6 +1020,61 @@ int SMC_ConfigLaserCoupling(int mode, double v_thresh_mm_s)
     }
     atomic_store_explicit(&g_laser_cfg.coupling_mode, mode, memory_order_release);
     atomic_store_explicit(&g_laser_cfg.v_thresh_mm_s, v_thresh_mm_s, memory_order_release);
+    return 0;
+}
+
+// P0-2 (2026-09-03): 辅助气压 AO 通道 + 量程
+// @Context: Non-RealTime Background Thread (init 阶段, InitAndStart 前)
+// @Thread-Safety: init 单写者; RT flush_pdos 只读
+int SMC_ConfigLaserGas(uint8_t ch_ao_pressure, double pressure_max_bar)
+{
+    if (ch_ao_pressure > 3) {
+        printf("[SMC_API] ConfigLaserGas 通道 %d 越界 (0-3)\n", ch_ao_pressure);
+        return -1;
+    }
+    if (pressure_max_bar <= 0.0) {
+        printf("[SMC_API] ConfigLaserGas 量程 %.2f bar 必须大于 0\n", pressure_max_bar);
+        return -1;
+    }
+    g_laser_cfg.ch_ao_pressure  = ch_ao_pressure;
+    g_laser_cfg.pressure_max_bar = pressure_max_bar;
+    printf("[SMC_API] 激光气压 AO: ch=%d, 量程 %.2f bar\n",
+           ch_ao_pressure, pressure_max_bar);
+    return 0;
+}
+
+// P1-5 (2026-09-03): 微连接段功率系数
+// @Thread-Safety: atomic store, 多写者 (M77/RPC/OPC UA); RT 经段级快照读
+int SMC_ConfigLaserMicroJoint(double mj_ratio)
+{
+    if (mj_ratio <= 0.0 || mj_ratio > 1.0) {
+        printf("[SMC_API] ConfigLaserMicroJoint ratio=%.3f 越界 (0,1]\n", mj_ratio);
+        return -1;
+    }
+    atomic_store_explicit(&g_laser_cfg.mj_ratio, mj_ratio, memory_order_release);
+    return 0;
+}
+
+// P1-4 (2026-09-03): 渐进穿孔台阶表
+// @Thread-Safety: init 阶段单写者 (与 couple_table 同模式); RT 只读
+int SMC_ConfigLaserPierceTable(const LaserPierceStep_t *steps, int count)
+{
+    if (!steps || count < 1 || count > LASER_PIERCE_TABLE_MAX) {
+        printf("[SMC_API] ConfigLaserPierceTable count=%d 越界 (1-%d)\n",
+               count, LASER_PIERCE_TABLE_MAX);
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        if (steps[i].power_w < 0.0 || steps[i].freq_hz < 0.0 || steps[i].dwell_ms < 1) {
+            printf("[SMC_API] ConfigLaserPierceTable 第 %d 级非法 "
+                   "(P=%.1fW F=%.1fHz T=%dms)\n", i,
+                   steps[i].power_w, steps[i].freq_hz, steps[i].dwell_ms);
+            return -1;
+        }
+    }
+    memcpy(g_laser_cfg.pierce_table, steps, sizeof(LaserPierceStep_t) * count);
+    g_laser_cfg.pierce_table_len = count;
+    printf("[SMC_API] 渐进穿孔表: %d 级已配置\n", count);
     return 0;
 }
 
@@ -1534,6 +1781,7 @@ int SMC_GetLaserState(SmcGetLaserStateRes *out)
     out->power_w          = g_laser_rt.power_w;
     out->freq_hz          = g_laser_rt.freq_hz;
     out->gas_select       = g_laser_rt.gas_select;
+    out->gas_pressure_bar = g_laser_rt.gas_pressure_bar;
     out->interlock        = g_laser_rt.interlock_status;
     out->emergency_kill   = g_laser_rt.emergency_kill;
     out->P_base_w         = g_laser_rt.P_base_w;
@@ -1541,11 +1789,14 @@ int SMC_GetLaserState(SmcGetLaserStateRes *out)
     out->coupling_mode_rt = g_laser_rt.coupling_mode_rt;
 
     // ---- 派生字段 (从 g_interpolator 计算) ----
-    // is_piercing: G04 dwell (M64 段) 等待期间为 1, 供 HMI 显示 "穿孔中" 状态
+    // is_piercing: G04 dwell (M64) / M76 渐进穿孔等待期间为 1, 供 HMI 显示 "穿孔中"
     out->is_piercing = (g_interpolator.is_waiting_mcode &&
-                        g_interpolator.current_mcode == 64) ? 1 : 0;
+                        (g_interpolator.current_mcode == 64 ||
+                         g_interpolator.current_mcode == 76)) ? 1 : 0;
     // current_seg_flags: 当前段工艺标记 (lead_in / micro_joint), 段消费环同步
     out->current_seg_flags = g_interpolator.current_seg_flags_rt;
+    // P0-1: feedhold 光闸 gate (HOLD 状态机每 cycle 重写, 不锁存)
+    out->hold_gate_off = g_laser_rt.hold_gate_off;
 
     // ---- 加工统计 (RT 累计, 跨程序不清零) ----
     out->pierce_count     = g_laser_rt.pierce_count;

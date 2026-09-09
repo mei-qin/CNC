@@ -193,6 +193,9 @@ typedef struct {
     int enable_soft_limit;   // 软件限位使能（0=否，1=是）
     double soft_limit_pos;  // 软件限位位置- 正向限位
     double soft_limit_neg;  // 软件限位位置- 负向限位
+    // P0 旋转轴最短路径解缠绕: 1=G90 绝对指令目标角 wrap-to-nearest (默认随
+    // axis_type==1 开启, INI rot_wrap_enable=0 可关)。仅 parser 层生效。
+    int rot_wrap_enable;
 
     //
     int enable_sync_alarm;    // 同步报警使能（0=否，1=是）
@@ -212,6 +215,11 @@ typedef struct {
 } PlannerConfig_t;
 
 extern PlannerConfig_t g_planner_config;
+
+// P0 RTCP 奇异点检测阈值 (定义在 axis_ctrl.c): 直线 R_max 预估 / 圆弧逐微段
+// phys/log 比超过则硬报警 (0x0026 + alarm + 中止文件)。<=0 禁用。默认 30.0。
+// @Thread-Safety: 初始化期 Non-RT 写入 (SMC_ConfigSingularityRmax), 运行期 parser 只读
+extern double g_rtcp_singularity_rmax;
 
 
 // ================== P0-3: Safe Z Lift 配置 (init 阶段, 非RT) ==================
@@ -344,6 +352,11 @@ typedef struct{
     double laser_power_w_rt;
     double laser_freq_hz_rt;
     int    gas_select_rt;
+
+    // ---- P1-4 (2026-09-03): M76 渐进穿孔子状态 (M 段等待屏障域, RT 单写者) ----
+    // -1=未激活; 0..N-1=当前台阶 (M76 段加载置 0, 等待块逐级推进, 整体完成回 -1)。
+    // 读点全部由 current_mcode==76 门控, 初值 0 无害 (仅防御语义)。
+    int    pierce_stage_idx;
 
     // ---- P0-c: 实时光标 (RT 消费段时记录, snapshot 镜像, UI 高亮当前段) ----
     // current_seg_id_rt: 段加载时从 seg.seg_id 拷贝 (ecat_thread_rt 段消费环).
@@ -500,7 +513,12 @@ typedef struct{
     // RT 线程消费段时拷到 g_coord_mgr.active_offset, 用于 current_logical_pos 推导。
     // 目的: 杜绝 parser 解析中途 `#5221=..` / G10 L2 改 work_offsets 时,
     // RT 用新偏置推旧位置的瞬间撕裂。G53 段此向量全 0。
+    // P1 (2026-09-07) G68.2: 语义升级为"总平移"= w + G52 + tilt_origin (active_offset 同)。
     double wcs_offset_snap[AXIS_NUM];
+    // P1 G68.2 (v4 布局): 倾斜面旋转快照 (行主序 3x3, 列=[u v n])。
+    // RT 反推 logical: p = Rᵀ·(g53 − active_offset); tilt=0 时盖单位阵, 反推退化减法。
+    int is_tilt_active;
+    double wcs_rot_snap[9];
     int m_code;         // M代码编号（如 3=M03, 5=M05）
     double s_value;     // S值（如主轴转速）
     double p_value;     // P参数（激光功率、宏程序参数等）
@@ -521,6 +539,7 @@ typedef struct{
     double aux_laser_power_w;      // M67 E<n> 设置 (W)
     double aux_laser_freq_hz;      // M68 E<n> 设置 (Hz)
     int    aux_gas_select;         // 0=off, 1=N2, 2=O2, 3=Air (M10/M11/M12)
+    double aux_laser_gas_pressure; // M13 P<bar> 辅助气压 (P0-2, 不受 can_emit 门)
     // ---- Phase B1: 段级耦合配置快照 (修复架构 BUG) ----
     // 历史设计错误: 把 coupling_mode 作为全局运行时状态, RT 每 cycle 读 g_laser_cfg.
     //   后果: parser 在 RT 第一次读之前就把 mode 改回 (M70 P1 → M70 P0 顺序覆盖),
@@ -529,6 +548,7 @@ typedef struct{
     //   保证段执行期间用入队时的 mode, 不受后续 M70 写入影响.
     int    aux_laser_coupling_mode;   // 入队时 g_laser_cfg.coupling_mode 快照
     double aux_laser_v_thresh;        // 入队时 g_laser_cfg.v_thresh_mm_s 快照
+    double aux_laser_mj_ratio;        // P1-5: 入队时 g_laser_cfg.mj_ratio 快照 (微连接系数)
 
     double total_distance;
     double dir_vec[AXIS_NUM];
@@ -610,8 +630,20 @@ typedef struct{
                                    // 写入路径: macro_eval.c #7001-#7948, 或未来 G10 L20 Pn
     double active_offset[AXIS_NUM]; // 当前生效偏置向量 (RT 单写者, = seg.wcs_offset_snap)
                                     // current_logical_pos = current_g53_pos - active_offset
+                                    // P1 G68.2: 语义为总平移 (含 tilt_origin); tilt 激活时
+                                    // XYZ 反推为 p = active_tilt_rotᵀ·(g53 − active_offset)
     double current_g53_pos[AXIS_NUM]; // 当前G53坐标位置（机床坐标），实时更新用于UI显示和坐标转换
     double current_logical_pos[AXIS_NUM];// 当前逻辑坐标位置（相对于当前坐标系），实时更新用于UI显示和控制
+
+    // ---- P1 (2026-09-07): G68.2/G68.3 倾斜面帧 ----
+    // @Thread-Safety: tilt_rot/tilt_origin/tilt_active 为 parser 单写者 (G68.2 捕获块/
+    //   G69/M30 清零); active_tilt_rot/active_tilt 为 RT 单写者镜像 (= seg 快照)。
+    //   后台(UI/宏)只读 current_logical_pos, 不直接读这些字段。
+    double tilt_rot[9];             // 倾斜面旋转 (行主序, 列=[u v n]); tilt=0 时无意义
+    double tilt_origin[AXIS_NUM];   // 倾斜面原点 (WCS 逻辑系, 仅 XYZ 分量有意义)
+    int    tilt_active;             // 0=未激活 (纯平移, 既有路径), 1=G68.2/G68.3 激活
+    double active_tilt_rot[9];      // RT 镜像 (= seg.wcs_rot_snap)
+    int    active_tilt;             // RT 镜像 (= seg.is_tilt_active)
 
 }CoordManager_t;
 

@@ -68,6 +68,8 @@ extern "C" {
 #define SMC_SNAP_FLAG_ABORT_REQ   0x00000004u   /* g_parser_ctrl.abort_request */
 #define SMC_SNAP_FLAG_HOLD        0x00000008u   /* g_interpolator.hold_state != HOLD_NORMAL */
 #define SMC_SNAP_FLAG_WAIT_MCODE  0x00000010u   /* g_interpolator.is_waiting_mcode */
+#define SMC_SNAP_FLAG_RESUME_READY 0x00000020u  /* 断点续切: SEARCH 已冻结边界, 可 ResumeStart
+                                                 * (g_program_resume_ready==1, UI 显示"可续切"按钮) */
 
 /* P0-a 状态快照结构 (~200B, AXIS_NUM=5)
  *

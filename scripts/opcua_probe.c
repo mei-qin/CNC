@@ -154,6 +154,26 @@ static int call_method_int32(UA_Client *c, const char *obj, const char *meth,
     return ok ? 0 : -1;
 }
 
+/* §11 Laser: 带输入参 + Boolean 出参的方法调用。
+ * 返回 0=调用成功且拿到 Boolean 出参 (业务值写 *out_val), -1=传输/类型失败 */
+static int call_method_bool_args(UA_Client *c, const char *obj, const char *meth,
+                                 size_t n_in, UA_Variant *in, int *out_val)
+{
+    UA_NodeId o = UA_NODEID_STRING(1, (char *)obj);
+    UA_NodeId m = UA_NODEID_STRING(1, (char *)meth);
+    size_t out_sz = 0;
+    UA_Variant *out = NULL;
+    UA_StatusCode sc = UA_Client_call(c, o, m, n_in, in, &out_sz, &out);
+    int ok = 0;
+    if (sc == UA_STATUSCODE_GOOD && out_sz > 0 &&
+        UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_BOOLEAN])) {
+        *out_val = (*(UA_Boolean *)out[0].data) != 0;
+        ok = 1;
+    }
+    if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
+    return ok ? 0 : -1;
+}
+
 static UA_StatusCode write_bool(UA_Client *c, const char *id, UA_Boolean v)
 {
     UA_Variant w;
@@ -763,6 +783,190 @@ int main(int argc, char *argv[])
             UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
             snprintf(buf, sizeof(buf), "rc=%d (expect -2)", rc);
             check(cok == 0 && rc == -2, "Re-protect -> Set rejected (-2)", buf);
+        }
+    }
+
+    /* ==================== §11 Laser 面契约 (2026-09-03, P0-3) ====================
+     * CNC.Laser 15 只读状态变量 + 6 运行时工艺方法。
+     * 跑法: sudo ./rpc_server sim & 后 ./opcua_probe (激光需 sim 默认
+     * SMC_ConfigLaserIO(0,0,0) 已配置, 否则状态全零仍应通过值域断言)。 */
+    {
+        printf("\n--- §11 Laser nodes & methods ---\n");
+        int32_t vi = -1;
+        double   vd = -1.0;
+
+        /* 11-1. 状态变量契约: 类型 + 值域 (未配置激光时全零也满足) */
+        read_int(client, "CNC.Laser.Enable", &vi);
+        snprintf(buf, sizeof(buf), "Enable=%d", vi);
+        check(vi == 0 || vi == 1, "Laser.Enable in {0,1}", buf);
+        read_int(client, "CNC.Laser.Shutter", &vi);
+        snprintf(buf, sizeof(buf), "Shutter=%d", vi);
+        check(vi == 0 || vi == 1, "Laser.Shutter in {0,1}", buf);
+        read_double(client, "CNC.Laser.PowerW", &vd);
+        snprintf(buf, sizeof(buf), "PowerW=%.1f", vd);
+        check(vd >= 0.0, "Laser.PowerW >= 0", buf);
+        read_double(client, "CNC.Laser.FreqHz", &vd);
+        snprintf(buf, sizeof(buf), "FreqHz=%.1f", vd);
+        check(vd >= 0.0, "Laser.FreqHz >= 0", buf);
+        read_int(client, "CNC.Laser.GasSelect", &vi);
+        snprintf(buf, sizeof(buf), "GasSelect=%d", vi);
+        check(vi >= 0 && vi <= 3, "Laser.GasSelect in 0..3", buf);
+        read_double(client, "CNC.Laser.GasPressure", &vd);
+        snprintf(buf, sizeof(buf), "GasPressure=%.2f", vd);
+        check(vd >= 0.0, "Laser.GasPressure >= 0", buf);
+        read_int(client, "CNC.Laser.Interlock", &vi);
+        snprintf(buf, sizeof(buf), "Interlock=0x%X", vi);
+        check(vi >= 0, "Laser.Interlock >= 0", buf);
+        read_int(client, "CNC.Laser.EmergencyKill", &vi);
+        snprintf(buf, sizeof(buf), "EKill=%d", vi);
+        check(vi == 0 || vi == 1, "Laser.EmergencyKill in {0,1}", buf);
+        read_double(client, "CNC.Laser.BasePowerW", &vd);
+        snprintf(buf, sizeof(buf), "BasePowerW=%.1f", vd);
+        check(vd >= 0.0, "Laser.BasePowerW >= 0", buf);
+        read_double(client, "CNC.Laser.ActualSpeed", &vd);
+        snprintf(buf, sizeof(buf), "ActualSpeed=%.3f", vd);
+        check(vd >= 0.0, "Laser.ActualSpeed >= 0", buf);
+        read_int(client, "CNC.Laser.CouplingMode", &vi);
+        snprintf(buf, sizeof(buf), "CouplingMode=%d", vi);
+        check(vi == 0 || vi == 1, "Laser.CouplingMode in {0,1}", buf);
+        read_int(client, "CNC.Laser.IsPiercing", &vi);
+        snprintf(buf, sizeof(buf), "IsPiercing=%d", vi);
+        check(vi == 0 || vi == 1, "Laser.IsPiercing in {0,1}", buf);
+        read_int(client, "CNC.Laser.SegFlags", &vi);
+        snprintf(buf, sizeof(buf), "SegFlags=%d", vi);
+        check(vi >= 0 && vi <= 3, "Laser.SegFlags in 0..3", buf);
+        read_int(client, "CNC.Laser.PierceCount", &vi);
+        snprintf(buf, sizeof(buf), "PierceCount=%d", vi);
+        check(vi >= 0, "Laser.PierceCount >= 0", buf);
+        {
+            UA_Variant v;
+            UA_Variant_init(&v);
+            UA_StatusCode sc = read_variant(client, "CNC.Laser.OnTimeMs", &v);
+            int ok64 = (sc == UA_STATUSCODE_GOOD)
+                       && UA_Variant_hasScalarType(&v, &UA_TYPES[UA_TYPES_INT64]);
+            UA_Variant_clear(&v);
+            check(ok64, "Laser.OnTimeMs Int64 readable", "");
+        }
+
+        /* 11-2. SetCoupling(1, 5.0) → true + CouplingMode 即时回读 ==1 */
+        {
+            UA_Variant in[2];
+            UA_Int32 mode = 1;
+            UA_Double vt = 5.0;
+            UA_Variant_setScalarCopy(&in[0], &mode, &UA_TYPES[UA_TYPES_INT32]);
+            UA_Variant_setScalarCopy(&in[1], &vt, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.SetCoupling", 2, in, &bv);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            int32_t cm = -1;
+            read_int(client, "CNC.Laser.CouplingMode", &cm);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d CouplingMode=%d", cok, bv, cm);
+            check(cok == 0 && bv == 1 && cm == 1,
+                  "SetCoupling(1,5.0) effective", buf);
+        }
+        /* 11-3. SetPower 合法值接受 + 越界拒绝 */
+        {
+            UA_Variant in[1];
+            UA_Double w = 1500.0;
+            UA_Variant_setScalarCopy(&in[0], &w, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.SetPower", 1, in, &bv);
+            UA_Variant_clear(&in[0]);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d", cok, bv);
+            check(cok == 0 && bv == 1, "SetPower(1500) accepted", buf);
+        }
+        {
+            UA_Variant in[1];
+            UA_Double w = 99999.0;
+            UA_Variant_setScalarCopy(&in[0], &w, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.SetPower", 1, in, &bv);
+            UA_Variant_clear(&in[0]);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d (expect 0)", cok, bv);
+            check(cok == 0 && bv == 0, "SetPower(99999) rejected", buf);
+        }
+        /* 11-4. ConfigGasRange(2, 10.0) + SetGas(1, 2.5) → GasSelect 回读 ==1 */
+        {
+            UA_Variant in[2];
+            UA_Int32 ch = 2;
+            UA_Double mb = 10.0;
+            UA_Variant_setScalarCopy(&in[0], &ch, &UA_TYPES[UA_TYPES_INT32]);
+            UA_Variant_setScalarCopy(&in[1], &mb, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.ConfigGasRange", 2, in, &bv);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d", cok, bv);
+            check(cok == 0 && bv == 1, "ConfigGasRange(2,10.0) accepted", buf);
+        }
+        {
+            UA_Variant in[2];
+            UA_Int32 sel = 1;
+            UA_Double p = 2.5;
+            UA_Variant_setScalarCopy(&in[0], &sel, &UA_TYPES[UA_TYPES_INT32]);
+            UA_Variant_setScalarCopy(&in[1], &p, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.SetGas", 2, in, &bv);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            int32_t gs = -1;
+            read_int(client, "CNC.Laser.GasSelect", &gs);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d GasSelect=%d", cok, bv, gs);
+            /* 注: GasSelect 是 parser pending (下段快照生效), 空闲态 g_laser_rt
+             * 镜像可能仍 0 — 仅断言方法层成功, 镜像由 sim 用例覆盖 */
+            check(cok == 0 && bv == 1, "SetGas(1,2.5) accepted", buf);
+        }
+        /* 11-5. ConfigMicroJoint(0.4) → true */
+        {
+            UA_Variant in[1];
+            UA_Double rj = 0.4;
+            UA_Variant_setScalarCopy(&in[0], &rj, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.ConfigMicroJoint", 1, in, &bv);
+            UA_Variant_clear(&in[0]);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d", cok, bv);
+            check(cok == 0 && bv == 1, "ConfigMicroJoint(0.4) accepted", buf);
+        }
+        /* 11-5b. SetFrequency(20000) → true (I-4: movecontrol int→double 转换语义) */
+        {
+            UA_Variant in[1];
+            UA_Double fz = 20000.0;
+            UA_Variant_setScalarCopy(&in[0], &fz, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.SetFrequency", 1, in, &bv);
+            UA_Variant_clear(&in[0]);
+            double fhz = -1;
+            read_double(client, "CNC.Laser.FreqHz", &fhz);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d FreqHz=%.1f", cok, bv, fhz);
+            check(cok == 0 && bv == 1, "SetFrequency(20000) accepted", buf);
+        }
+        /* 11-6. 收尾还原: SetCoupling(0, 5.0) + ConfigMicroJoint(1.0) */
+        {
+            UA_Variant in[2];
+            UA_Int32 mode = 0;
+            UA_Double vt = 5.0;
+            UA_Variant_setScalarCopy(&in[0], &mode, &UA_TYPES[UA_TYPES_INT32]);
+            UA_Variant_setScalarCopy(&in[1], &vt, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            call_method_bool_args(client, "CNC.Laser",
+                                  "CNC.Laser.SetCoupling", 2, in, &bv);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]);
+            check(bv == 1, "restore SetCoupling(0,5.0)", "");
+        }
+        {
+            UA_Variant in[1];
+            UA_Double rj = 1.0;
+            UA_Variant_setScalarCopy(&in[0], &rj, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            call_method_bool_args(client, "CNC.Laser",
+                                  "CNC.Laser.ConfigMicroJoint", 1, in, &bv);
+            UA_Variant_clear(&in[0]);
+            check(bv == 1, "restore ConfigMicroJoint(1.0)", "");
         }
     }
 

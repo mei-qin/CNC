@@ -21,6 +21,7 @@ WSL2 sim 联调:
     python3 scripts/run_gcode_for_snap_test.py tests/gcode/test_m3_s_same_line.nc
 """
 
+import os
 import socket
 import struct
 import sys
@@ -31,7 +32,9 @@ import signal
 # ---- 协议常量 ----
 PREV_MAGIC       = 0x53524556   # "PREV"
 PREV_ACK_MAGIC   = 0x50524146   # "PRAK"
-PREV_VERSION     = 3          # v3: TrajectorySegment_t 加 is_exact_stop (P2-A 精准停, 2026-07-16)
+PREV_VERSION     = 4          # v4 (2026-09-07): TrajectorySegment_t 加 is_tilt_active(int) + wcs_rot_snap[9](double)
+                              #   于 wcs_offset_snap 后 (P1 G68.2 倾斜面段级快照), native 对齐下 +80B。
+                              #   v3: is_exact_stop (P2-A 精准停, 2026-07-16); v2: seg_flags (Laser B4)。
 SMC_CMD_PREVIEW_SUBSCRIBE = 0x002B
 
 # SmcReqHeader: uint16 cmd_type + uint16 data_len
@@ -66,7 +69,9 @@ SEG_FMT = "@" + "".join([
     "i",      # is_exact_stop (P2-A v3)      84-87
     "i",      # active_wcs                   88-91
     "5d",     # wcs_offset_snap[5]           92-131
-    "i",      # m_code                       132-135
+    "i",      # is_tilt_active (P1 G68.2 v4)
+    "9d",     # wcs_rot_snap[9] (行主序 3x3, 列=[u v n])
+    "i",      # m_code
               # pad 4B                       132-135
     "d",      # s_value                      136-143
     "d",      # p_value                      144-151
@@ -81,10 +86,14 @@ SEG_FMT = "@" + "".join([
     "i",      # aux_laser_shutter            196-199
     "d",      # aux_laser_power_w            200-207
     "d",      # aux_laser_freq_hz            208-215
-    "i",      # aux_gas_select               216-219
-    "i",      # aux_laser_coupling_mode      220-223
-    "d",      # aux_laser_v_thresh           224-231
-    "d",      # total_distance               232-239
+    "i",      # aux_gas_select
+              # pad 4B
+    "d",      # aux_laser_gas_pressure       P0-2 M13 P<bar> 辅助气压
+    "i",      # aux_laser_coupling_mode
+              # pad 4B
+    "d",      # aux_laser_v_thresh
+    "d",      # aux_laser_mj_ratio           P1-5 微连接系数快照
+    "d",      # total_distance
     "5d",     # dir_vec[5]                   240-279
     "d",      # v_max                        280-287
     "d",      # v_start                      288-295
@@ -100,21 +109,23 @@ SEG_FMT = "@" + "".join([
     "d",      # jerk                         552-559
 ])
 SEG_SIZE = struct.calcsize(SEG_FMT)
-# 预期 564 (v3 含 is_exact_stop), 实际由 ack.seg_size_bytes 校验
+# 预期 672 (v4 = v3 的 564 + 80B 倾斜面快照 + 16B 激光气压/微连接系数),
+# 实际由 ack.seg_size_bytes 校验 (fail-fast: 不一致立即退出, 禁止静默字段错位)
 
 # 字段名 (与 SEG_FMT 顺序一致; 数组字段保留为 tuple)
 SEG_FIELDS = [
     "target_pos", "is_ready", "speed", "cmd_type",
     "seg_id", "line_no", "motion_type", "seg_flags",
     "is_fillet", "is_g93_strict", "is_rtcp_active", "is_exact_stop", "active_wcs",
-    "wcs_offset_snap",
+    "wcs_offset_snap", "is_tilt_active", "wcs_rot_snap",
     "m_code", "s_value", "p_value", "q_value", "r_value",
     "aux_spindle_mode", "aux_spindle_rpm",
     "aux_coolant", "aux_tool_id",
     "aux_laser_enable", "aux_laser_shutter",
     "aux_laser_power_w", "aux_laser_freq_hz",
-    "aux_gas_select", "aux_laser_coupling_mode",
-    "aux_laser_v_thresh", "total_distance",
+    "aux_gas_select", "aux_laser_gas_pressure",
+    "aux_laser_coupling_mode", "aux_laser_v_thresh", "aux_laser_mj_ratio",
+    "total_distance",
     "dir_vec", "v_max", "v_start", "v_end",
     "T1_T7", "v0_v6", "s0_s6", "j1_j7",
     "T_total", "v_target", "acc", "dec", "jerk",
@@ -226,6 +237,22 @@ def main():
     crc_fail = 0
     last_seg_id = 0
     t0 = time.time()
+
+    # 信号处理: SIGINT/SIGTERM 时先打印段流统计再退出。
+    # 必要性: 统计行原本只在 socket 断开分支之后打印, 而 CMD_CLOSE 并不会
+    #   断开 9529 订阅长连接, 导致 harness 只能 kill → 统计永久丢失
+    #   (P1 G682 §6 验证曾因此误判)。此处保证任何中断都给出可判定统计。
+    def _on_signal(signum, _frame):
+        el = time.time() - t0
+        rate = (seg_total / el) if el > 0 else 0.0
+        print(f"\n[prev] [signal {signum}] 收到 {frame_count} 帧 / {seg_total} 段, "
+              f"CRC 失败 {crc_fail}, 用时 {el:.1f}s, 段速率 {rate:.1f} seg/s",
+              flush=True)
+        sys.stdout.flush()
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _on_signal)
+    signal.signal(signal.SIGTERM, _on_signal)
 
     while True:
         # 读帧头 16B

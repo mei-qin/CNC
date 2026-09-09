@@ -10,8 +10,9 @@
  *    端口 9529) 按各自订阅 seq 拉取段流, 用于轨迹预览 + 实时光标。
  *
  *  并发模型 (SPSC 历史 ring + 多 reader):
- *    单写者: Non-RT Background Thread (parser_thread, axis_ctrl hook 内)
- *      ring[write_seq % CAP] = *seg; write_seq++;   (release)
+ *    生产者互斥 (2026-09-08 加固): Non-RT Background Thread (parser_thread 直通/
+ *      刀补回调 + bspline_thread 拟合子段, 均经 axis_ctrl PREVIEW 分支或入队路径)
+ *      Push 内部自旋锁保证 "ring[write_seq % CAP] = *seg; write_seq++" 原子执行
  *    多读者: Non-RT Background Thread (push server client_thread)
  *      ReadSince(from_seq, buf, max) 拷贝 [from_seq, min(latest, from_seq+max))
  *
@@ -44,8 +45,9 @@ extern "C" {
 /* ---- 帧标识 (与 SmcPreviewFrameHeader.magic 一致) ---- */
 #define SMC_PREVIEW_MAGIC       0x53524556u   /* "PREV" little-endian */
 #define SMC_PREVIEW_ACK_MAGIC   0x50524146u   /* "PRAK" - Preview Ack */
-#define SMC_PREVIEW_VERSION     3u   /* v3: TrajectorySegment_t 加 is_exact_stop (P2-A 精准停, 2026-07-16). 结构体大小 560→564B (新增 int 字段), 字段布局变, 旧 client fail-fast.
-                                       * v2: 加 seg_flags (Laser B4, 2026-07-14), 大小不变 560B. */
+#define SMC_PREVIEW_VERSION     4u   /* v4 (2026-09-07): TrajectorySegment_t 加 is_tilt_active(int) + wcs_rot_snap[9](double)
+                                       * 于 wcs_offset_snap 后 (P1 G68.2 倾斜面段级快照). 字段布局变 (native 对齐下 +80B),
+                                       * 旧 client fail-fast. v3: is_exact_stop (P2-A). v2: seg_flags (Laser B4). */
 
 /* =====================================================================
  *  API
@@ -56,7 +58,7 @@ extern "C" {
 int  PreviewStreamer_Init(void);
 
 /* @Context: Non-RealTime Background Thread (parser_thread / bspline_thread)
- * @Safe: 1 次 memcpy + 1 次 atomic store。无锁, 不感知 reader。
+ * @Safe: push 自旋锁 (2026-09-08 加固, 多生产者安全) + memcpy + atomic store。
  *         绝不在 1ms Hard-RT 线程调用 (TrajectorySegment_t 太大, memcpy 影响抖动)。
  *         api_push_trajectory_impl 在 Non-RT 后台线程调用本函数。
  * @param seg 待推段 (caller 通常从 CommandQueue.buffer[head] 直接传址) */

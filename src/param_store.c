@@ -88,7 +88,8 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[3].ppu = 2777.7778;
     p->ax[3].dyn_type = 1; p->ax[3].max_speed = 18.0;
     p->ax[3].max_acc = 72.0; p->ax[3].max_dec = 72.0; p->ax[3].eq_radius = 50.0;
-    p->ax[3].sl_enable = 0; p->ax[3].sl_neg = 0.0; p->ax[3].sl_pos = 0.0;
+    p->ax[3].sl_enable = 1; p->ax[3].sl_neg = -730.0; p->ax[3].sl_pos = 730.0;
+    p->ax[3].rot_wrap_enable = 1;
     p->ax[3].gs_tol_pulse = 0; p->ax[3].gs_max_err_pulse = 0; p->ax[3].gs_err_time_ms = 0;
     p->ax[3].hm_enable = 1; p->ax[3].hm_method = 35;
     p->ax[3].hm_direction = 1; p->ax[3].hm_timeout_ms = 10000; p->ax[3].hm_speed = 10.0;
@@ -98,7 +99,8 @@ static void ps_default_profile(MachineProfile_t *p)
     p->ax[4].ppu = 2777.7778;
     p->ax[4].dyn_type = 1; p->ax[4].max_speed = 18.0;
     p->ax[4].max_acc = 72.0; p->ax[4].max_dec = 72.0; p->ax[4].eq_radius = 80.0;
-    p->ax[4].sl_enable = 0; p->ax[4].sl_neg = 0.0; p->ax[4].sl_pos = 0.0;
+    p->ax[4].sl_enable = 1; p->ax[4].sl_neg = -110.0; p->ax[4].sl_pos = 110.0;
+    p->ax[4].rot_wrap_enable = 1;
     p->ax[4].gs_tol_pulse = 0; p->ax[4].gs_max_err_pulse = 0; p->ax[4].gs_err_time_ms = 0;
     p->ax[4].hm_enable = 1; p->ax[4].hm_method = 35;
     p->ax[4].hm_direction = 1; p->ax[4].hm_timeout_ms = 10000; p->ax[4].hm_speed = 10.0;
@@ -106,6 +108,12 @@ static void ps_default_profile(MachineProfile_t *p)
     /* 五轴运动学 (Head-Head 原值) */
     p->tool_len = 150.0;
     p->pivot_x = 0.0; p->pivot_y = 0.0; p->pivot_z = 200.0;
+    p->singularity_rmax = 30.0;
+    p->chain_order = 0;
+
+    /* P0 安全默认 (2026-09-02): 旋转轴软限位 C±730°/B±110° + wrap 默认开。
+     * 注意: cnc_test sim 与 rpc_server sim 默认初始化不走本档案, 两处硬编码
+     * (main.c / rpc_server.c kernel_init) 需同步修改, 值以本表为单一权威。 */
 
     /* 规划器 (保守默认) */
     p->corner_tolerance = 0.05;
@@ -146,6 +154,7 @@ static const PsAxisField_t g_axis_fields[] = {
     {"soft_limit_enable",    offsetof(ProfileAxis_t, sl_enable),       0},
     {"soft_limit_neg",       offsetof(ProfileAxis_t, sl_neg),          1},
     {"soft_limit_pos",       offsetof(ProfileAxis_t, sl_pos),          1},
+    {"rot_wrap_enable",      offsetof(ProfileAxis_t, rot_wrap_enable), 0},
     {"gantry_tol_pulse",     offsetof(ProfileAxis_t, gs_tol_pulse),    0},
     {"gantry_max_err_pulse", offsetof(ProfileAxis_t, gs_max_err_pulse),0},
     {"gantry_err_time_ms",   offsetof(ProfileAxis_t, gs_err_time_ms),  0},
@@ -214,6 +223,8 @@ static int ps_parse_global_line(MachineProfile_t *p, const char *section,
         else if (strcmp(key, "pivot_x") == 0)  p->pivot_x  = strtod(val, NULL);
         else if (strcmp(key, "pivot_y") == 0)  p->pivot_y  = strtod(val, NULL);
         else if (strcmp(key, "pivot_z") == 0)  p->pivot_z  = strtod(val, NULL);
+        else if (strcmp(key, "singularity_rmax") == 0) p->singularity_rmax = strtod(val, NULL);
+        else if (strcmp(key, "chain_order") == 0) p->chain_order = (int)strtol(val, NULL, 10);
         else { printf("[param_store] 行 %d: 未知 [kinematics] key '%s' (忽略)\n", lineno, key); }
         return 0;
     }
@@ -410,6 +421,8 @@ static int ps_save_locked(const MachineProfile_t *p)
     fprintf(fp, "pivot_x=%.6f\n",  p->pivot_x);
     fprintf(fp, "pivot_y=%.6f\n",  p->pivot_y);
     fprintf(fp, "pivot_z=%.6f\n",  p->pivot_z);
+    fprintf(fp, "singularity_rmax=%.6f\n", p->singularity_rmax);
+    fprintf(fp, "chain_order=%d\n", p->chain_order);
     fprintf(fp, "\n[planner]\n");
     fprintf(fp, "corner_tolerance=%.6f\n",   p->corner_tolerance);
     fprintf(fp, "max_centripetal_acc=%.6f\n", p->max_centripetal_acc);

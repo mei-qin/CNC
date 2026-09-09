@@ -311,9 +311,21 @@ static void recompute_scurve_profile(TrajectorySegment_t *seg)
     seg->s5 = seg->s4 + seg->v4*dt5 + seg->j5*dt5*dt5*dt5/6.0;
     seg->s6 = seg->s5 + seg->v5*dt6 + 0.5*seg->a6*dt6*dt6;
 
-    /* NaN / Inf 熔断（总时长上限 30s） */
-    if (isnan(seg->T_total) || isinf(seg->T_total)
-        || seg->T_total <= 0.0 || seg->T_total > 30000.0) {
+    /* NaN / Inf 熔断 */
+    // @Fix P0-RTCP (2026-09-02): 原条件额外含 "T_total > 30000.0" (单段 30s),
+    //   会把【合法长行程段】误判为异常并静默降级为零长度空段 ——
+    //   total_distance / v_target 被清零、T_total 强制 1ms, 但 target_pos 不变,
+    //   plan_cursor 亦已推进 → RT 视该段 1ms 完成而物理轴不动,
+    //   位置记账与实际位置脱节, 后续加工全在错误基准上进行 (撞机风险),
+    //   且全程无打印 / 无事件, 上层与操作者完全无感知。
+    //   实测该阈值与行程无关, 纯为单段时长 (等效行程 ÷ F):
+    //     X100 F600   (10s)   通过  |  X100 F100   (60s)   被吞
+    //     X350 F2000  (10.5s) 通过  |  X350 F600   (35s)   被吞
+    //     C300 F600   (26.2s) 通过  |  C350 F600   (30.5s) 被吞
+    //   大工件长边 / 旋转轴大角度转位属合法工况, 不应熔断;
+    //   NaN/Inf 才是真正的数值异常, 保留熔断 (T_total<=0 为零长度段, 合法降级)。
+    // @Thread-Safety 仅读写 seg 指向的段缓冲, 调用者持 queue_spinlock
+    if (isnan(seg->T_total) || isinf(seg->T_total) || seg->T_total <= 0.0) {
         seg->T1=0; seg->T2=0; seg->T3=0; seg->T4=0;
         seg->T5=0; seg->T6=0; seg->T7=0;
         seg->T_total = 1.0;

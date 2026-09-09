@@ -74,6 +74,9 @@ typedef struct {
     int    sl_enable;
     double sl_neg;
     double sl_pos;
+    /* P0 旋转轴最短路径解缠绕 (立即级): 1=G90 绝对指令 wrap-to-nearest
+     * 仅 G90 逻辑坐标生效; G91 增量精确执行; G53 机械绝对直通 (逃生通道) */
+    int    rot_wrap_enable;
     /* 龙门同步报警 (双驱轴生效) */
     int    gs_tol_pulse;
     int    gs_max_err_pulse;
@@ -96,6 +99,12 @@ typedef struct {
     /* 五轴运动学 (立即级) */
     double tool_len;
     double pivot_x, pivot_y, pivot_z;
+    /* P0 RTCP 奇异点阈值: 直线 R_max 预估 / 圆弧逐微段 phys/log 比 超过则硬报警
+     * 默认 30.0; <=0 显式禁用检测 */
+    double singularity_rmax;
+    /* P1 (2026-09-04): 双摆头链序 0=R1 外层 (已交付默认) / 1=R2 外层 (C外B内腕)。
+     * 同时参数化逆解装配与 G43.5 姿态解算; 实机观测确认后切换 */
+    int    chain_order;
     /* 规划器 (立即级) */
     double corner_tolerance;
     double max_centripetal_acc;
