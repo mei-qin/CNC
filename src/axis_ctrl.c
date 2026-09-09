@@ -54,6 +54,81 @@ int32_t          g_program_num_n_labels = 0;
  * result: 0=未启动/进行中, 1=边界冻结成功, 2=行存在但非 G00 边界, 3=行不存在。 */
 _Atomic int      g_program_resume_ready  = 0;
 _Atomic int      g_program_resume_result = 0;
+
+/* ---- 加载 keep-last-good 身份暂存 (2026-09-09, opcua_probe §11-2/3 修复) ----
+ * 语义: Load/Run 的 Program_Load 异步失败时, 恢复上一成功加载的程序身份
+ * (Fanuc 惯例: 选程失败保留旧程序), LineCount / RunLoadedProgram 语义不因
+ * 一次失败加载归零。此前 parser 启动即清零 stats+load_done, 失败后不恢复,
+ * "Load(UNC 坏路径) → LineCount=0 + Start 拒绝" 即此。
+ * 写时序 (三阶段, 不并发):
+ *   1. SMC_LoadProgram/RunGCodeFile (API 线程, is_running=0 门控): 覆盖前暂存
+ *   2. parser 失败分支: Restore + WARN 事件
+ *   3. 成功路径: 自然覆盖, 暂存保留供下次用 */
+typedef struct {
+    int      valid;                          // 1 = 存在可恢复的成功加载
+    char     filepath[256];
+    int32_t  total_lines, num_o_labels, num_n_labels;
+    double   total_time_ms;
+    double   bbox_min[AXIS_NUM], bbox_max[AXIS_NUM];
+    uint64_t first_seg_id, last_seg_id;
+    long     fp_file_size, fp_file_mtime;    // 断点续切指纹一并保留
+    double   fp_work_offsets[6][AXIS_NUM];
+    double   fp_local_offset[AXIS_NUM];
+} ProgramIdentity_t;
+static ProgramIdentity_t g_last_good_load = {{0}, {0}};
+
+// @Context: Non-RealTime Background Thread (API 线程, is_running=0 门控下)
+// 仅当上一加载已完成 (load_done==1) 时暂存其身份; 无成功加载则跳过。
+void api_program_identity_save(void)
+{
+    if (!atomic_load_explicit(&g_program_load_done, memory_order_acquire)) {
+        return;
+    }
+    strncpy(g_last_good_load.filepath, g_parser_ctrl.filepath,
+            sizeof(g_last_good_load.filepath) - 1);
+    g_last_good_load.filepath[sizeof(g_last_good_load.filepath) - 1] = '\0';
+    g_last_good_load.total_lines   = g_program_total_lines;
+    g_last_good_load.num_o_labels  = g_program_num_o_labels;
+    g_last_good_load.num_n_labels  = g_program_num_n_labels;
+    g_last_good_load.total_time_ms = g_program_total_time_ms;
+    memcpy(g_last_good_load.bbox_min, g_program_bbox_min, sizeof(double) * AXIS_NUM);
+    memcpy(g_last_good_load.bbox_max, g_program_bbox_max, sizeof(double) * AXIS_NUM);
+    g_last_good_load.first_seg_id = g_program_first_seg_id;
+    g_last_good_load.last_seg_id  = g_program_last_seg_id;
+    g_last_good_load.fp_file_size  = g_parser_ctrl.fp_file_size;
+    g_last_good_load.fp_file_mtime = g_parser_ctrl.fp_file_mtime;
+    memcpy(g_last_good_load.fp_work_offsets, g_parser_ctrl.fp_work_offsets,
+           sizeof(double) * 6 * AXIS_NUM);
+    memcpy(g_last_good_load.fp_local_offset, g_parser_ctrl.fp_local_offset,
+           sizeof(double) * AXIS_NUM);
+    g_last_good_load.valid = 1;
+}
+
+// @Context: Non-RealTime Background Thread (parser 失败分支)
+// 恢复上一成功加载身份。返回 0=已恢复, -1=无可恢复项 (从未成功加载过)。
+int api_program_identity_restore(void)
+{
+    if (!g_last_good_load.valid) return -1;
+    strncpy(g_parser_ctrl.filepath, g_last_good_load.filepath,
+            sizeof(g_parser_ctrl.filepath) - 1);
+    g_parser_ctrl.filepath[sizeof(g_parser_ctrl.filepath) - 1] = '\0';
+    g_program_total_lines   = g_last_good_load.total_lines;
+    g_program_num_o_labels  = g_last_good_load.num_o_labels;
+    g_program_num_n_labels  = g_last_good_load.num_n_labels;
+    g_program_total_time_ms = g_last_good_load.total_time_ms;
+    memcpy(g_program_bbox_min, g_last_good_load.bbox_min, sizeof(double) * AXIS_NUM);
+    memcpy(g_program_bbox_max, g_last_good_load.bbox_max, sizeof(double) * AXIS_NUM);
+    g_program_first_seg_id = g_last_good_load.first_seg_id;
+    g_program_last_seg_id  = g_last_good_load.last_seg_id;
+    g_parser_ctrl.fp_file_size  = g_last_good_load.fp_file_size;
+    g_parser_ctrl.fp_file_mtime = g_last_good_load.fp_file_mtime;
+    memcpy(g_parser_ctrl.fp_work_offsets, g_last_good_load.fp_work_offsets,
+           sizeof(double) * 6 * AXIS_NUM);
+    memcpy(g_parser_ctrl.fp_local_offset, g_last_good_load.fp_local_offset,
+           sizeof(double) * AXIS_NUM);
+    atomic_store_explicit(&g_program_load_done, 1, memory_order_release);
+    return 0;
+}
 /************************ 五轴系统初始化（核心配置，修改此函数即可调整轴参数） ************************/
 // @Context: Non-RealTime Background Thread (parser 线程经 api_push_trajectory_impl 调用)
 // @Safe: printf + EventLogger_Push 允许。越界拒绝时置系统报警 (对齐 G28 中间点
@@ -154,6 +229,14 @@ void api_set_zero(int axis_idx){
 
 
 void api_go_zero(int axis_idx,double speed){
+    // 2026-09-09 类修复 (opcua_probe §11-4): 空闲时以实际机床位置为基准。
+    // plan_cursor 只在部分 RT 直写路径收尾时被重同步 (JOG 停止 hotfix #2 /
+    // 报警复位 / 程序启动 / G28 / SetOriginHere), SafeLift DONE / Homing DONE
+    // 补同步前仍可能残留偏差 — 入口统一兜底, 免疫所有现存与未来的直写路径。
+    // 运动中绝不同步 (is_trajectory_finished=0): cursor 是在途段链式基准。
+    if (is_trajectory_finished()) {
+        api_sync_planner_cursor();
+    }
     double t_pos[AXIS_NUM];
     for(int i=0;i<AXIS_NUM;i++){
         t_pos[i]=plan_cursor[i];
@@ -176,6 +259,13 @@ void api_go_zero(int axis_idx,double speed){
 
 
 void api_move_relative(int axis_idx,double distance,double speed){
+    // 2026-09-09 类修复 (opcua_probe §11-4): 增量基准统一为"空闲时实际位置"。
+    // 背景: 基准 plan_cursor 与回读 ActualPosition (反馈) 不同源, RT 直写路径
+    // (JOG/SafeLift/Homing) 后残差直接进入增量 target — JogStop hotfix #2 修了
+    // JOG 一处, 此处入口兜底修全类。连续增量 (队列非空) 保持链式基准不变。
+    if (is_trajectory_finished()) {
+        api_sync_planner_cursor();
+    }
     double t_pos[AXIS_NUM];
     for(int i=0;i<AXIS_NUM;i++){
         t_pos[i]=plan_cursor[i];
@@ -2149,5 +2239,8 @@ int axis_homing_multi(const int *axis_indices, int count, int source)
     //   若不在此恢复则机床后续 motion 永久冻结 (time_scale=0). 故显式恢复.
     //   (G28 parser 路径同理受益: 回零后续段能正常插补.)
     g_interpolator.time_scale = 1.0;
+    // 2026-09-09: 回零直写 current_cmd_pos/homing_shift 后重同步 plan_cursor
+    // (与 JogStop hotfix #2 同类 — 此前 Homing DONE 后增量指令用旧基准)。
+    api_sync_planner_cursor();
     return 0;
 }

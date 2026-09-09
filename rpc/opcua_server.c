@@ -166,7 +166,8 @@ typedef enum {
     OM_LASER_SET_GAS,
     OM_LASER_SET_COUPLING,
     OM_LASER_CONFIG_GAS_RANGE,
-    OM_LASER_CONFIG_MICRO_JOINT
+    OM_LASER_CONFIG_MICRO_JOINT,
+    OM_LASER_CONFIG_RANGE
 } OpcMethodKind;
 
 /* P3: 配置写保护 (server 级开关, 仿 Fanuc PWE 参数写使能)。
@@ -1079,6 +1080,21 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
         ok = (SMC_ConfigLaserMicroJoint(*(UA_Double *)input[0].data) == 0);
         break;
     }
+    case OM_LASER_CONFIG_RANGE: {
+        /* in: Double powerMaxW, Double freqMaxHz, Double powerMinW —
+         * 直调 SMC_ConfigLaserRange (RPC 0x0054 同源)。sim 下 kernel_init 不配
+         * 激光量程 (生产由上位机配置), 独立冒烟测试须先经此方法配量程, 否则
+         * SetPower/SetFrequency 越界 (0-0) 被防呆拒。 */
+        if (inputSize != 3 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[2], &UA_TYPES[UA_TYPES_DOUBLE]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        ok = (SMC_ConfigLaserRange(*(UA_Double *)input[0].data,
+                                   *(UA_Double *)input[1].data,
+                                   *(UA_Double *)input[2].data) == 0);
+        break;
+    }
     }
 
     return UA_Variant_setScalarCopy(output, &ok, &UA_TYPES[UA_TYPES_BOOLEAN]);
@@ -1650,6 +1666,16 @@ static void build_laser_nodes(UA_Server *s, const UA_NodeId ns_cnc)
         UA_Argument in[1] = { arg_in_double("ratio", "micro-joint power ratio (0,1]") };
         add_method(s, "Laser.ConfigMicroJoint", ns_laser, "ConfigMicroJoint",
                    "set micro-joint power ratio", OM_LASER_CONFIG_MICRO_JOINT, in, 1);
+    }
+    {
+        UA_Argument in[3] = {
+            arg_in_double("powerMaxW", "power full-scale (W, >0)"),
+            arg_in_double("freqMaxHz", "frequency full-scale (Hz, >0)"),
+            arg_in_double("powerMinW", "power minimum (W, >=0)"),
+        };
+        add_method(s, "Laser.ConfigRange", ns_laser, "ConfigRange",
+                   "configure laser power/frequency full-scale range",
+                   OM_LASER_CONFIG_RANGE, in, 3);
     }
 }
 

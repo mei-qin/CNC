@@ -24,7 +24,7 @@
 #define PROBE_NC_PATH      "/tmp/opcua_probe_test.nc"
 /* CNC 端程序根目录 (与 rpc/opcua_server.c 对齐): SMC_PROGRAM_DIR 环境变量
  * 优先, 默认开发机路径。main() 开头初始化 (实机用户名可能不同, 如 server) */
-#define PROBE_NC_DIR_DEFAULT "/home/meiqin/nc"
+#define PROBE_NC_DIR_DEFAULT "/home/server/nc"
 static char PROBE_NC_SHARED[512];
 static char PROBE_NC_DIR[448];
 
@@ -794,6 +794,23 @@ int main(int argc, char *argv[])
         printf("\n--- §11 Laser nodes & methods ---\n");
         int32_t vi = -1;
         double   vd = -1.0;
+
+        /* 11-0. 前置: ConfigRange 配激光量程 (sim 下 kernel_init 不配, 量程=0,
+         * SetPower/SetFrequency 会被防呆拒)。freq_max 50000 覆盖 movecontrol
+         * 常用 20000Hz (对齐 scripts/test_laser_config_rpc.py 默认量程)。 */
+        {
+            UA_Variant in[3];
+            UA_Double pmax = 3000.0, fmax = 50000.0, pmin = 50.0;
+            UA_Variant_setScalarCopy(&in[0], &pmax, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[1], &fmax, &UA_TYPES[UA_TYPES_DOUBLE]);
+            UA_Variant_setScalarCopy(&in[2], &pmin, &UA_TYPES[UA_TYPES_DOUBLE]);
+            int bv = -1;
+            int cok = call_method_bool_args(client, "CNC.Laser",
+                                            "CNC.Laser.ConfigRange", 3, in, &bv);
+            UA_Variant_clear(&in[0]); UA_Variant_clear(&in[1]); UA_Variant_clear(&in[2]);
+            snprintf(buf, sizeof(buf), "cok=%d ok=%d", cok, bv);
+            check(cok == 0 && bv == 1, "ConfigRange(3000,50000,50) accepted", buf);
+        }
 
         /* 11-1. 状态变量契约: 类型 + 值域 (未配置激光时全零也满足) */
         read_int(client, "CNC.Laser.Enable", &vi);

@@ -53,6 +53,10 @@ void api_push_rel(double tx,double ty,double tz,double speed);
 void api_sync_planner_cursor();
 double api_get_cursor(int axis_idx);
 int is_trajectory_finished();
+// 加载 keep-last-good (2026-09-09, opcua_probe §11-2/3): Load/Run 前暂存上一成功
+// 加载身份, parser Program_Load 失败时恢复 (Fanuc 选程失败保留旧程序惯例)。
+void api_program_identity_save(void);
+int  api_program_identity_restore(void);
 int  api_push_trajectory(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 // @Context: Non-RealTime Background Thread (parser / bspline)
 // @Thread-Safety: Lock-Free SPSC 队列,write_head 由生产者串行独占写入

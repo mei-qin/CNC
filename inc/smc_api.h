@@ -155,7 +155,9 @@ void SMC_AbortProcessing(void);
 // 加载程序到 preview cache (parser 跑完但不进 motion queue, RT 不消费)
 // 调用后 parser_thread 异步跑, g_program_load_done=1 时表示完成
 // filepath: G 代码绝对路径 (Linux 格式, Windows 端通过 SDK 的 TranslatePathForWSL 转换)
-// 返回: 0=已启动, -1=parser 正忙 (is_running=1), -2=filepath 空或越界
+// 返回: 0=已启动, -1=parser 正忙 (is_running=1), -2=filepath 空或越界,
+//       -3=文件不可达 (fail-fast, 2026-09-09; 上一成功加载不受影响)
+// 异步失败 (读取中断等): keep-last-good 恢复上一成功程序 (事件 0x003A)
 int SMC_LoadProgram(const char *filepath);
 
 // 执行已加载的程序 (LoadProgram 必须先完成, g_program_load_done=1)

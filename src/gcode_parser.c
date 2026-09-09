@@ -2680,6 +2680,18 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             GCodeProgram_t *prog = Program_Load(g_parser_ctrl.filepath);
             if(!prog){
                 printf("[Parser错误] 加载失败: %s\n", g_parser_ctrl.filepath);
+                // 2026-09-09 keep-last-good (opcua_probe §11-2/3): 异步加载失败
+                // 恢复上一成功加载的程序身份 (Fanuc 选程失败保留旧程序惯例),
+                // LineCount / RunLoadedProgram 语义不因失败加载归零。
+                // fail-fast (API 层 stat) 已挡掉不可达路径类; 此处兜其余
+                // (读取中断/行数超限/解析期文件被删等)。
+                if (api_program_identity_restore() == 0) {
+                    EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x003A, 0,
+                                     "program load failed, previous program retained");
+                } else {
+                    EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x003A, 0,
+                                     "program load failed (no previous program)");
+                }
                 g_parser_ctrl.is_running=0;
                 continue;
             }

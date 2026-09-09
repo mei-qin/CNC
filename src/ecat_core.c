@@ -792,6 +792,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.current_pos[z]   = g_axis[z].current_cmd_pos;
                     g_interpolator.safe_lift_state  = 3;  /* DONE */
                     /* time_scale 保持 0, 由 alarm_reset 路径或 cancel 恢复 1.0 */
+                    /* 2026-09-09: RT 直写收尾即重同步 plan_cursor (报警路径原本
+                     * 经 alarm_reset 的 sync 兜底, 手动抬升无报警伴随则裸奔 —
+                     * 抬升后 Z 轴增量指令会用抬升前旧基准)。有界 5 拷贝, RT 安全
+                     * (与报警复位路径的同名调用同模式)。 */
+                    api_sync_planner_cursor();
                     EventLogger_Push(SEVERITY_INFO,
                                      g_interpolator.safe_lift_source,
                                      0x0005, 3, "safe_z_lift done");

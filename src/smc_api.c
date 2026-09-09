@@ -603,9 +603,21 @@ void SMC_GoZero(char axis_letter, double speed) {
 // ================== G代码加工 ==================
 int SMC_RunGCodeFile(const char *filepath) {
     if (g_parser_ctrl.is_running) return -1;
+    // 2026-09-09 fail-fast: 文件不可达同步拒绝 (UNC/笔误路径), 不进 parser 异步失败
+    {
+        struct stat st;
+        if (filepath == NULL || filepath[0] == '\0') return -2;
+        if (stat(filepath, &st) != 0) {
+            printf("[SMC_API] RunGCodeFile: 文件不可达, 拒绝 (%s)\n", filepath);
+            EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x003A, 0,
+                             "RunGCodeFile rejected: file not accessible");
+            return -3;
+        }
+    }
     // 直跑路径同样作废续切冻结 (同 LoadProgram 理由)
     atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
     atomic_store_explicit(&g_program_resume_result, 0, memory_order_release);
+    api_program_identity_save();   // keep-last-good: 覆盖前暂存上一成功加载
     strncpy(g_parser_ctrl.filepath, filepath, sizeof(g_parser_ctrl.filepath)-1);
     g_parser_ctrl.abort_request = 0;
     g_parser_ctrl.is_paused = 0;
@@ -634,9 +646,25 @@ int SMC_LoadProgram(const char *filepath) {
     if (filepath == NULL || filepath[0] == '\0') return -2;
     if (g_parser_ctrl.is_running) return -1;
 
+    // 2026-09-09 fail-fast (opcua_probe §11-2/3): 文件不可达同步拒绝 (-3),
+    // UNC/笔误路径不再进 parser 异步失败 — 那条路径曾把 load_done/total_lines
+    // 清零污染上一成功加载 (LineCount=0 + Start 拒绝的根因之一)。
+    {
+        struct stat st;
+        if (stat(filepath, &st) != 0) {
+            printf("[SMC_API] LoadProgram: 文件不可达, 拒绝 (%s)\n", filepath);
+            EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x003A, 0,
+                             "LoadProgram rejected: file not accessible");
+            return -3;
+        }
+    }
+
     // 新程序加载 → 作废上一程序的续切冻结 (防 ResumeStart 误触旧边界)
     atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
     atomic_store_explicit(&g_program_resume_result, 0, memory_order_release);
+    // keep-last-good: 覆盖 parser_ctrl 前暂存上一成功加载身份
+    // (若后续 Program_Load 异步失败, parser 失败分支恢复)
+    api_program_identity_save();
 
     strncpy(g_parser_ctrl.filepath, filepath, sizeof(g_parser_ctrl.filepath) - 1);
     g_parser_ctrl.filepath[sizeof(g_parser_ctrl.filepath) - 1] = '\0';
@@ -1786,7 +1814,28 @@ int SMC_GetLaserState(SmcGetLaserStateRes *out)
     out->emergency_kill   = g_laser_rt.emergency_kill;
     out->P_base_w         = g_laser_rt.P_base_w;
     out->v_actual_mm_s    = g_laser_rt.v_actual_mm_s;
-    out->coupling_mode_rt = g_laser_rt.coupling_mode_rt;
+    // ---- 耦合模式: 空闲态回落配置源 (2026-09-09, opcua_probe §11-1 修复) ----
+    // Phase B1 段级镜像语义: coupling_mode_rt 仅在 RT 消费运动段时刷新
+    // (laser_ctrl.c laser_rt_sync_config)。空闲态镜像停留在旧值, 操作员
+    // SetCoupling 后回读看不到变更 — 但空闲期"下一段将生效的值"就是配置值。
+    // 规则: 队列空 && !is_moving && !is_waiting_mcode → 报 g_laser_cfg (配置态
+    // = 空闲期的真实生效语义); 运动中/等待中 → RT 镜像 (在途真实值)。
+    // 段间瞬态 is_moving 短暂为 0 但队列非空 → 不闪变。RPC 0x0033 与 OPC UA
+    // Laser.CouplingMode 同源于此, 双面一致。
+    {
+        int queue_empty = (atomic_load_explicit(&g_cmd_queue.write_head,
+                                                memory_order_acquire)
+                           == atomic_load_explicit(&g_cmd_queue.read_tail,
+                                                   memory_order_acquire));
+        int idle = (queue_empty
+                    && atomic_load_explicit(&g_interpolator.is_moving,
+                                            memory_order_acquire) == 0
+                    && !g_interpolator.is_waiting_mcode);
+        out->coupling_mode_rt = idle
+            ? (int)atomic_load_explicit(&g_laser_cfg.coupling_mode,
+                                        memory_order_acquire)
+            : g_laser_rt.coupling_mode_rt;
+    }
 
     // ---- 派生字段 (从 g_interpolator 计算) ----
     // is_piercing: G04 dwell (M64) / M76 渐进穿孔等待期间为 1, 供 HMI 显示 "穿孔中"
