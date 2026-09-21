@@ -7,6 +7,7 @@
 #include "program_loader.h"  // Phase 2B M1: 文件加载器 + N 标签 + GOTO
 #include "event_logger.h"    // P1-b: 参数校验报警 + 程序生命周期
 #include "smc_protocol.h"    // P2-A: SMC_MODE_* 位定义 (M30 override 重置用)
+#include "block_timing.h"    // 论文1 S10: block 级计时插桩 (bt_block_open/close/reset)
 #include <math.h>
 #include <stdatomic.h>    // atomic_store_explicit (M3 S 值保护报警)
 #define PI 3.14159265358979323846
@@ -61,6 +62,8 @@ extern int api_push_trajectory_g93(double target_pos[AXIS_NUM],double speed,doub
 extern int api_push_trajectory_passthrough(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],double speed,double acc,double dec);
 extern int api_push_mcode(int m_code, double s_value, double p_value, double q_value, double r_value);
+// 论文1 B0′ 消融 (axis_ctrl.c 定义): 1=每微段继承整块进给字 (τ_b=n_b·T_b)
+extern int g_g93_f_inherit;
 
 // P4' Phase 2: G65/G66 共用的宏调用分发 helper (前向声明)
 // 参数: o_num=目标O号, l_repeat=重复次数, args/args_set=字母参数(#1-#26),
@@ -372,6 +375,23 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         memcpy(phys_end, end_pos, sizeof(double) * AXIS_NUM);
         apply_rtcp_to_pos(phys_end);
         double speed_mm_sec = run_speed_mm / 60.0;
+        // G93 必须走强一致性 wrapper (论文1 V2 战役 发现 F1, 2026-09-18):
+        // 此前本分支恒调 api_push_trajectory_rtcp(), 使 is_g93_strict=0 /
+        // g93_dt_sec=0, 严格时间剖面被跳过而退化成梯形 —— 实测
+        //   G43.4 G93 G01 X10 B0 C0 F60  ->  tau = 1.159 s (T=1 s, +15.9%)
+        // 且 tau ≈ T + v_cmd/a_max (v=5/10/20 mm/s -> 超时 110/159/409 ms),
+        // v_cmd 在给定长度内达不到时饱和到 2*sqrt(L/a)。
+        // 无旋转时 RTCP 变换是常量平移, 物理位移 = 逻辑位移, 故
+        // speed_mm_sec = dist_total/T 已是正确的时间守恒速度, 直接沿用。
+        if(g93_T_sec > 1e-9){
+            // 论文1 S10: 无旋转分支是**单段**承载整块预算, gen=1, sum==cmd。
+            bt_block_open(g93_T_sec * 1000.0, 1, g93_T_sec * 1000.0,
+                          g_current_line_no);
+            int rc = api_push_trajectory_g93(phys_end, speed_mm_sec,
+                                             DEFAULT_ACC, DEFAULT_DEC, g93_T_sec);
+            bt_block_close();
+            return rc;
+        }
         return api_push_trajectory_rtcp(phys_end, speed_mm_sec, DEFAULT_ACC, DEFAULT_DEC);
     }
 
@@ -436,6 +456,10 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         if(num_segments > 20000) num_segments = 20000;
         if(num_segments < 1) num_segments = 1;
         dt_per_seg = g93_T_sec / (double)num_segments;
+        // B0′ 消融 (论文1, 2026-09-17): 禁用 IV-B 再分配, 微段直接继承整块
+        // 进给字 → τ_b = n_b·T_b。下方 phys_speed = phys_dist/dt_per_seg 随之
+        // 自动一致 (段速度 = 段长/继承预算), 无需二次改动。
+        if(g_g93_f_inherit) dt_per_seg = g93_T_sec;
     } else {
         double adaptive_segment_mm = RTCP_LINEAR_SEGMENT_MM / fmax(1.0, R_max);
         if(adaptive_segment_mm < 0.01) adaptive_segment_mm = 0.01;
@@ -457,6 +481,19 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         double feed_mm_sec = run_speed_mm / 60.0;
         if(feed_mm_sec < 1e-6) feed_mm_sec = 1e-6;
         dt_per_seg = seg_logical_dist / feed_mm_sec;
+    }
+
+    // ---- 4.5 论文1 S10: block 计时插桩 (仅 G93) ----
+    // 必须在任何 push 之前声明: block_seg_count 要在**第一个**微段入队时就已知
+    // (段按值入队, 无法事后回填)。G94 自适应空间切分不参与本实验, 保持未插桩。
+    //   block_budget_cmd_ms = T*1000                  (指令时长)
+    //   block_budget_sum_ms = Σ dt_per_seg*1000       (实际下发预算之和)
+    //   Full : sum == cmd  (= T*1000)
+    //   -H2  : sum == n*T*1000  (B0′ 每微段继承整块 T)
+    if(g93_T_sec > 1e-9){
+        bt_block_open(g93_T_sec * 1000.0, num_segments,
+                      dt_per_seg * (double)num_segments * 1000.0,
+                      g_current_line_no);
     }
 
     // ---- 5. 逐点插值 + 逆解 + 物理速度计算 + 入队 ----
@@ -489,7 +526,12 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         double phys_dist = sqrt(phys_dist_sq);
 
         // 物理下发速度 = 物理距离 / 时间预算
+        // H1 消融 (S10, 2026-09-20): tip_basis=1 时改为信任"声明进给"
+        // (run_speed_mm 由刀尖欧氏长度 L^P 反推) 而非逐微段实测物理量
+        // phys_dist/dt_per_seg —— 朴素控制器不做微段重测。执行侧 strict 段
+        // 仍按 dist/T 重算, 故轨迹不变; 只有可行性门被系统性低估 m 倍。
         double phys_speed = (dt_per_seg > 1e-9) ? phys_dist / dt_per_seg : 1e-6;
+        if(g_g93_tip_basis && g93_T_sec > 1e-9) phys_speed = run_speed_mm / 60.0;
         if(phys_speed < 1e-6) phys_speed = 1e-6;
 
         // G93 模式走强一致性路径,豁免底层短板限幅,刚性守恒时间预算。
@@ -497,18 +539,24 @@ int generate_linear_rtcp_trajectory(double start_pos[AXIS_NUM], double end_pos[A
         // 注意: G93 路径暂未提供 _rtcp 变体,因为 G93 已豁免短板限幅,
         //       is_rtcp_active 元数据对 G93 段意义不大 (RT 线程不区分对待)。
         //       后续若需 G93 RTCP 元数据,可扩展 api_push_trajectory_g93_rtcp。
+        // F4 (2026-09-19): 本处是**按时间切分**出来的微段 (dt_per_seg = T/n ≈ 1ms),
+        //   改用 _slice 变体显式告知 axis_ctrl, 使其在可行性回退时走恒速通过,
+        //   避免逐微段 0→v→0 的爬行 (S0 B4 实测 τ/T = 46.69, 应 5.33)。
         int push_ret;
         if(g93_T_sec > 1e-9){
-            push_ret = api_push_trajectory_g93(interp_pos, phys_speed,
-                                                DEFAULT_ACC, DEFAULT_DEC, dt_per_seg);
+            push_ret = api_push_trajectory_g93_slice(interp_pos, phys_speed,
+                                                     DEFAULT_ACC, DEFAULT_DEC,
+                                                     dt_per_seg);
         } else {
             push_ret = api_push_trajectory_rtcp(interp_pos, phys_speed,
                                                  DEFAULT_ACC, DEFAULT_DEC);
         }
         if(push_ret < 0){
+            bt_block_close();
             return -1;
         }
     }
+    bt_block_close();
 
     printf("[Parser] RTCP直线打碎: %d 段 (等效距离 %.2f mm, R_max=%.2f, 步长=%.3fmm)\n",
            num_segments, dist_eq, R_max,
@@ -2412,8 +2460,13 @@ int parse_gcode_line(const char *gcode_line)
         // 不再在此处对起终点做硬算，避免旋转运动时中间轨迹挖坑
 
         // 多轴等效距离计算（用于 G93 速度反推）
+        // H1 消融 (S10, 2026-09-20): tip_basis=1 时改用**刀尖欧氏长度 L^P**
+        // (只累加直线轴, 旋转轴折算行程不计入) ⇒ 下发速率 = L^P/T 而非 L^M/T。
+        // 执行侧 G93 strict 段是时间驱动 (axis_ctrl v_const = dist/T), 故轨迹不变;
+        // 变的只有可行性门看到的 req_v (低估 m = L^M/L^P 倍)。
         double dist_total = 0.0;
         for(int i=0;i<AXIS_NUM;i++){
+            if(g_g93_tip_basis && g_axis[i].axis_type == 1) continue;
             double delta = machine_target_pos[i] - machine_start_pos[i];
             if(g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0){
                 // 旋转轴：角度 → 弧长 (mm)
@@ -2587,7 +2640,27 @@ int parse_gcode_line(const char *gcode_line)
                 }
             } else {
                 // 直通: G00 或 B-Spline 未启用
-                if(api_push_trajectory(machine_target_pos,speed_mm_sec,DEFAULT_ACC,DEFAULT_DEC) < 0){
+                // 2026-09-16 修复 (L2_g93_strict 实测 5343ms vs T=2500ms, +113.6%):
+                // G93 普通直通路径 (无 RTCP/无刀补/无样条) 此前走 api_push_trajectory
+                // (is_g93_strict=0, g93_dt_sec=0) — parser 按物理等效距离反推的 v_req
+                // 被 planner 短板限幅压低 (C 轴大回转需求超限) → 块时长膨胀。
+                // 这是 C3 "四路径全覆盖" 遗漏的第五条路径, E3 机制 (前瞻动力学覆盖
+                // 时间预算) 的实证案例。G01+G93 改走 g93 wrapper 保严格剖面;
+                // G00 不携带时间预算, 维持原路径。
+                int push_rc;
+                if (g_state.feed_mode == FEED_MODE_G93 && g_state.motion_mode == 1) {
+                    // 论文1 S10: 直通 G93 路径是**单段**承载整块预算 (不打碎),
+                    // 故 segments_generated = 1, sum == cmd == T*1000。
+                    bt_block_open(g93_T_sec * 1000.0, 1, g93_T_sec * 1000.0,
+                                  g_current_line_no);
+                    push_rc = api_push_trajectory_g93(machine_target_pos, speed_mm_sec,
+                                                      DEFAULT_ACC, DEFAULT_DEC, g93_T_sec);
+                    bt_block_close();
+                } else {
+                    push_rc = api_push_trajectory(machine_target_pos, speed_mm_sec,
+                                                  DEFAULT_ACC, DEFAULT_DEC);
+                }
+                if(push_rc < 0){
                     printf("[Parser] 运动指令入队失败(报警)，中止当前文件！\n");
                     return -1;
                 }
@@ -2707,6 +2780,8 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
             }
 
             api_sync_planner_cursor(); // 同步规划器光标，确保新轨迹从当前状态开始
+            api_g93_jerk_reset();      // 论文1 IV-E: 严格块链状态清零 (每程序独立)
+            api_g93_posthoc_reset();   // 论文1 M1: 事后修正速度赤字清零 (每程序独立)
 
             for(int i=0;i<AXIS_NUM;i++){
                 g_state.current_pos[i]=api_get_cursor(i);
@@ -3223,6 +3298,9 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
     if(g93_T_sec > 1e-9){
         // G93: 整段时间预算均分到每微段,RTCP/非 RTCP 一致
         dt_per_seg = g93_T_sec / (double)num_segments;
+        // B0′ 消融 (论文1, 2026-09-17): 圆弧侧同样回退为 F-inheritance;
+        // 发射循环 seg_speed = phys_dist/dt_per_seg 自动保持一致。
+        if(g_g93_f_inherit) dt_per_seg = g93_T_sec;
     } else if(g_state.rtcp_enabled){
         double seg_logical_dist = helical_length / (double)num_segments;
         double feed_mm_sec = feedrate_mm_min / 60.0;
@@ -3259,6 +3337,13 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
      * 与直线侧 estimate_max_jacobian_ratio() 的纯几何定义保持一致。 */
     double prev_phys[AXIS_NUM];
     int    have_prev_phys = 0;
+
+    // ---- 5.5 论文1 S10: block 计时插桩 (仅 G93) ----
+    if(g93_T_sec > 1e-9){
+        bt_block_open(g93_T_sec * 1000.0, num_segments,
+                      dt_per_seg * (double)num_segments * 1000.0,
+                      g_current_line_no);
+    }
 
     // ---- 6. 逐点插补 ----
     for(int i = 1; i <= num_segments; i++){
@@ -3365,9 +3450,11 @@ int generate_arc_trajectory(double start_pos[AXIS_NUM],double end_pos[AXIS_NUM],
                                             DEFAULT_ACC, DEFAULT_DEC);
         }
         if(push_ret < 0){
+            bt_block_close();
             return -1;
         }
     }
+    bt_block_close();
 
     printf("[Parser] 生成了 %d 个圆弧插补点 (平面 G%d, 速度 %.2f mm/s)\n",
            num_segments, g_state.active_plane, speed_mm_sec);

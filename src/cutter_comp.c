@@ -10,6 +10,11 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+// 论文1 M1 替代设计 (RPC 0x0085): 事后修正开关与累积速度赤字 (定义于 axis_ctrl.c)
+extern int    g_g93_posthoc;
+extern double g_g93_posthoc_debt;
+extern int    g_g93_ratio_off;   /* V2 战役: Naive 基线 (关闭 IV-D 比重标定) */
+
 // ================== 全局引擎状态 ==================
 static CutterCompState_t g_comp;
 
@@ -246,16 +251,53 @@ static int line_arc_tangent(const double line_p0[2], const double line_dir[2],
 // C3 (2026-07-27): cutter_emit 签名不变 (caller 仍传 4 参数),
 // 内部从 g_comp 读取 G93 上下文 (g93_strict_pending/g93_dt_sec_pending),
 // 透传到 output_fn. PushPoint/PushArc 入口负责缓存 G93 上下文.
+// F6 (2026-09-19) 前向声明: 两个函数的定义在 comp_axis_dist 之后 / 紧随其后。
+static double comp_axis_dist(const double a[AXIS_NUM], const double b[AXIS_NUM]);
+static double comp_ramp_cap_speed(const double from[AXIS_NUM],
+                                  const double to[AXIS_NUM], double L_mm);
+
 static int cutter_emit(const double pos[AXIS_NUM], double speed,
                        double acc, double dec)
 {
-    TraceLogger_PushPipeline(STAGE_CUTTER_COMP, pos, speed / 1000.0);
+    double dt     = g_comp.g93_dt_sec_pending;
+    int    strict = g_comp.g93_strict_pending;
+    double v_out  = speed;
+
+    // ---- F6 (2026-09-19): 刀补引入几何的逐轴硬限封顶 --------------------
+    // @现象: G41 建立 / G40 撤销要把刀具横向移动一个刀补半径 R。这段行程原先
+    //   直接沿用"环境块的 pending G93 预算 T"下发 ⇒ 实际速度 v = R/T
+    //   (axis_ctrl.c:1208 `v_const = dist / T_total_ms`), 而 strict 段又豁免
+    //   下游逐轴限幅 ⇒ R/T 完全不受硬限约束。实测 (S7: G41 D20):
+    //     建立  20 mm / 0.13093 s = 152.75 mm/s = 3.06× X/Y 硬限 50
+    //     G40   20 mm / 0.065465 s = 305.5  mm/s = 6.11×
+    //   S5 同机制但无害 (R=5, T=0.577 s → 4.33 / 8.66 mm/s); 那两个值正是
+    //   S5 的 b1/b5 尾部 (此前被误记为"加减速斜坡") 的物理来源。
+    // @修法: 给这段行程算它自己的预算 ——
+    //     dt = max(T_pending, L / v_cap),  v_cap = 该方向上硬限允许的最大速度
+    //   当 R/T ≤ v_cap 时 dt == T_pending ⇒ **与现行为逐位一致 (零回归)**;
+    //   只有在会越限时才把时间拉长, 绝不静默超速。
+    // @Scope: 只影响 cutter_emit 的 14 个调用点 (全部是 G41 建立 / G40 撤销的
+    //   横向行程 + G94 回退)。编程段走 cutter_emit_line_scaled / cutter_emit_dt,
+    //   不受影响 ⇒ 论文 Table 3 的判据不受扰动。
+    if(strict && dt > 1e-9 && g_comp.last_emit_valid) {
+        double L = comp_axis_dist(g_comp.last_emit_pos, pos);
+        double cap = (L > 1e-9)
+                   ? comp_ramp_cap_speed(g_comp.last_emit_pos, pos, L) : 0.0;
+        if(cap > 0.0) {
+            double v_req = L / dt;                  // 该 emit 实际将以 v = L/dt 执行
+            if(v_req > cap * (1.0 + 1e-9)) {
+                dt    = L / cap;                    // 拉长到硬限允许的最短时间
+                v_out = cap;                        // 让第三步.5 的可行性门看到真值
+            }
+        }
+    }
+    // --------------------------------------------------------------------
+
+    TraceLogger_PushPipeline(STAGE_CUTTER_COMP, pos, v_out / 1000.0);
     // C3-fix2: 记录实际刀位 (圆弧离散化入口对齐用)
     memcpy(g_comp.last_emit_pos, pos, sizeof(double) * AXIS_NUM);
     g_comp.last_emit_valid = 1;
-    return g_comp.output_fn(pos, speed, acc, dec,
-                             g_comp.g93_strict_pending,
-                             g_comp.g93_dt_sec_pending);
+    return g_comp.output_fn(pos, v_out, acc, dec, strict, dt);
 }
 
 // C3-fix (2026-07-28): 显式 G93 上下文版本 —— 圆弧离散化微段时间均分专用.
@@ -276,6 +318,95 @@ static int cutter_emit_dt(const double pos[AXIS_NUM], double speed,
     g_comp.last_emit_valid = 1;
     return g_comp.output_fn(pos, speed, acc, dec,
                              is_g93_strict, g93_dt_sec);
+}
+
+// 2026-09-16: G93 速度锁定语义统一 —— LINE 体对齐 ARC 体的占比缩放。
+// 背景 (G93 论文实验实测): 内拐角剪裁后 L_act < L_prog, LINE 体仍用整段 T
+//   → v 降 ~14.5%, 功率密度 P/v 同幅波动 (激光烧切风险); 外拐角延伸
+//   (L_act > L_prog) 同理反向。ARC 体已按 |s_end/sweep| 缩放
+//   (discretize_offset_arc), LINE 体按同一不变量:
+//     T' = T × L_act / L_prog  →  v = L_act/T' = L_prog/T = v_cmd 恒定
+// L_act 从上一实际发射点 (last_emit_pos, C3-fix2 维护) 起算;
+// L_prog 为该编程段全长 (等效半径加权 5 轴距离, 与 parser v_req 基准一致);
+// dt 取段自身 seg->g93_dt_sec (不走 pending —— pending 已被下一段覆盖)。
+static double comp_axis_dist(const double a[AXIS_NUM], const double b[AXIS_NUM])
+{
+    double s = 0.0;
+    for(int j = 0; j < AXIS_NUM; j++) {
+        double d = b[j] - a[j];
+        if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0) {
+            d = d * (M_PI / 180.0) * g_axis[j].equivalent_radius;
+        }
+        s += d * d;
+    }
+    return sqrt(s);
+}
+
+// F6 (2026-09-19): 返回"沿 from→to 这个方向运动时, 硬限允许的最大合速度 (mm/s)"。
+//
+// 投影与 axis_ctrl.c 第三步.5 完全一致, 只是这里用**实际几何方向**而不是
+// 调用方传入的名义 speed:
+//   线性轴: u_j = |Δmm_j| / L                 (无量纲, 方向余弦)
+//   旋转轴: u_j = |Δdeg_j| / L                (deg/s per mm/s)
+//           —— 因为 Δdeg = Δmm / ((π/180)·ρ), 而合速度 v = L/dt, 故
+//              Δdeg/dt = v·|Δdeg|/L, ρ 自然约掉。
+//   cap_j = max_speed_j / u_j,   取所有轴的最小值。
+// 返回 0 表示"无约束" (所有相关轴位移为零或硬限为 0)。
+static double comp_ramp_cap_speed(const double from[AXIS_NUM],
+                                  const double to[AXIS_NUM], double L_mm)
+{
+    double v = 0.0;
+    for(int j = 0; j < AXIS_NUM; j++) {
+        double d = fabs(to[j] - from[j]);
+        if(d < 1e-9) continue;
+        double lim = g_axis[j].max_speed;
+        if(lim <= 0.0) continue;
+        double u = d / L_mm;
+        if(u <= 1e-9) continue;
+        double cap = lim / u;
+        if(v <= 0.0 || cap < v) v = cap;
+    }
+    return v;
+}
+
+static int cutter_emit_line_scaled(const CompSegment_t *seg,
+                                   const double pos[AXIS_NUM],
+                                   double speed, double acc, double dec)
+{
+    if(seg->g93_dt_sec <= 1e-9) {
+        return cutter_emit(pos, speed, acc, dec);   // G94: 原 pending 路径
+    }
+    double l_prog = comp_axis_dist(seg->start_pos, seg->end_pos);
+    double ratio = 1.0;
+    double l_act = l_prog;
+    if(g_comp.last_emit_valid && l_prog > COMP_ZERO_LEN_TOL) {
+        l_act = comp_axis_dist(g_comp.last_emit_pos, pos);
+        ratio = l_act / l_prog;
+        // 防御: 比例异常 (发射基准跨段失效等) 回退整段语义, 宁可保守
+        if(!(ratio >= 0.0) || ratio > 3.0) ratio = 1.0;
+    }
+
+    // 论文1 V2 仿真战役 (2026-09-18): Naive 基线 (g_g93_ratio_off=1) ——
+    // 不做先验长度重标定, 段按标称整段 T 执行 → v_act/v_cmd = γ (E4 解析预测)。
+    if(g_g93_ratio_off && !g_g93_posthoc) {
+        return cutter_emit_dt(pos, speed, acc, dec, 1, seg->g93_dt_sec);
+    }
+
+    // 论文1 M1 替代设计 (2026-09-18): 事后修正 —— 不做先验长度重标定,
+    // 段按标称 T 执行; 段末按实测 v_act 累积速度赤字, 补偿到下一段。
+    if(g_g93_posthoc && seg->g93_dt_sec > 1e-9 && l_prog > COMP_ZERO_LEN_TOL) {
+        double v_cmd = l_prog / seg->g93_dt_sec;          // mm/s
+        double dt    = seg->g93_dt_sec;                   // 标称, 无先验缩放
+        double v_eff = v_cmd + g_g93_posthoc_debt;        // 上一段赤字补偿
+        if(v_eff > 1e-9) dt = l_prog / v_eff;
+        if(!(dt > 1e-9)) dt = seg->g93_dt_sec;
+        // 段末"测量": 实际走过 l_act, 实际耗时 dt
+        double v_act = l_act / dt;
+        g_g93_posthoc_debt += (v_cmd - v_act);
+        return cutter_emit_dt(pos, speed, acc, dec, 1, dt);
+    }
+
+    return cutter_emit_dt(pos, speed, acc, dec, 1, seg->g93_dt_sec * ratio);
 }
 
 // ================== 核心：拐角分类与轨迹重构 ==================
@@ -363,7 +494,7 @@ static int process_corner_line_line(const CompSegment_t *segA,
         memcpy(pt, curr, sizeof(double) * AXIS_NUM);
         pt[ax1] += R * nAx;
         pt[ax2] += R * nAy;
-        cutter_emit(pt, speed, acc, dec);
+        cutter_emit_line_scaled(segA, pt, speed, acc, dec);
         return 0;
     }
 
@@ -403,7 +534,7 @@ static int process_corner_line_line(const CompSegment_t *segA,
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
             pt[ax1] = ix;
             pt[ax2] = iy;
-            cutter_emit(pt, speed, acc, dec);
+            cutter_emit_line_scaled(segA, pt, speed, acc, dec);
         }
 
     } else {
@@ -427,7 +558,6 @@ static int process_corner_line_line(const CompSegment_t *segA,
         memcpy(ptA, curr, sizeof(double) * AXIS_NUM);
         ptA[ax1] = footAx;
         ptA[ax2] = footAy;
-        cutter_emit(ptA, speed, acc, dec);
 
         // ② 生成过渡圆弧微段
         double start_angle = atan2(footAy - curr[ax2], footAx - curr[ax1]);
@@ -447,8 +577,53 @@ static int process_corner_line_line(const CompSegment_t *segA,
         double angle_step = sweep / (double)num_seg;
 
         // ③ 生成圆弧微段: 最后一微段强制对齐理论终点 footB，消除浮点累积
-        // C3-fix (2026-07-28): 过渡弧是刀补插入的非编程几何, 不占 G93 时间预算
-        // → 显式走非 strict 路径 (dt=0), 防止微段各拿整块 6s 导致 N×6s 膨胀
+        //
+        // F3-fix (2026-09-19): 凸角过渡弧必须计入 G93 时间预算 (取代旧 C3-fix)。
+        //   旧行为 (C3-fix 2026-07-28): 弧标为非 strict (dt=0) 当自由定位移动。
+        //     本意是防"每个微段各拿整块 6s → N×6s 膨胀", 但副作用是弧完全不占
+        //     预算且以 ~2-15mm/s 慢速爬行 → 块 τ 膨胀约 1.9-2× (γ=1.10 实测
+        //     3707ms vs 期望 1920ms)。该膨胀不是"时间守恒"而是"时间失控"。
+        //   新语义: 弧走 strict 路径, 按自身弧长计预算 (cutter_emit_dt strict=1),
+        //     与 IV-D 不变量对齐 (L_act = Lp + arc_len, γ = L_act/Lp):
+        //       Ours(默认): 直线体占整段 T (offset 线长=Lp → v=v_cmd), 弧追加
+        //                   arc_len/v_cmd → 块 τ = γ·T, 全程 v=v_cmd (不变量守恒)。
+        //       Naive(ratio_off): 直线体+弧【共享】整段 T, 平均 v=γ·v_cmd
+        //                   → 块 τ = T (不变), v_act = γ·v_cmd (不变量破坏, E4 预测)。
+        //       M1(posthoc): 直线体按 nominal T 跑并累积速度赤字; 弧按弧长计预算。
+        //     非 G93 (T_seg<=0) 保持旧的 dt=0 自由定位语义 (G94 无预算概念)。
+        double Lp    = comp_axis_dist(segA->start_pos, segA->end_pos);
+        double T_seg = segA->g93_dt_sec;
+        double v_cmd = (T_seg > 1e-9 && Lp > COMP_ZERO_LEN_TOL)
+                       ? (Lp / T_seg) : 0.0;
+        int is_g93   = (T_seg > 1e-9 && v_cmd > 1e-9) ? 1 : 0;
+
+        double dt_line = T_seg;   // 直线体预算 (默认 Ours 语义)
+        double dt_arc  = 0.0;     // 过渡弧预算 (总数, 再按 num_seg 均分)
+        if(is_g93) {
+            if(g_g93_ratio_off && !g_g93_posthoc) {
+                // Naive: 直线体+弧共享整段 T, 各按实际长度占比分配
+                double L_act = Lp + arc_len;
+                dt_line = (L_act > COMP_ZERO_LEN_TOL) ? T_seg * (Lp / L_act) : T_seg;
+                dt_arc  = T_seg - dt_line;
+            } else if(g_g93_posthoc) {
+                // M1: 直线体按 nominal T 跑并累积速度赤字 (与 cutter_emit_line_scaled 同口径)
+                double l_act_line = g_comp.last_emit_valid
+                                    ? comp_axis_dist(g_comp.last_emit_pos, ptA) : Lp;
+                double v_eff = v_cmd + g_g93_posthoc_debt;
+                dt_line = (v_eff > 1e-9) ? (l_act_line / v_eff) : T_seg;
+                if(!(dt_line > 1e-9)) dt_line = T_seg;
+                double v_act_line = (dt_line > 1e-9) ? (l_act_line / dt_line) : 0.0;
+                g_g93_posthoc_debt += (v_cmd - v_act_line);
+                dt_arc = arc_len / v_cmd;   // 弧按自身弧长计预算 (不累积赤字)
+            } else {
+                // Ours (IV-D 默认): 直线体占整段 T, 弧按弧长追加
+                dt_arc = arc_len / v_cmd;
+            }
+        }
+
+        cutter_emit_dt(ptA, speed, acc, dec, is_g93, dt_line);
+
+        double seg_T_arc = (num_seg > 0) ? (dt_arc / (double)num_seg) : 0.0;
         for(int i = 1; i <= num_seg; i++) {
             double pt[AXIS_NUM];
             memcpy(pt, curr, sizeof(double) * AXIS_NUM);
@@ -460,7 +635,7 @@ static int process_corner_line_line(const CompSegment_t *segA,
                 pt[ax1] = curr[ax1] + R * cos(theta);
                 pt[ax2] = curr[ax2] + R * sin(theta);
             }
-            cutter_emit_dt(pt, speed, acc, dec, 0, 0.0);
+            cutter_emit_dt(pt, speed, acc, dec, is_g93, seg_T_arc);
         }
     }
 
@@ -551,7 +726,7 @@ static int process_corner_line_arc(const CompSegment_t *segA,
         memcpy(pt, curr, sizeof(double) * AXIS_NUM);
         pt[ax1] += R * nAx;
         pt[ax2] += R * nAy;
-        cutter_emit(pt, speed, acc, dec);
+        cutter_emit_line_scaled(segA, pt, speed, acc, dec);
         return 0;
     }
 
@@ -626,7 +801,7 @@ static int process_corner_line_arc(const CompSegment_t *segA,
         memcpy(pt, curr, sizeof(double) * AXIS_NUM);
         pt[ax1] = ix;
         pt[ax2] = iy;
-        cutter_emit(pt, speed, acc, dec);
+        cutter_emit_line_scaled(segA, pt, speed, acc, dec);
 
     } else {
         // ============================================================
@@ -657,7 +832,7 @@ static int process_corner_line_arc(const CompSegment_t *segA,
         memcpy(ptA, curr, sizeof(double) * AXIS_NUM);
         ptA[ax1] = footAx;
         ptA[ax2] = footAy;
-        cutter_emit(ptA, speed, acc, dec);
+        cutter_emit_line_scaled(segA, ptA, speed, acc, dec);
 
         // ② 生成过渡圆弧微段 (与 LINE-LINE 外角逻辑同源)
         double start_angle = atan2(footAy - curr[ax2], footAx - curr[ax1]);
@@ -757,6 +932,58 @@ static void discretize_offset_arc(const CompSegment_t *arc,
     //   seg_T(i) = T_portion×i/N − T_portion×(i−1)/N
     double T_portion = (arc->g93_dt_sec > 1e-9)
                        ? arc->g93_dt_sec * fabs(sweep_ratio) : 0.0;
+
+    // 论文1 V2 战役 (2026-09-18, F2 复核): Naive 基线 (g_g93_ratio_off=1) ——
+    // 与 LINE 体 (cutter_emit_line_scaled) 同口径: 不做任何先验长度重标定, 弧体
+    // 按标称整段 T 执行 (即使被内角剪裁) → v_act/v_cmd = |s_end/sweep| = γ_arc,
+    // 即 E4 在弧体上的解析预测。修复前弧体无此分支, 导致 ARC 路由上
+    // Naive ≡ Proposed, E4 对照实验在弧路由不可实现。
+    if(g_g93_ratio_off && !g_g93_posthoc && arc->g93_dt_sec > 1e-9) {
+        T_portion = arc->g93_dt_sec;
+    }
+
+    // 论文1 M1 替代设计 (2026-09-18): 事后修正 —— 弧体同样不做先验扫角占比
+    // 缩放; 按标称 T 执行, 段末按实测 (v_act = L_act/T_eff) 累积速度赤字,
+    // 并补偿到下一段。
+    //
+    // 口径修正 (2026-09-18): L_prog / L_act 一律以【编程轮廓】弧长 (半径
+    // R_prog = |arc->radius|) 计量, 不用偏置弧长 (半径 R_off)。原因:
+    //   (1) g_g93_posthoc_debt 是 LINE 体与 ARC 体**共用**的速度域累加器, LINE
+    //       体的 l_prog = comp_axis_dist(编程轮廓起止点) 是轮廓量纲; 弧体若用
+    //       偏置量纲, 同一条链上 LINE/ARC 混排时弧块的 v_cmd 会带上 R_off/R 的
+    //       系统性偏置 (R=50,r=5 内偏 0.900 / 外偏 1.100), 赤字被按 ∓10% 缩放。
+    //   (2) 比值 γ_arc = L_act/L_prog = |s_end/sweep| 在两种量纲下**相同**
+    //       (半径同时约掉), 故 IV-D 的 T' = T·L_act/L_prog 不受本次修正影响;
+    //       受影响的只有 M1 的绝对量纲, 且仅在 debt≠0 或弧被剪裁时才显现。
+    // 螺旋弧 (非平面轴随动) 的行程按 sweep_ratio 线性跟随, 一并按等效半径计入。
+    if(g_g93_posthoc && arc->g93_dt_sec > 1e-9) {
+        double R_prog = fabs(arc->radius);                  // 编程轮廓半径
+        double s_full = fabs(arc->sweep);
+        double s_act  = fabs(s_end);
+        double dnon = 0.0;                                  // 非平面轴行程 (全长)
+        for(int j = 0; j < AXIS_NUM; j++) {
+            if(j == ax1 || j == ax2) continue;
+            double d = arc->end_pos[j] - arc->start_pos[j];
+            if(g_axis[j].axis_type == 1 && g_axis[j].equivalent_radius > 0.0) {
+                d = d * (M_PI / 180.0) * g_axis[j].equivalent_radius;
+            }
+            dnon += d * d;
+        }
+        dnon = sqrt(dnon);
+        double l_prog_full = sqrt((s_full * R_prog) * (s_full * R_prog)
+                                  + dnon * dnon);   // 未裁剪的编程弧长
+        double l_act_arc   = sqrt((s_act * R_prog) * (s_act * R_prog)
+                                  + (dnon * fabs(sweep_ratio))
+                                    * (dnon * fabs(sweep_ratio)));
+        double v_cmd = (l_prog_full > COMP_ZERO_LEN_TOL)
+                       ? l_prog_full / arc->g93_dt_sec : 0.0;
+        if(v_cmd > 1e-9) {
+            double v_eff = v_cmd + g_g93_posthoc_debt;
+            T_portion = (v_eff > 1e-9) ? (l_prog_full / v_eff) : arc->g93_dt_sec;
+            double v_act = l_act_arc / T_portion;
+            g_g93_posthoc_debt += (v_cmd - v_act);
+        }
+    }
     int is_g93_arc = (T_portion > 1e-9) ? 1 : 0;
 
     for(int i = 1; i <= num_seg; i++) {
@@ -1429,7 +1656,7 @@ static void flush_last_segment(void)
     memcpy(end, curr, sizeof(double) * AXIS_NUM);
     end[ax1] += R * nx;
     end[ax2] += R * ny;
-    cutter_emit(end, speed, acc, dec);
+    cutter_emit_line_scaled(seg_curr, end, speed, acc, dec);
 
     // 回退点: 从偏置终点垂直返回到编程轨迹
     // 距离恰好为 R，确保后续无补偿指令从正确的编程位置开始。
@@ -1578,12 +1805,32 @@ int CutterComp_PushPoint(double pos[AXIS_NUM], double speed,
     CompSegment_t new_seg;
     memset(&new_seg, 0, sizeof(new_seg));
     new_seg.type = COMP_SEG_LINE;
-    memcpy(new_seg.start_pos, g_comp.window_seg[0].end_pos,
+    // 2026-09-16 修复: 新段起点必须是【上一段】终点 (window_seg[1]),
+    // 不能用 window_seg[0] (上上段)。滑动后 window[0]=segA, window[1]=上一段,
+    // 二者仅在没有 ARC 夹在中间时偶然相等; 一旦中间夹 ARC 段就断开
+    // (ARC 由 PushArc 单独入窗口, 其 end_pos 不回写到 window[0])。
+    // 症状: G93 语义统一后 l_prog 被算成 L*sqrt(2)
+    //   (实测 cutter_line 段2: 70.71 而非 50; cutter_arc 段4: 42.43 而非 30)
+    //   -> T' = T x L_act/L_prog 直接带偏。
+    // 安全性: LINE 段的 start_pos 仅被 cutter_emit_line_scaled 用于算 l_prog;
+    // 拐角几何一律取 segA->end_pos (见 process_corner_* 的 curr 赋值), 不受影响。
+    // segB->start_pos 的另一处消费 (算 radius 向量) 只在 segB 是 ARC 时发生,
+    // 而 ARC 段走 CutterComp_PushArc, 不经过本函数。
+    memcpy(new_seg.start_pos,
+           (g_comp.window_count >= 2) ? g_comp.window_seg[1].end_pos
+                                      : g_comp.window_seg[0].end_pos,
            sizeof(double) * AXIS_NUM);
     memcpy(new_seg.end_pos, pos, sizeof(double) * AXIS_NUM);
     new_seg.speed = speed;
     new_seg.acc = acc;
     new_seg.dec = dec;
+    // 2026-09-16: 段自身必须携带 G93 时间预算。
+    // 缺这行时 cutter_emit_line_scaled 读到的 seg->g93_dt_sec 恒为 0 (memset),
+    // 直接走 cutter_emit 回退分支 —— LINE/ARC 语义统一实测完全不生效
+    // (cutter_line 仍 6000ms / v=0.007500, 与改动前逐位相同)。
+    // 不能用 g_comp.g93_dt_sec_pending 顶替: LINE 体是【延迟一段】输出的,
+    // pending 此时已被下一段覆盖 (相邻块 F 不同会吃错预算)。
+    new_seg.g93_dt_sec = g93_dt_sec;
 
     // 第一次推入 (window_count==1): 仅填窗口, 不触发拐角处理
     // (因为没有 segA 可配对)

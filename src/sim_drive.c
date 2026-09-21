@@ -183,7 +183,13 @@ int32_t sim_drive_get_follow_err(int axis_idx, int slave_subidx)
     if (axis_idx < 0 || axis_idx >= AXIS_NUM) return 0;
     if (slave_subidx < 0 || slave_subidx >= MAX_SLAVES_PER_AXIS) return 0;
     SimMotor_t *m = &g_sim_axis[axis_idx].motor[slave_subidx];
-    return m->target - m->pos;
+    /* 2026-09-16: 上报值缩放 0.1 — 建模驱动内部 kHz 闭环的等效滞后,
+     * 而非 1ms 指令流滞后 (真驱动 0x60F4 语义)。消除 sim 高速段 (G93 严格等
+     * 豁免短板限幅的 1ms 速度阶跃) 的跟随误差假阳性 —— G93 论文实验 60% wall
+     * 拉伸 (段消费被冻结) 的根因。
+     * 报警监控链完好: sim_drive_inject_fault 走 SW_ERROR(case-3, 在跟随误差
+     * 监控之前置 FAULT), 不经此函数, 0828 类事故回归测试不受影响。 */
+    return (int32_t)((m->target - m->pos) / 10);
 }
 
 int sim_drive_inject_fault(int axis_idx, int slave_subidx)

@@ -68,6 +68,18 @@ typedef struct {
     int32_t dwell_ms;  /* 本级停留 ms (>=1) */
 } LaserPierceStep_t;   /* pack(1) 下 20B */
 
+/* ---- P0-2 (2026-09-09): 激光互锁链规则表 (软 PLC 地基, 数据驱动互锁) ----
+ * 对标整机厂梯形图互锁链: il_count==0 回退内核默认 6 路链;
+ * 1..LASER_IL_MAX 条规则由 safety_gate 每 cycle 评估。
+ * mask 约束: 不占用 bit15 (0x8000 保留 system_alarm 联动)。 */
+#define LASER_IL_MAX  8        /* 规则条数上限 (RT 1ms 循环评估预算内) */
+
+typedef struct {
+    uint8_t  bit;      /* DI 位偏移 (0-15), 该位=1 视为异常 */
+    uint8_t  reserved; /* 对齐填充, 必须填 0 */
+    uint16_t mask;     /* 异常时 interlock_status 置位码 (bit0-14) */
+} LaserIlRule_t;       /* pack(1) 下 4B */
+
 /* ============================================================
  * 2. 命令类型枚举
  *    按功能段划分并预留空号, 便于未来追加新 API 而不打乱编号。
@@ -172,6 +184,49 @@ typedef enum {
     SMC_CMD_RESUME_SEARCH            = 0x0070, /* 校验目标行 G00 边界 + SEARCH 重放建立模态 (阻塞至完成) */
     SMC_CMD_RESUME_START             = 0x0071, /* 从冻结边界起跑 (重定位前导 + 激光模态恢复 + 续切) */
     SMC_CMD_GET_RESUME               = 0x0072, /* 查询 resume 状态 (ready/target_line/target_pos) */
+
+    /* --- 软 PLC 地基 P0 (2026-09-09): 0x0073 ~ 0x0074 --- */
+    SMC_CMD_INJECT_LASER_DI          = 0x0073, /* sim-only: 注入 16-bit DI 图案 (互锁链 sim 可测) */
+    SMC_CMD_CONFIG_LASER_INTERLOCK   = 0x0074, /* 互锁链规则表 (0 条 = 回退默认 6 路链) */
+
+    /* --- P0-4a 参数化骨架 (2026-09-10): 0x0075 --- */
+    SMC_CMD_CONFIG_LASER_PDO_LAYOUT  = 0x0075, /* I/O 端子 PDO 布局 (byte 偏移/宽度, 选型适配) */
+
+    /* --- P1 软 PLC (2026-09-11): 0x0076 ~ 0x007A --- */
+    SMC_CMD_PLC_DOWNLOAD             = 0x0076, /* 程序下载+编译 (返回诊断行号; 不启动) */
+    SMC_CMD_PLC_UPLOAD               = 0x0077, /* 程序文本上传 (P1-4 实装) */
+    SMC_CMD_PLC_CTRL                 = 0x0078, /* 启动/停止/复位 (P1-2 实装) */
+    SMC_CMD_PLC_GET_STATE            = 0x0079, /* 状态查询 (state/变量数/语句数/文本长) */
+    SMC_CMD_PLC_READ_VARS            = 0x007A, /* 变量表快照 (P1-2 实装) */
+
+    /* --- P1-3 (2026-09-12): 0x007B sim-only 测试钩子 --- */
+    SMC_CMD_PLC_TEST_HOOK            = 0x007B, /* 冻结/恢复 heartbeat 发布 (看门狗验证) */
+
+    /* --- P1.5-1 (2026-09-14): AI 模拟输入通道 --- */
+    SMC_CMD_CONFIG_PERIPH_AI          = 0x007C, /* AI 从站 PDO 布局 + 每通道满量程 */
+    SMC_CMD_INJECT_PERIPH_AI          = 0x007D, /* sim-only: 注入传感器工程量 (G_AIx) */
+
+    /* --- P1.5-2 (2026-09-15): Force 强制 --- */
+    SMC_CMD_PLC_FORCE_VAR             = 0x007E, /* PLC 用户变量强制 (输出强制语义) */
+
+    /* --- P1.5-3 (2026-09-15): Trace 变量示波器 --- */
+    SMC_CMD_PLC_TRACE_CONFIG          = 0x007F, /* 通道/分频/触发配置 */
+    SMC_CMD_PLC_TRACE_CTRL            = 0x0080, /* arm / stop 定格 / abort / 查询 */
+    SMC_CMD_PLC_TRACE_READ            = 0x0081, /* DONE 后分页导出样本 */
+
+    /* --- G93 jerk-bounded 转移剖面 (论文1 IV-E, 2026-09-16): 0x0082 --- */
+    SMC_CMD_CONFIG_G93_JERK           = 0x0082, /* 配置转移模式 (enable/ε_v%/ε_t%; enable=0 退化 IV-C) */
+
+    /* --- 论文1 B0′ 消融 + N22 实时性 (2026-09-17): 0x0083 / 0x0084 --- */
+    SMC_CMD_CONFIG_G93_ABLATION       = 0x0083, /* B0′ F-inheritance 消融 (f_inherit; 1=τ=n·T, 仅实验) */
+    SMC_CMD_QUERY_ENQUEUE_STATS       = 0x0084, /* enqueue 临界区耗时统计 (count/mean/max μs, 可读后清零) */
+
+    /* --- 论文1 M1 替代设计: 事后修正 (2026-09-18): 0x0085 --- */
+    SMC_CMD_CONFIG_G93_POSTHOC        = 0x0085, /* M1 post-hoc 速度赤字 carry-over (1=启用, 0=本文构造) */
+    SMC_CMD_CONFIG_G93_RATIO          = 0x0086, /* V2 战役: IV-D 长度比重标定 关闭 (1=Naive T'=T, 仅实验) */
+    SMC_CMD_CONFIG_G93_STRICT_OFF     = 0x0087, /* S3 planner-rate-limiting: 1=关闭强一致豁免(B2 下游限速), 0=Ours(默认) */
+    SMC_CMD_CONFIG_G93_TIP_BASIS      = 0x0088, /* S10-H1 RTCP 长度基消融: 1=刀尖欧氏长度 L^P (忽略旋转轴折算, 门看不到机械轴真实需求), 0=机械轴等效长度 L^M (Ours 默认) */
+    SMC_CMD_QUERY_BLOCK_TIMING        = 0x0089, /* 论文1 S10: 控制器内 block 级计时查询 (op: 0=读, 1=清零后读) */
 } SmcCmdType;
 
 /* ============================================================
@@ -515,6 +570,126 @@ typedef struct {
     double  target_pos[AXIS_NUM]; /* SEARCH 冻结位姿 */
 } SmcGetResumeRes;
 
+/* ----- G93 jerk-bounded 转移剖面 (论文1 IV-E, 2026-09-16): 0x0082 ----- */
+/* SMC_CONFIG_G93_JERK: pack(1) 下 1+3pad + 2×double = 20B */
+typedef struct {
+    uint8_t  enable;       /* 1=转移模式生效 (加速边界 exact / 减速边界 debt), 0=完全退化 IV-C */
+    uint8_t  _pad[3];
+    double   eps_v_pct;    /* exact 模式瞬时超速上限 (% v_cmd, 默认 5.0) */
+    double   eps_t_pct;    /* debt 模式时长修正上限 (% T, 默认 2.0) */
+} SmcConfigG93JerkReq;
+typedef struct { int32_t ret_code; } SmcConfigG93JerkRes;
+
+/* ----- 论文1 B0′ 消融 + N22 实时性 (2026-09-17): 0x0083 / 0x0084 ----- */
+/* SMC_CONFIG_G93_ABLATION: pack(1) 下 1+3pad = 4B */
+typedef struct {
+    uint8_t  f_inherit;    /* 1=B0′ F-inheritance (每微段继承整块进给字, τ=n·T), 0=IV-B 正常分配 */
+    uint8_t  _pad[3];
+} SmcConfigG93AblationReq;
+typedef struct { int32_t ret_code; } SmcConfigG93AblationRes;
+
+/* SMC_CONFIG_G93_POSTHOC (0x0085, 论文1 M1): 复用同构 4B 请求体 */
+typedef struct {
+    uint8_t  enable;       /* 1=M1 事后修正 (段末测 v_act, 速度赤字 carry-over 到下一段), 0=本文 IV-D 构造 */
+    uint8_t  _pad[3];
+} SmcConfigG93PosthocReq;
+typedef struct { int32_t ret_code; } SmcConfigG93PosthocRes;
+
+/* SMC_CONFIG_G93_RATIO (0x0086, 论文1 V2 仿真战役): 复用同构 4B 请求体 */
+typedef struct {
+    uint8_t  ratio_off;    /* 1=Naive 基线 (T'=T, 关闭 IV-D 长度比重标定), 0=IV-D 生效 (生产默认) */
+    uint8_t  _pad[3];
+} SmcConfigG93RatioReq;
+typedef struct { int32_t ret_code; } SmcConfigG93RatioRes;
+
+/* SMC_CONFIG_G93_STRICT_OFF (0x0087, 论文1 S3 planner-rate-limiting): 复用同构 4B 请求体 */
+typedef struct {
+    uint8_t  strict_off;   /* 1=B2 基线 (关闭 G93 强一致豁免, 下游 planner 正常短板限幅), 0=Ours (默认) */
+    uint8_t  _pad[3];
+} SmcConfigG93StrictOffReq;
+typedef struct { int32_t ret_code; } SmcConfigG93StrictOffRes;
+
+/* SMC_CONFIG_G93_TIP_BASIS (0x0088, 论文1 S10-H1 长度基消融): 复用同构 4B 请求体 */
+typedef struct {
+    uint8_t  tip_basis;    /* 1=-H1 基线 (需求速率按刀尖欧氏长度 L^P 反推, 旋转轴折算不计), 0=IV-A 物理基 L^M (生产默认) */
+    uint8_t  _pad[3];
+} SmcConfigG93TipBasisReq;
+typedef struct { int32_t ret_code; } SmcConfigG93TipBasisRes;
+
+/* ============================================================
+ * SMC_QUERY_BLOCK_TIMING (0x0089, 论文1 S10, 2026-09-20)
+ *
+ * 动机: 此前的时长口径全部来自 CSV trace 行数 (cy[i_end]-cy[i0])。但 sim_engine
+ *       落盘受 should_log_this_cycle 闸门影响, 窗口两端都会丢行 ⇒ 恒少 1。
+ *       本 RPC 直接读控制器内由 RT 周期计数器 `cycle` 打的 block 起止刻度。
+ *
+ * 约定: block_end_cycle_exclusive = 末微段完成周期 + 1
+ *       block_elapsed_cycles      = end_exclusive - start   (单周期 block 得 1)
+ *
+ * 三种时间严格分开 (H5 要求):
+ *   virtual_elapsed_ms        = T_virtual (语义时间, 被倍率/feedhold 缩放)
+ *   controller_elapsed_cycles = T_ctrl 的周期数 (真实流逝, 含 feedhold)
+ *   host_runtime_ms           = T_host  —— 不在本结构, 由宿主墙钟测
+ *
+ * Req pack(1) 下 1+3pad = 4B; Res pack(1) 下 = 184B
+ * Python: struct.unpack("<IiIQQQIIIdddQQQddQdQdQdQQQ", resp[:184])
+ * ============================================================ */
+typedef struct {
+    uint8_t  op;           /* 0=只读, 1=读前清零 (下一 run 从零累计) */
+    uint8_t  _pad[3];
+} SmcBlockTimingReq;
+
+typedef struct {
+    int32_t  ret_code;                  /* 恒 0 */
+
+    /* ---- block 级 (当前 / 最后一个) ---- */
+    uint32_t block_uid;
+    int32_t  block_line_no;
+    uint64_t block_start_cycle;
+    uint64_t block_end_cycle_exclusive;
+    uint64_t block_elapsed_cycles;
+    uint32_t block_stall_cycles;        /* block 在飞但虚拟时间未推进的周期数 (期望 0) */
+    uint32_t segments_generated;        /* parser 声明生成 */
+    uint32_t segments_completed;        /* RT 实际跑完 */
+    double   block_budget_cmd_ms;       /* 指令 block 时长 (ms) */
+    double   block_budget_sum_ms;       /* 实际下发微段预算之和 (ms) */
+    double   block_virtual_ms;          /* 本 block 推进的虚拟时间 (ms), 见 inc/block_timing.h */
+
+    /* ---- 程序级 ---- */
+    uint64_t ctrl_start_cycle;
+    uint64_t ctrl_end_cycle_exclusive;
+    uint64_t controller_elapsed_cycles;
+    double   controller_elapsed_ms;
+    double   virtual_elapsed_ms;
+    uint64_t hold_active_cycles;
+    double   hold_active_ms;                /* = hold_active_cycles * Ts */
+    uint64_t hold_frozen_cycles;            /* 虚拟时间完全不推进的周期 (advance==0) */
+    double   override_eff_sum;              /* Σ eff_scale (仅 is_moving 周期) */
+    uint64_t override_eff_cycles;           /* 上面求和的周期数 */
+    double   virtual_model_ms;              /* Σ(hold ? 0 : Ts*eff_scale) 声明式模型 */
+    uint64_t segments_completed_total;
+    uint64_t blocks_closed;
+    uint64_t rt_cycle_counter;          /* 读数时刻的 RT 全局 cycle */
+} SmcBlockTimingRes;
+
+
+/* SMC_QUERY_ENQUEUE_STATS: Req pack(1) 下 1+3pad = 4B;
+ * Res pack(1) 下 4+4pad+2×u64+4×double = 56B */
+typedef struct {
+    uint8_t  reset;        /* 1=读后清零 (下一 run 从零累计) */
+    uint8_t  _pad[3];
+} SmcEnqueueStatsReq;
+typedef struct {
+    int32_t  ret_code;      /* 恒 0 */
+    uint32_t _pad;
+    uint64_t count_all;     /* 全部入队次数 (G93+G94) */
+    uint64_t count_strict;  /* G93 严格入队次数 (含 IV-C/IV-E 剖面预计算) */
+    double   mean_us_all;   /* 全部入队平均耗时 (μs/次) */
+    double   mean_us_strict;/* 严格入队平均耗时 (μs/次) — 论文 V-C 头条 */
+    double   max_us_strict; /* 严格入队最大耗时 (μs/次) */
+    double   reserved;      /* 预留对齐 (0) */
+} SmcEnqueueStatsRes;
+
 /* SMC_GET_PROGRAM_STRUCTURE: 无 Req, payload 直接是 SMC_ProgramStructure_t */
 typedef struct {
     int32_t  ret_code;            /* 0=ok, -1=未加载 */
@@ -648,6 +823,205 @@ typedef struct {
     LaserPierceStep_t steps[LASER_PIERCE_TABLE_MAX];
 } SmcConfigLaserPierceTableReq;
 typedef struct { int32_t ret_code; } SmcConfigLaserPierceTableRes;
+
+/* SMC_INJECT_LASER_DI (0x0073, P0-3a 2026-09-09): sim-only DI 注入
+ * 使能后 laser_hw_read_di 返回 pattern, safety_gate 互锁链在 WSL2 sim 可测。
+ * pack(1) 下 4B */
+typedef struct {
+    uint16_t pattern;   /* 注入 DI 图案 (bit=1 该位异常), 如 0x0008=水温 */
+    uint16_t enable;    /* 1=使能注入, 0=清除 (回恒 0 无异常) */
+} SmcInjectLaserDiReq;
+typedef struct {
+    int32_t ret_code;   /* 0=ok, -2=非 sim 模式 */
+} SmcInjectLaserDiRes;
+
+/* SMC_CONFIG_LASER_INTERLOCK (0x0074, P0-2 2026-09-09): 互锁链规则表
+ * count: 0..LASER_IL_MAX (0 = 回退默认 6 路链, 等价不配置)
+ * 校验: bit<=15, mask!=0 且不含 0x8000, reserved==0
+ * pack(1) 下 4 + 8×4 = 36B */
+typedef struct {
+    int32_t       count;
+    LaserIlRule_t rules[LASER_IL_MAX];
+} SmcConfigLaserInterlockReq;
+typedef struct { int32_t ret_code; } SmcConfigLaserInterlockRes;
+
+/* SMC_CONFIG_LASER_PDO_LAYOUT (0x0075, P0-4a 2026-09-10): I/O 端子 PDO 布局
+ * 选型适配参数 — 换端子型号 = 改这 6 个数 + slave_id, 内核代码不动。
+ * 校验: *_bytes ∈ {1,2}, ao_stride ∈ {2,4}, *_byte_off <= 63
+ * 默认 (EL 级 16-bit 端子): 全 0 偏移 + di/do 2 字节 + stride 2 */
+typedef struct {
+    uint8_t di_byte_off;    /* DI PDO 起始字节 */
+    uint8_t di_bytes;       /* DI 宽度 1/2 (8 点端子配 1, 防 IOmap 越界读邻站) */
+    uint8_t do_byte_off;    /* DO PDO 起始字节 */
+    uint8_t do_bytes;       /* DO 宽度 1/2 */
+    uint8_t ao_byte_off;    /* AO 通道 0 起始字节 */
+    uint8_t ao_stride;      /* AO 每通道字节 2/4 */
+    uint8_t reserved[2];    /* 必须 0 */
+} SmcConfigLaserPdoLayoutReq;   /* pack(1) 下 8B */
+typedef struct { int32_t ret_code; } SmcConfigLaserPdoLayoutRes;
+
+/* ============================================================
+ * P1 软 PLC (2026-09-11): 0x0076 ~ 0x007A
+ * ============================================================ */
+#define SMC_PLC_TEXT_MAX      4080   /* 程序文本上限 (8B 头 + 4080 ≤ 4096 payload 限额;
+                                      * 与 plc_core.h PLC_PROG_TEXT_MAX 同步改) */
+#define SMC_PLC_DIAG_MSG_LEN  64
+#define SMC_PLC_DIAG_IN_RESP  5      /* 响应内诊断条数上限 (352B < 512 响应缓冲) */
+
+/* SMC_PLC_DOWNLOAD (0x0076): Req = 8B 头 + 变长文本 (data_len = 8 + text_len)
+ * 文本不要求 NUL 终结; CRC-32 (IEEE, 与 Python zlib.crc32 一致)。 */
+typedef struct {
+    int32_t  text_len;      /* 1..SMC_PLC_TEXT_MAX */
+    uint32_t crc32;
+} SmcPlcDownloadReqHead;    /* 之后紧跟 char text[text_len] */
+
+/* 编译诊断 (布局与 plc_lang.h PlcDiag_t 一致, 二进制兼容直接 memcpy) */
+typedef struct {
+    int32_t line;
+    char    msg[SMC_PLC_DIAG_MSG_LEN];
+} SmcPlcDiag_t;             /* pack(1) 下 68B */
+
+typedef struct {
+    int32_t ret_code;       /* 0=编译通过(未启动) -1=编译错误(见 diags)
+                             * -2=超长/参数非法 -3=CRC 不符 -4=运行中拒绝 */
+    int32_t n_diag_total;   /* 诊断总数 (可能 > included) */
+    int32_t n_diag_included;
+    SmcPlcDiag_t diags[SMC_PLC_DIAG_IN_RESP];
+} SmcPlcDownloadRes;        /* pack(1) 下 12 + 5×68 = 352B */
+
+/* SMC_PLC_CTRL (0x0078, P1-2): action 0=stop 1=start 2=reset */
+typedef struct { int32_t action; } SmcPlcCtrlReq;
+typedef struct { int32_t ret_code; } SmcPlcCtrlRes;   /* 0=ok, -1=状态不允许 */
+
+/* SMC_PLC_GET_STATE (0x0079, P1-2 扩展): 前 16B 与 P1-1 兼容 (追加字段) */
+typedef struct {
+    int32_t  state;         /* PlcRunState: 0=EMPTY 1=STOPPED 2=RUNNING 3=ERROR */
+    int32_t  n_vars;        /* 用户变量数 */
+    int32_t  n_stmts;       /* 顶层语句数 */
+    int32_t  text_len;
+    uint32_t heartbeat;     /* 已完成扫描周期数 */
+    uint32_t cycle_us;      /* 最近周期执行耗时 (µs) */
+    int32_t  err_line;      /* 运行期错误行 (0=无) */
+    char     err_msg[64];
+} SmcPlcGetStateRes;        /* pack(1) 下 92B */
+
+/* SMC_PLC_READ_VARS (0x007A, P1-2): 变量快照分页 (用户变量 + 3 个 F 系统变量) */
+#define SMC_PLC_VARS_PER_PAGE  10
+typedef struct { int32_t offset; } SmcPlcReadVarsReq;  /* 起始条目 (0 起) */
+typedef struct {
+    char     name[32];
+    uint8_t  type;          /* PlcType */
+    uint8_t  cls;           /* 0=user 2=sys_F */
+    uint8_t  fb;            /* PlcFbKind */
+    uint8_t  forced;        /* P1.5-2: 1 = 该变量当前被强制 (原 reserved 位升级) */
+    double   value;         /* BOOL 0/1, 数值统一 double */
+} SmcPlcVarSnap_t;          /* pack(1) 下 44B */
+typedef struct {
+    int32_t ret_code;
+    int32_t n_total;
+    int32_t n_included;
+    int32_t next_offset;    /* -1=末页 */
+    SmcPlcVarSnap_t vars[SMC_PLC_VARS_PER_PAGE];
+} SmcPlcReadVarsRes;        /* pack(1) 下 16 + 440 = 456B */
+
+/* SMC_PLC_TEST_HOOK (0x007B, P1-3 2026-09-12): sim-only 看门狗验证钩子
+ * freeze_hb=1: 扫描线程继续跑但停止递增/发布 heartbeat (模拟调度饥饿) */
+typedef struct { int32_t freeze_hb; } SmcPlcTestHookReq;
+typedef struct { int32_t ret_code; } SmcPlcTestHookRes;   /* 0=ok, -2=非 sim */
+
+/* SMC_PLC_FORCE_VAR (0x007E, P1.5-2 2026-09-15): PLC 用户变量强制
+ * 输出强制语义: 程序写被周期末覆写, watch/F 区呈现强制值。
+ * name 空 + on=0 = 清除全部强制; 仅 RUNNING 有效 (-3), 重启自动清零。
+ * pack(1) 下 48B */
+typedef struct {
+    char     name[32];      /* 变量名 (大小写不敏感) */
+    double   val;           /* 强制值 (按声明类型转换/钳制) */
+    int32_t  on;            /* 1=强制 0=解除 */
+    int32_t  reserved;      /* 必须 0 */
+} SmcPlcForceVarReq;
+typedef struct { int32_t ret_code; } SmcPlcForceVarRes;
+/* ret: 0=ok, -1=变量不存在, -3=非 RUNNING */
+
+/* ============================================================
+ * P1.5-3 (2026-09-15): Trace 变量示波器 0x007F ~ 0x0081
+ * 采样: PLC 扫描线程每 div 周期一点 (10ms×div), 1000 点环形,
+ * pre 500 / post 500; 通道可为任意 PLC 变量 (含 G_/F_ 系统变量)。
+ * ============================================================ */
+#define SMC_PLC_TRACE_CH_MAX  8     /* 与 plc_trace.h PLC_TRACE_CH_MAX 同步 */
+
+/* SMC_PLC_TRACE_CONFIG (0x007F): 通道/分频/触发配置 (须在 arm 前)
+ * pack(1) 下 16+8+256 = 280B */
+typedef struct {
+    int32_t  n_ch;              /* 1-8 */
+    int32_t  div;               /* 采样分频 1-100 (1=10ms/点) */
+    int32_t  trig_kind;         /* 0=手动 1=>= 2=<= 3=上穿 4=下穿 */
+    int32_t  trig_ch;           /* 触发通道 0-7 */
+    double   trig_threshold;
+    char     names[SMC_PLC_TRACE_CH_MAX][32];  /* 前 n_ch 有效, 变量名 */
+} SmcPlcTraceConfigReq;
+typedef struct { int32_t ret_code; } SmcPlcTraceConfigRes;
+/* ret: 0=ok, -1=参数越界(含空名), -2=录制中拒改 */
+
+/* SMC_PLC_TRACE_CTRL (0x0080): 1=arm 0=stop 定格 2=abort 清数据 3=仅查询 */
+typedef struct { int32_t action; } SmcPlcTraceCtrlReq;
+typedef struct {
+    int32_t ret_code;       /* arm: 0/-1 通道名不可解析/-3 非RUNNING;
+                             * stop: 0/-1 非录制态; abort/查询: 0 */
+    int32_t state;          /* 0=IDLE 1=ARMED 2=TRIGGED 3=DONE */
+    int32_t n_samples;      /* 可导出样本数 = min(累计, 1000) */
+} SmcPlcTraceCtrlRes;       /* 12B */
+
+/* SMC_PLC_TRACE_READ (0x0081): DONE 态分页导出 (时间升序) */
+#define SMC_PLC_TRACE_PER_PAGE  6
+typedef struct {
+    uint32_t seq;           /* arm 起递增 */
+    uint32_t t_ms;          /* heartbeat×10 */
+    double   v[SMC_PLC_TRACE_CH_MAX];
+} SmcPlcTraceSample_t;      /* pack(1) 下 72B */
+typedef struct { int32_t offset; } SmcPlcTraceReadReq;
+typedef struct {
+    int32_t ret_code;       /* 0=ok, -2=offset 越界, -3=须 DONE 态 */
+    int32_t n_total;
+    int32_t n_included;
+    int32_t next_offset;    /* -1=末页 */
+    SmcPlcTraceSample_t samples[SMC_PLC_TRACE_PER_PAGE];
+} SmcPlcTraceReadRes;       /* pack(1) 下 16 + 432 = 448B */
+
+/* SMC_CONFIG_PERIPH_AI (0x007C, P1.5-1 2026-09-14): AI 通道配置
+ * 数据链: RT periph_ai_rt_poll 读 PDO raw → 0..fs[ch] 工程量 → G 区 ai[4]
+ *         → PLC 系统变量 G_AI0..G_AI3 (REAL)。fs<=0 = 该通道未配 (恒 0)。
+ * pack(1) 下 8 + 32 = 40B */
+#define PERIPH_AI_PROTO_MAX  4    /* 与 periph_ai.h PERIPH_AI_CH_MAX 同步 */
+typedef struct {
+    int32_t  slave_id;            /* AI 从站 (-1 = 未配置) */
+    uint8_t  byte_off;            /* 通道 0 起始字节 (0-63) */
+    uint8_t  stride;              /* 每通道字节 2/4 */
+    uint8_t  count;               /* 通道数 0-4 */
+    uint8_t  reserved;            /* 必须 0 */
+    double   fs[PERIPH_AI_PROTO_MAX];   /* 每通道满量程工程值 */
+} SmcConfigPeriphAiReq;
+typedef struct { int32_t ret_code; } SmcConfigPeriphAiRes;   /* 0=ok, -1=越界 */
+
+/* SMC_INJECT_PERIPH_AI (0x007D, P1.5-1): sim-only 传感器值注入
+ * pack(1) 下 8 + 8 = 16B */
+typedef struct {
+    uint8_t  ch;                  /* 0-3 */
+    uint8_t  reserved[7];         /* 0 */
+    double   val;                 /* 工程量 (G_AIx 呈现值) */
+} SmcInjectPeriphAiReq;
+typedef struct { int32_t ret_code; } SmcInjectPeriphAiRes;   /* 0=ok, -1=ch 越界, -2=非 sim */
+
+/* SMC_PLC_UPLOAD (0x0077, P1-4 2026-09-12): 程序文本分页上传
+ * (文本 ≤4080B > 512B 响应缓冲, 按 0x007A 同模式分页) */
+#define SMC_PLC_UPLOAD_CHUNK  480
+typedef struct { int32_t offset; } SmcPlcUploadReq;
+typedef struct {
+    int32_t ret_code;       /* 0=ok, -1=槽内无文本, -2=offset 越界 */
+    int32_t total_len;
+    int32_t n_included;     /* 本次 chunk 字节数 */
+    int32_t next_offset;    /* -1=末页 */
+    char    chunk[SMC_PLC_UPLOAD_CHUNK];
+} SmcPlcUploadRes;          /* 16 + n_included (≤496B) */
 
 /* ============================================================
  * P0-3: Safe Z Lift

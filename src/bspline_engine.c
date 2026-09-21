@@ -466,6 +466,45 @@ static void bspline_process_batch_from(int start, int count)
     double g93_avg_speed = (total_g93_time > 1e-9)
                             ? total_arc / total_g93_time : 0.0;
 
+    // ==================================================================
+    // F7 (2026-09-19): P5 引入腿 (entry leg) 独立时间预算
+    // ------------------------------------------------------------------
+    // 缺陷背景: 本子批的控制点集合 = G01 目标点 P_1..P_n, 而机器当前位置
+    //   (plan_cursor) 是**第 1 个 G01 块的起点** (上一 G00 目标 / 上一子批
+    //   的锐角透传点)。腿 (cursor → P_1) 是真实编程几何且自带时间预算
+    //   batch_g93[start], 但它**不在控制点集合内** ⇒ 旧实现把它吞进首条
+    //   重采样弦, 而该弦的 G93 预算只覆盖 step (0.2mm) 弧长:
+    //     实测 spline_g93.nc Batch1: 首段 11.4ms 预算内实走 5.50mm
+    //     ⇒ 481 mm/s (X 硬上限 50 mm/s 的 9.6 倍), 全程无加减速斜坡。
+    //   axis_ctrl.c 第三步.5 可行性门只看"申报速度" speed_sec_mm 而非
+    //   dist/dt —— 申报值恰是合法的整批匀速, 故对该类"预算与行程不匹配"
+    //   完全失明 (与 F6 同族: 几何行程挂在一条与之无关的 G93 预算上)。
+    // 修法: 引入腿显式拆成独立 G93 段, 消费它自己那个块的时间预算
+    //   batch_g93[start]; 样条体只消费 Σ_{i>start} batch_g93[i]。
+    //   ⇒ 全程恒速、无越限, 且块级时间严格守恒 (Σ 全块 T 不变)。
+    // ==================================================================
+    double entry_T  = batch_g93[start];
+    double spline_T = 0.0;
+    for (int i = 1; i < count; i++) spline_T += batch_g93[start + i];
+
+    // 引入腿长度 (plan_cursor 与 batch_ctrl 同为机械坐标, 可直接相减)
+    double d_entry = 0.0;
+    {
+        double dsq = 0.0;
+        for (int j = 0; j < AXIS_NUM; j++) {
+            double d = batch_ctrl[start][j] - api_get_cursor(j);
+            dsq += d * d;
+        }
+        d_entry = sqrt(dsq);
+    }
+    int is_g93    = (spline_T > 1e-9 || entry_T > 1e-9) ? 1 : 0;
+    int has_entry = (is_g93 && d_entry > 1e-6 && entry_T > 1e-9) ? 1 : 0;
+    if (is_g93 && !has_entry) {
+        // 起点已就位 / 引入腿无预算: 该块预算归还样条体, 总时长守恒不变
+        spline_T += entry_T;
+        entry_T = 0.0;
+    }
+
     // ---- 等分数计算 + 严格段弧长 ----
     double step = g_bspline_config.step_size_mm;
     if (step < 1e-6) step = 1e-6;  // 防除零
@@ -478,7 +517,78 @@ static void bspline_process_batch_from(int start, int count)
     int num_seg = full_steps + 1;  // 末段总是存在 (吸收余数或等于 step)
     double last_seg_arc = total_arc - (double)full_steps * step;
 
+    // ---- 三个长度口径 (论文1 S6: γ_fit / γ_disc / γ_total) ----
+    // L_poly  : 控制点折线长 (编程几何; 引入腿不属于拟合域, 不计入)
+    // L_spline: 拟合样条弧长 = total_arc
+    // L_chord : 重离散化弦长之和 (实际执行几何)
+    double L_poly = 0.0;
+    for (int i = 0; i < count - 1; i++) {
+        double dsq = 0.0;
+        for (int j = 0; j < AXIS_NUM; j++) {
+            double d = batch_ctrl[start + i + 1][j] - batch_ctrl[start + i][j];
+            dsq += d * d;
+        }
+        L_poly += sqrt(dsq);
+    }
+
+    // 第一遍: 只累加弦长 (prev 局部滚动, 无需额外缓冲, 无堆分配)
+    double L_chord = 0.0;
+    {
+        double prev[AXIS_NUM], cur[AXIS_NUM];
+        memcpy(prev, batch_ctrl[start], sizeof(double) * AXIS_NUM);
+        for (int i = 1; i <= num_seg; i++) {
+            double target_arc = (i < num_seg) ? (double)i * step : total_arc;
+            double t = arc_length_to_t(target_arc, arc_lut, arc_lut_count);
+            de_boor_evaluate(n, BSPLINE_DEGREE, batch_knots,
+                             &batch_ctrl[start], t, cur);
+            int bad = 0;
+            for (int j = 0; j < AXIS_NUM; j++) {
+                if (isnan(cur[j]) || isinf(cur[j])) { bad = 1; break; }
+            }
+            if (bad) continue;
+            if (i == num_seg)
+                memcpy(cur, batch_ctrl[start + count - 1],
+                       sizeof(double) * AXIS_NUM);
+            double dsq = 0.0;
+            for (int j = 0; j < AXIS_NUM; j++) {
+                double d = cur[j] - prev[j]; dsq += d * d;
+            }
+            L_chord += sqrt(dsq);
+            memcpy(prev, cur, sizeof(double) * AXIS_NUM);
+        }
+    }
+    if (L_chord < 1e-9) L_chord = total_arc;   // 退化兜底
+
+    double gamma_fit   = (L_poly    > 1e-9) ? total_arc / L_poly    : 1.0;
+    double gamma_disc  = (total_arc > 1e-9) ? L_chord  / total_arc : 1.0;
+    double gamma_total = (L_poly    > 1e-9) ? L_chord  / L_poly     : 1.0;
+
+    // ---- H4 长度比重修正 (论文1 IV-D 在 P5 路由的实现, 2026-09-19) ----
+    // g_g93_ratio_off=1 (B0/NoCorrection): T_exp = spline_T
+    //     ⇒ v_act/v_ref = γ_total
+    // g_g93_ratio_off=0 (Full/H4Correction): T_exp = γ_total · spline_T
+    //     ⇒ v_act/v_ref = 1
+    double T_exp = is_g93 ? ((g_g93_ratio_off ? 1.0 : gamma_total) * spline_T)
+                          : 0.0;
+    double g93_v = (T_exp > 1e-9) ? L_chord / T_exp : 0.0;  // 样条体恒速
+
+    // ---- 引入腿: 独立 G93 段 (恒速 d_entry/entry_T) ----
+    // 申报速度 == 实际速度 ⇒ axis_ctrl 第三步.5 可行性门对其完备有效。
+    if (has_entry) {
+        double v_entry = d_entry / entry_T;
+        if (v_entry < 1e-6) v_entry = 1e-6;
+        if (api_push_trajectory_g93_wcs(batch_ctrl[start], v_entry,
+                                        DEFAULT_ACC, DEFAULT_DEC,
+                                        entry_T, batch_wcs[start],
+                                        batch_offsets[start]) < 0) {
+            printf("[BSpline] 引入腿入队失败 (报警)，中止本批次\n");
+            return;
+        }
+    }
+
     int seg_out = 0;
+    double prev_pos[AXIS_NUM];
+    memcpy(prev_pos, batch_ctrl[start], sizeof(double) * AXIS_NUM);
     for (int i = 1; i <= num_seg; i++) {
         double target_arc;
         double current_seg_arc;
@@ -514,33 +624,62 @@ static void bspline_process_batch_from(int start, int count)
                    sizeof(double) * AXIS_NUM);
         }
 
+        // 本段实际弦长 (与第一遍同源): dt 按弦长分配 ⇒ 段速恒为 L_chord/T_exp
+        double chord = 0.0;
+        {
+            double dsq = 0.0;
+            for (int j = 0; j < AXIS_NUM; j++) {
+                double d = curr_pos[j] - prev_pos[j]; dsq += d * d;
+            }
+            chord = sqrt(dsq);
+        }
+
         // @Context: Non-RealTime Background Thread (bspline_thread_func)
         // @Stage: STAGE_BSPLINE —— 3 阶 B 样条等距重采样输出点
         // curr_pos 已通过 NaN 防护 + 终点对齐,是最终的等距重采样形态。
         // v_target 取本批次恒定速度 (G93=整批匀速, G94=avg_speed),
         // 与下方 seg_speed 同源, /1000.0 转换为 mm/ms 与 RT 探针对齐。
         {
-            double bspline_v = (total_g93_time > 1e-9) ? g93_avg_speed : avg_speed;
+            double bspline_v;
+            if (is_g93) bspline_v = (g93_v > 1e-6) ? g93_v : g93_avg_speed;
+            else        bspline_v = avg_speed;
             if (bspline_v < 1e-6) bspline_v = 1e-6;
             TraceLogger_PushPipeline(STAGE_BSPLINE, curr_pos, bspline_v / 1000.0);
         }
 
-        // 入队 (整段步长 = step,末段 = last_seg_arc,速度恒定)
+        // 入队 (段时长按**弦长**分配,速度恒定 = L_chord/T_exp)
         // 全部用 _wcs 变体: bspline 线程不得读 parser 的 g_state.modal_wcs 与 work_offsets。
         // WCS/offset 取 batch_wcs[start] / batch_offsets[start]:
         //   parser 切 WCS 或写 #5221 时已 BSpline_Flush,同批次 WCS+偏置恒定。
         double seg_speed;
         int push_ret;
-        if (total_g93_time > 1e-9) {
-            // G93: 段速度 = 整批匀速,段时长按本段弧长比例分配
-            // (current_seg_arc: 整段=step,末段=last_seg_arc)
-            seg_speed = g93_avg_speed;
-            if (seg_speed < 1e-6) seg_speed = 1e-6;
-            double dt_this = current_seg_arc / total_arc * total_g93_time;
-            push_ret = api_push_trajectory_g93_wcs(curr_pos, seg_speed,
-                                                    DEFAULT_ACC, DEFAULT_DEC,
-                                                    dt_this, batch_wcs[start],
-                                                    batch_offsets[start]);
+        if (is_g93) {
+            if (g_g93_f_inherit) {
+                // B0′ 消融 (论文1, 2026-09-17): F-inheritance — 每条重采样弦
+                // 继承批内平均单点预算 T̄ = T_spline/count → τ_batch =
+                // n_chords × T̄ (E2 陷阱在 P5 路由的可执行复现)。
+                // 引入腿预算已剥离, 不参与 F-inheritance 均分。
+                double dt_inh = spline_T / (double)count;
+                if (dt_inh < 1e-9) dt_inh = 1e-9;
+                seg_speed = current_seg_arc / dt_inh;
+                if (seg_speed < 1e-6) seg_speed = 1e-6;
+                push_ret = api_push_trajectory_g93_wcs(curr_pos, seg_speed,
+                                                        DEFAULT_ACC, DEFAULT_DEC,
+                                                        dt_inh, batch_wcs[start],
+                                                        batch_offsets[start]);
+            } else {
+                // 段时长按本段弦长比例分配 ⇒ 全批恒速 g93_v, 总时长恰为 T_exp。
+                // (弦长口径而非弧长口径, 保证 Σdt = T_exp 与 v ≡ L_chord/T_exp
+                //  同时成立 —— 弧长口径下二者相差 O(step²/ρ²), 落在 1e-6 量级。)
+                double dt_this = (L_chord > 1e-9)
+                                 ? chord / L_chord * T_exp : 1e-9;
+                seg_speed = g93_v;
+                if (seg_speed < 1e-6) seg_speed = 1e-6;
+                push_ret = api_push_trajectory_g93_wcs(curr_pos, seg_speed,
+                                                        DEFAULT_ACC, DEFAULT_DEC,
+                                                        dt_this, batch_wcs[start],
+                                                        batch_offsets[start]);
+            }
         } else {
             // G94 模式: B-样条已输出严格等距平滑段,必须透传(is_fillet=1),
             // 否则 Planner 的 G64 拐角抹圆会对 B-样条段做二次篡改,破坏等距性。
@@ -555,11 +694,16 @@ static void bspline_process_batch_from(int start, int count)
             printf("[BSpline] 入队失败 (报警)，中止本批次\n");
             return;
         }
+        memcpy(prev_pos, curr_pos, sizeof(double) * AXIS_NUM);
         seg_out++;
     }
 
-    printf("[BSpline] 批次完成: %d 点 -> %d 段 (弧长 %.2f mm, 步长 %.4f mm, 末段 %.4f mm)\n",
-           count, seg_out, total_arc, step, last_seg_arc);
+    printf("[BSpline] 批次完成: %d 点 -> %d 段 (L_poly %.4f / L_arc %.4f / L_chord %.4f mm;"
+           " γ_fit %.6f γ_disc %.6f γ_total %.6f; entry %.4f mm/%.1f ms, T_exp %.3f ms)\n",
+           count, seg_out, L_poly, total_arc, L_chord,
+           gamma_fit, gamma_disc, gamma_total,
+           has_entry ? d_entry : 0.0, has_entry ? entry_T * 1000.0 : 0.0,
+           T_exp * 1000.0);
 }
 
 // ================== 3 阶 B 样条数学引擎 ==================

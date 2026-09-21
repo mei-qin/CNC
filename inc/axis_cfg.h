@@ -493,6 +493,19 @@ typedef struct{
     int32_t  line_no;
     uint8_t  motion_type;
     uint8_t  seg_flags;
+    /* ---- 论文1 S10 block 级计时插桩 (2026-09-20) ----
+     * block_uid:      所属 G-code block 实例号 (parser bt_block_open 分配, 1-based;
+     *                 0 = 未插桩路径, RT 不做 block 记账)。
+     * block_seg_index:本微段在 block 内的 0-based 序号。
+     * block_seg_count:parser 声明为本 block 生成的微段总数 (第一个微段就得带上,
+     *                 因为段按值入队、无法事后回填)。
+     * block_budget_cmd_ms / _sum_ms: 指令 block 时长 / 实际下发微段时长之和 (ms)。
+     * 仅诊断元数据, 不参与插补决策。 */
+    uint32_t block_uid;
+    uint32_t block_seg_index;
+    uint32_t block_seg_count;
+    double   block_budget_cmd_ms;
+    double   block_budget_sum_ms;
     int is_fillet;      // 几何锁定标识(0/1)：1=圆弧子段、G93微段、B-样条透传段。标记为1时，禁止 Planner 对其进行 G64 拐角二次抹圆篡改。
     int is_g93_strict;  // 1=G93 强一致性段: 纯匀速,planner 不得 S 曲线限幅
     int is_rtcp_active; // 1=RTCP 路径产生段(经 Kinematics_Inverse 物理逆解);

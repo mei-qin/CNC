@@ -6,7 +6,11 @@
 #include "sim_engine.h"
 #include "sim_drive.h"
 #include "snapshot_hub.h"
+#include "periph_bus.h"    /* P0-1: PeriphBus_PublishG (软 PLC 地基) */
+#include "periph_ai.h"     /* P1.5-1: periph_ai_rt_poll (AI → G 区) */
+#include "plc_core.h"      /* P1-3: plc_rt_is_running/heartbeat (看门狗数据源) */
 #include "event_logger.h"   /* P1-b: EventLogger_Push (RT 安全, 无锁无 malloc) */
+#include "block_timing.h"   /* 论文1 S10: block 级计时插桩 (bt_rt_*) */
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -32,8 +36,68 @@ int dowkccheck = 0, currentgroup = 0;
 int g_all_axis_enabled = 0;
 int g_sim_mode = 0;
 
+/* ---- P0-4a (2026-09-10): 期望拓扑表 (kernel_init_hw 注入, bring-up 校验) ---- */
+static EcatTopoExpect_t g_topo_expect[ECAT_TOPO_MAX];
+static int g_topo_count = 0;
+
+/* @Context: Non-RealTime (kernel_init_hw, SMC_InitAndStart 之前) */
+void ecat_set_expected_topo(const EcatTopoExpect_t *list, int count)
+{
+    g_topo_count = 0;
+    if (list == NULL || count <= 0) return;
+    if (count > ECAT_TOPO_MAX) count = ECAT_TOPO_MAX;
+    for (int i = 0; i < count; i++) g_topo_expect[i] = list[i];
+    g_topo_count = count;
+    printf("[ECAT] 期望拓扑表已装载: %d 站 (bring-up 校验)\n", count);
+}
+
+/* @Context: Non-RealTime (ecat_bringup 内, ecx_config_init 之后)
+ * @return 0=通过或未配置; -1=从站数不符; -2=第 idx 站 vendor/product 不符 */
+static int ecat_topo_check(void)
+{
+    if (g_topo_count <= 0) return 0;
+    if (ctx.slavecount != g_topo_count) {
+        printf("[ECAT错误] 拓扑不符: 期望 %d 站, 实际 %d 站 "
+               "(增减从站 = slave_id 全体漂移, 拒绝启动)\n",
+               g_topo_count, ctx.slavecount);
+        return -1;
+    }
+    for (int i = 1; i <= ctx.slavecount; i++) {
+        uint32_t v = ctx.slavelist[i].eep_man;
+        uint32_t p = ctx.slavelist[i].eep_id;
+        if ((g_topo_expect[i-1].vendor != 0 && v != g_topo_expect[i-1].vendor)
+            || (g_topo_expect[i-1].product != 0 && p != g_topo_expect[i-1].product)) {
+            printf("[ECAT错误] 拓扑不符: 站 %d 期望 vendor=0x%08X product=0x%08X, "
+                   "实际 vendor=0x%08X product=0x%08X\n",
+                   i, g_topo_expect[i-1].vendor, g_topo_expect[i-1].product, v, p);
+            return -2;
+        }
+    }
+    printf("[ECAT] 拓扑校验通过 (%d 站)\n", ctx.slavecount);
+    return 0;
+}
+
 // 实时控制变量
 int cycle = 0;
+
+/* ---- 论文1 S10 (2026-09-20): block 级计时钩子 ----
+ * @Context: 1ms Hard-RT Thread (EtherCAT)
+ * @Danger: 仅整数赋值/加法 + 一次 double 除法, NO BLOCKING / NO MATH.H / NO PRINTF.
+ * 目的: 用 RT 周期计数器 `cycle` 直接给 block 打起止刻度, 彻底摆脱
+ *       "从 CSV trace 行数反推时长" 的口径 (窗口两端丢行 ⇒ 恒少 1)。 */
+static void rt_bt_on_segment_load(const TrajectorySegment_t *seg, int cyc)
+{
+    if (seg == 0 || seg->block_uid == 0) return;   /* 未插桩路径 (G00/刀补/B-Spline) */
+    if (!g_bt.cur_active || g_bt.cur_uid != seg->block_uid) {
+        bt_rt_block_start(seg->block_uid, seg->line_no, seg->block_seg_count,
+                          seg->block_budget_cmd_ms, seg->block_budget_sum_ms, cyc);
+    }
+}
+static void rt_bt_on_segment_done(int cyc)
+{
+    if (g_bt.cur_uid != 0) bt_rt_segment_done(cyc);
+}
+
 int g_csp_ready = 0;
 int64 cycletime = CYCLE_TIME_NS;
 int64 syncoffset = 500000;
@@ -366,6 +430,37 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
             if (!g_sim_mode && ctx.slavelist[0].hasdc && (wkc > 0))
                 ec_sync(ctx.DCtime, cycletime, &toff);
+
+            // ---- P1-3 (2026-09-12): 软 PLC 看门狗 ----
+            // RUNNING 且 heartbeat 30ms 未刷新 → 软停机 + 事件 0x0004 (单次锁存,
+            // heartbeat 恢复流动自动解除锁存重武装)。非 RUNNING 不武装 (EMPTY/
+            // STOPPED/ERROR 无安全职责)。放在安全门之前: 报警同周期联动激光关断。
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: 2×atomic relaxed load + static 簿记, 无锁无阻塞。
+            {
+                static uint32_t wd_last_hb = 0;
+                static int      wd_last_cycle = 0;
+                static int      wd_latched = 0;
+                if (plc_rt_is_running()) {
+                    uint32_t hb = plc_rt_heartbeat();
+                    if (hb != wd_last_hb) {
+                        wd_last_hb = hb;
+                        wd_last_cycle = cycle;
+                        wd_latched = 0;          /* 恢复流动 → 解除锁存 */
+                    } else if (!wd_latched && (cycle - wd_last_cycle) > 30) {
+                        wd_latched = 1;
+                        atomic_store_explicit(&g_sys_alarm_state, 1,
+                                              memory_order_release);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_PLC, 0x0004,
+                                         (int32_t)(cycle - wd_last_cycle),
+                                         "PLC watchdog: heartbeat stale >30ms");
+                    }
+                } else {
+                    wd_last_hb = plc_rt_heartbeat();
+                    wd_last_cycle = cycle;
+                    wd_latched = 0;
+                }
+            }
 
             // ---- P0-Laser: cycle 头安全门 (alarm_reset 之前, 段消费之前) ----
             // 检查 DI 互锁 + g_sys_alarm_state, 异常时立即关激光 + 锁存 emergency_kill.
@@ -934,6 +1029,11 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 }   /* F1 else (非报警) 结束 */
             }
 
+            // 论文1 S10: 记录本周期虚拟时间预算起点 (SafeLift/Homing/JOG 冻结路径
+            // 已把 ms_budget 置 0, 故此处捕获的是"实际可推进"的预算)。
+            // 周期末 (ms_budget_initial - ms_budget) = 本周期真实推进的虚拟时间。
+            double ms_budget_initial = ms_budget;
+
             while (ms_budget > 1e-6 && rt_iter < RT_ITER_CAP
                    && g_interpolator.safe_lift_state != 2
                    && g_interpolator.homing_state != 2
@@ -1081,6 +1181,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     g_interpolator.phase_T_curr = 0.0;
                     g_interpolator.phase_T_next = seg.T1;
 
+                    // 论文1 S10: block 归属切换时打开始刻度 (Snap 与正常段共用)
+                    rt_bt_on_segment_load(&seg, cycle);
+
                     if (seg.T_total > 0.5) {
                         // 正常段: 进入插补消费
                         g_interpolator.is_moving = 1;
@@ -1096,6 +1199,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         }
                         double snap_time = (seg.T_total > 0.001) ? seg.T_total : 0.001;
                         ms_budget -= snap_time;
+                        rt_bt_on_segment_done(cycle);   // 论文1 S10: 本周期即完成
                         just_loaded_seg = 1;  // 触发 trace 记录 Snap 落点
                         // 不置 is_moving,继续 while 加载下一段
                         continue;
@@ -1123,6 +1227,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         rt_resolve_scurve_step(eff_scale);  // 末态: s=total_distance, v_current=v_end
                         ms_budget -= remaining_time;
                         g_interpolator.is_moving = 0;  // 标记本段结束,下次 while 加载新段
+                        /* 论文1 S10: exclusive-end 刻度 (完成周期 + 1) */
+                        rt_bt_on_segment_done(cycle);
                         // P2-A-3: 单段模式 re-arm (运动段完成时)
                         // 读 mode_flags 当前值, 允许 UI 中途 toggle off (下次完成时不再 re-arm).
                         // 设 ms_budget=0 强制 while 退出, 防止本 cycle 内连续吃多段.
@@ -1135,6 +1241,23 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     }
                 }
             }  // end while
+
+            // ---- 论文1 S10: 周期级计时累加 ----
+            // @Context: 1ms Hard-RT Thread (EtherCAT)
+            // @Danger: 仅减法/加法/比较, NO BLOCKING / NO MATH.H / NO PRINTF.
+            //   virtual_inc_ms  = 本周期真实推进的虚拟时间 (feedhold 时 eff_scale=0 ⇒ 0)
+            //   hold_active     = feedhold 生效 (BRAKING/PAUSED, 与 hold_gate_off 同判据)
+            {
+                double virt_inc = ms_budget_initial - ms_budget;
+                if (virt_inc < 0.0) virt_inc = 0.0;      // 防御 (不应为负)
+                int hold_on = (g_interpolator.hold_state == HOLD_BRAKING
+                               || g_interpolator.hold_state == HOLD_PAUSED) ? 1 : 0;
+                /* eff_scale = 本周期真实时间缩放 (time_scale × override_ratio,
+                 *   v1 clamp ≤ 1.0); moving = 段在飞 (override 只对运动段生效)。 */
+                bt_rt_cycle(cycle, virt_inc, hold_on,
+                            (double)cycletime / 1000000.0,
+                            eff_scale, g_interpolator.is_moving ? 1 : 0);
+            }
 
             // ---- P2-A-2: Override + Dry-Run "有效输出"计算 (RT 单写者) ----
             // @Context: 1ms Hard-RT Thread (EtherCAT)
@@ -1337,6 +1460,15 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             //         g_state / g_parser_ctrl 字段 best-effort 读, 撕裂容忍.
             SnapshotHub_Publish((uint32_t)cycle);
 
+            // ---- P0-1 (2026-09-09): 外围 G/F 信号表 G 区发布 (软 PLC 地基) ----
+            // @Context: 1ms Hard-RT Thread
+            // @Danger: PeriphBus_PublishG 仅 atomic store + 字段赋值, 无锁无阻塞.
+            //          与 SnapshotHub 同约束: 不受 should_log_this_cycle / g_sim_mode
+            //          限制, 静止时也发布 (外围侧联动逻辑依赖连续时基).
+            // P1.5-1: AI 采样先行 (PublishG 把 g_periph_ai_rt 带入 G 区 ai[4]).
+            periph_ai_rt_poll();
+            PeriphBus_PublishG((uint32_t)cycle);
+
             if(g_all_axis_op_ready){
                 for(int i=0;i<AXIS_NUM;i++){
                     if(g_axis[i].slave_count>=2&&g_axis[i].enable_sync_alarm){
@@ -1407,10 +1539,36 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                              if(wait_target_ms > MCODE_WAIT_TIMEOUT_MS)
                                  wait_target_ms = MCODE_WAIT_TIMEOUT_MS;
                              break;
+                    // ---- P1-3 (2026-09-12): M80-M89 PLC 域 M 码 ----
+                    // 等待 PLC 的 F_MCODE_FIN == 码值 (VM 侧 strobe 上升沿已清 FIN,
+                    // 防止上一次握手的 stale FIN 重触发); 5000ms (绝对超时) 未 FIN
+                    // → 软停机 + 事件 0x0005。FIN 到达即可完成, 不等 timer。
+                    case 80: case 81: case 82: case 83: case 84:
+                    case 85: case 86: case 87: case 88: case 89:
+                             wait_target_ms = MCODE_WAIT_TIMEOUT_MS;
+                             break;
                     default: wait_target_ms=500;  break;
                 }
-                if(g_interpolator.mcode_wait_timer >= wait_target_ms ||
+                /* P1-3: PLC 域 M 码 FIN 提前完成判定 (早于超时门) */
+                int plc_fin_done = 0;
+                if (g_interpolator.current_mcode >= 80
+                    && g_interpolator.current_mcode <= 89) {
+                    uint16_t fin = atomic_load_explicit(
+                        &PeriphBus_GetF()->mcode_fin, memory_order_acquire);
+                    plc_fin_done = ((int)fin == g_interpolator.current_mcode);
+                }
+                if(plc_fin_done ||
+                   g_interpolator.mcode_wait_timer >= wait_target_ms ||
                    g_interpolator.mcode_wait_timer >= MCODE_WAIT_TIMEOUT_MS){
+                    // P1-3: PLC 域 M 码超时 (非 FIN 完成) → 软停机 + 事件 (常量串, RT 安全)
+                    if (g_interpolator.current_mcode >= 80
+                        && g_interpolator.current_mcode <= 89 && !plc_fin_done) {
+                        atomic_store_explicit(&g_sys_alarm_state, 1,
+                                              memory_order_release);
+                        EventLogger_Push(SEVERITY_ALARM, SOURCE_PLC, 0x0005,
+                                         g_interpolator.current_mcode,
+                                         "PLC-domain M-code FIN timeout (5000ms)");
+                    }
                     // ---- P1-4 (2026-09-03): M76 台阶推进 ----
                     // 未到最后一级: 切换下一级 (timer 清 0 复用本屏障, 不引入第二
                     // 计时器); pierce_count 只在整体完成时 +1 (一次渐进穿孔计 1 次)。
@@ -1977,6 +2135,13 @@ void ecat_bringup(char *ifname)
         exit(-1);
     }
     printf("[ECAT] 扫描到%d个EtherCAT从站\n", ctx.slavecount);
+
+    /* P0-4a (2026-09-10): 期望拓扑校验 — 在任何 PDO 重映射/IOmap 分配之前,
+     * 失配即拒绝启动 (slave_id 引用按位置分配, 漂移=读邻站数据) */
+    if (ecat_topo_check() != 0) {
+        ecx_close(&ctx);
+        exit(-1);
+    }
 
     // TxPDO 重映射：添加 0x60F4 跟随误差到 PDO 输入（必须在 config_map_group 之前）
     for(int i=0;i<AXIS_NUM;i++){
