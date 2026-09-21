@@ -33,6 +33,7 @@
 #include <stdint.h>
 #include "axis_cfg.h"   // TrajectorySegment_t / _Atomic
 #include "smc_protocol.h"  // LaserCouplePoint_t + LASER_COUPLE_TABLE_MAX (P0-Laser-ConfigRPC 移入协议头供 SDK 共享)
+                           // + LASER_IL_MAX (P0-2 互锁规则表, 2026-09-09)
 
 // =====================================================================
 // P0-Laser Phase B1: 功率-速度耦合 (分段查表) 表语义说明
@@ -77,6 +78,18 @@ typedef struct {
     uint8_t ch_ao_pressure;     // 气压通道 (默认 2)
     double  pressure_max_bar;   // 量程 bar (RPC 0x0067 配置, 默认 0=禁用)
 
+    // ---- P0-4a (2026-09-10): PDO 布局参数 (选型无关骨架, 默认 EL 级 16-bit 端子) ----
+    // 差异收敛四参数 {slave_id, byte_off, bit/ch, 宽度} 的后三项 (slave_id 见上)。
+    // 写者: init 阶段 (hw 档案 [laser_io] / RPC 0x0075), RT 只读 — 与 bit_* 同模式。
+    // 越界保护: HAL 侧对照 slavelist[id].Ibytes/Obytes 钳制, 防 IOmap 连续区越界
+    // 读写邻站数据 (8 点端子 di_bytes=1 时读 inputs[1] = 读到下一从站!)。
+    uint8_t di_byte_off;        // DI PDO 起始字节 (默认 0)
+    uint8_t di_bytes;           // DI 宽度 1/2 字节 (默认 2; 8 点端子配 1)
+    uint8_t do_byte_off;        // DO PDO 起始字节 (默认 0)
+    uint8_t do_bytes;           // DO 宽度 1/2 字节 (默认 2)
+    uint8_t ao_byte_off;        // AO 通道 0 起始字节 (默认 0)
+    uint8_t ao_stride;          // AO 每通道字节数 2/4 (默认 2 = 16-bit 通道)
+
     // ---- 物理量程 ----
     double  power_max_w;        // 默认 3000.0
     double  freq_max_hz;        // 默认 5000.0
@@ -103,6 +116,18 @@ typedef struct {
     // init 阶段配置 RT 只读 (与 couple_table 同模式); 默认表 1 级 {3000W, 2000Hz, 500ms}。
     LaserPierceStep_t pierce_table[LASER_PIERCE_TABLE_MAX];
     int    pierce_table_len;     // 1..LASER_PIERCE_TABLE_MAX
+
+    // ---- P0-2 (2026-09-09): 互锁链规则表 (数据驱动, 对标整机厂梯形图互锁) ----
+    // il_count == 0: 回退默认 6 路链 (bit_di_* 固定映射, 兼容既有行为)
+    // il_count 1..LASER_IL_MAX: safety_gate 循环评估规则表
+    //   il_bit[i]  = DI 位偏移 (0-15)
+    //   il_mask[i] = 该位异常时 interlock_status 的置位码
+    // 约束: mask 不得占用 bit15 (0x8000 保留给 system_alarm 联动)
+    // 写者: init 阶段 (hw 参数表 [laser_interlock] / RPC 0x0074), RT 只读 —
+    //       与 couple_table 同模式 (init 单写者, RT 循环内无锁读)
+    int     il_count;
+    uint8_t il_bit[LASER_IL_MAX];
+    uint16_t il_mask[LASER_IL_MAX];
 } LaserConfig_t;
 
 typedef struct {
@@ -197,6 +222,14 @@ void laser_emergency_kill(uint16_t interlock_mask);
 
 // @Context: 1ms Hard-RT Thread (alarm_reset 路径调)
 // 清 emergency_kill 锁存 (但不自动重开激光, 需 M3 重发).
+// P0-3c (2026-09-09): 实际解除锁存时推 LASER 0x0014 INFO 事件 (复位审计).
 void laser_rt_reset(void);
+
+// @Context: Non-RealTime (RPC 0x0073 handler 线程)
+// @Thread-Safety: 字段级 atomic (release 写 / RT acquire 读), 单写者.
+// P0-3a (2026-09-09): sim 模式 DI 注入 — 使能后 laser_hw_read_di 返回
+// pattern (1=该位异常), safety_gate 互锁链在 sim 下可测 (原设计 sim 跳过
+// DI 检查 = 互锁零测试覆盖). enable=0 清除注入 (回恒 0).
+void laser_sim_inject_di(uint16_t pattern, int enable);
 
 #endif // LASER_CTRL_H

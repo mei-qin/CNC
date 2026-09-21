@@ -19,11 +19,18 @@
 
 #include "laser_ctrl.h"
 #include "global_def.h"
+#include "event_logger.h"   // P0-3c: EventLogger_Push (RT 安全, 无锁无 malloc)
 #include <stdatomic.h>
 
 // 全局实例定义 (单一定义点, global_def.h extern 引用)
 LaserConfig_t  g_laser_cfg;
 LaserRTState_t g_laser_rt;
+
+// ---- P0-3a (2026-09-09): sim DI 注入通道 ----
+// 写者: RPC 0x0073 handler (Non-RT, laser_sim_inject_di) — release
+// 读者: RT safety_gate → laser_hw_read_di — acquire
+static _Atomic uint16_t g_laser_sim_di_pattern = 0;
+static _Atomic int      g_laser_sim_di_en      = 0;
 
 // =====================================================================
 // 硬件抽象层 (HAL) — Phase A 简化 stub
@@ -42,41 +49,67 @@ LaserRTState_t g_laser_rt;
 // =====================================================================
 
 // @Context: 1ms Hard-RT Thread
-// 读 16-bit DI 状态 (1=该位异常). sim/未配置返回 0 (无异常).
+// 读 DI 状态 (1=该位异常), 宽度 di_bytes (1/2 字节).
+// P0-3a (2026-09-09): sim 模式下若 RPC 0x0073 注入使能, 返回注入图案 —
+//   互锁链在 WSL2 sim 下可测 (原设计 sim 恒 0 = 互锁零测试覆盖).
+// P1.5-2 (2026-09-15): 0x0073 去 sim-only — 实机即 DI 强制 (调机隔离故障点),
+//   强制优先级最高 (覆盖 PDO 物理读数); 实机开强制推事件 0x0015 审计。
+// P0-4a (2026-09-10): 硬件路径实装, 参数化 {slave_id, di_byte_off, di_bytes};
+//   Ibytes 越界钳制 — SOEM IOmap 连续布局, 读越本从站 = 读到邻站数据。
 static uint16_t laser_hw_read_di(int slave_id)
 {
-    if (slave_id < 0 || g_sim_mode) return 0;
+    /* 强制/注入优先 (sim = 传感器模拟; 实机 = DI force 调机工具) */
+    if (atomic_load_explicit(&g_laser_sim_di_en, memory_order_acquire))
+        return atomic_load_explicit(&g_laser_sim_di_pattern, memory_order_acquire);
 
-    // === 硬件阶段在此插入 PDO 读 ===
-    // uint8_t *inputs = ctx.slavelist[slave_id].inputs;
-    // return (uint16_t)(inputs[0] | (inputs[1] << 8));
-    return 0;
+    if (g_sim_mode) return 0;   /* sim 未注入 = 恒 0 */
+    if (slave_id < 0 || slave_id > ctx.slavecount) return 0;
+
+    uint8_t *inputs = ctx.slavelist[slave_id].inputs;
+    if (inputs == NULL) return 0;
+    if (g_laser_cfg.di_byte_off + g_laser_cfg.di_bytes
+        > (int)ctx.slavelist[slave_id].Ibytes) return 0;   // 越界 = 配置错误, 视无异常
+
+    uint16_t v = inputs[g_laser_cfg.di_byte_off];
+    if (g_laser_cfg.di_bytes >= 2)
+        v |= (uint16_t)(inputs[g_laser_cfg.di_byte_off + 1] << 8);
+    return v;
 }
 
 // @Context: 1ms Hard-RT Thread
-// 写 16-bit DO 状态. sim/未配置为 no-op.
+// 写 DO 状态, 宽度 do_bytes (1/2 字节). sim/未配置为 no-op.
+// P0-4a: 参数化 {do_byte_off, do_bytes}; Obytes 越界钳制 (8 点端子只写 1 字节,
+//   多写的字节会落入 IOmap 中下一从站的输出区)。
 static void laser_hw_write_do(int slave_id, uint16_t val)
 {
-    if (slave_id < 0 || g_sim_mode) return;
+    if (slave_id < 0 || slave_id > ctx.slavecount) return;
+    if (g_sim_mode) return;
 
-    // === 硬件阶段在此插入 PDO 写 ===
-    // uint8_t *outputs = ctx.slavelist[slave_id].outputs;
-    // outputs[0] = (uint8_t)(val & 0xFF);
-    // outputs[1] = (uint8_t)(val >> 8);
-    (void)val;
+    uint8_t *outputs = ctx.slavelist[slave_id].outputs;
+    if (outputs == NULL) return;
+    if (g_laser_cfg.do_byte_off + g_laser_cfg.do_bytes
+        > (int)ctx.slavelist[slave_id].Obytes) return;     // 越界 = 配置错误, 整体不写
+
+    outputs[g_laser_cfg.do_byte_off] = (uint8_t)(val & 0xFF);
+    if (g_laser_cfg.do_bytes >= 2)
+        outputs[g_laser_cfg.do_byte_off + 1] = (uint8_t)(val >> 8);
 }
 
 // @Context: 1ms Hard-RT Thread
 // 写 16-bit AO 通道. sim/未配置为 no-op.
+// P0-4a: 参数化 {ao_byte_off, ao_stride}; 通道地址 = ao_byte_off + ch × ao_stride。
 static void laser_hw_write_ao(int slave_id, uint8_t ch, uint16_t raw)
 {
-    if (slave_id < 0 || g_sim_mode) return;
+    if (slave_id < 0 || slave_id > ctx.slavecount) return;
+    if (g_sim_mode) return;
 
-    // === 硬件阶段在此插入 PDO 写 ===
-    // uint8_t *outputs = ctx.slavelist[slave_id].outputs;
-    // outputs[ch * 2]     = (uint8_t)(raw & 0xFF);
-    // outputs[ch * 2 + 1] = (uint8_t)(raw >> 8);
-    (void)ch; (void)raw;
+    uint8_t *outputs = ctx.slavelist[slave_id].outputs;
+    if (outputs == NULL) return;
+    int off = g_laser_cfg.ao_byte_off + (int)ch * g_laser_cfg.ao_stride;
+    if (off + 2 > (int)ctx.slavelist[slave_id].Obytes) return;   // 越界钳制
+
+    outputs[off]     = (uint8_t)(raw & 0xFF);
+    outputs[off + 1] = (uint8_t)(raw >> 8);
 }
 
 // =====================================================================
@@ -109,6 +142,14 @@ void laser_ctrl_init(void)
     // AO 通道偏移默认
     g_laser_cfg.ch_ao_power = 0;
     g_laser_cfg.ch_ao_freq  = 1;
+    // P0-4a (2026-09-10): PDO 布局默认 = EL 级 16-bit 端子 (EL1809/EL2809/EL4132 类)
+    // 换端子不改代码, 只改 hw 档案 [laser_io] 或 RPC 0x0075
+    g_laser_cfg.di_byte_off = 0;
+    g_laser_cfg.di_bytes    = 2;
+    g_laser_cfg.do_byte_off = 0;
+    g_laser_cfg.do_bytes    = 2;
+    g_laser_cfg.ao_byte_off = 0;
+    g_laser_cfg.ao_stride   = 2;
     // P0-2: 气压通道默认 2 (功率 0 / 频率 1 之后); 量程 0 = 未配置不输出
     g_laser_cfg.ch_ao_pressure  = 2;
     g_laser_cfg.pressure_max_bar = 0.0;
@@ -136,6 +177,10 @@ void laser_ctrl_init(void)
     g_laser_cfg.pierce_table[0].freq_hz  = 2000.0;
     g_laser_cfg.pierce_table[0].dwell_ms = 500;
     g_laser_cfg.pierce_table_len = 1;
+
+    // P0-2 (2026-09-09): 互锁规则表默认空 = 默认 6 路链 (行为兼容);
+    // hw 参数表 [laser_interlock] 或 RPC 0x0074 配置覆盖
+    g_laser_cfg.il_count = 0;
 
     // RT 状态归零
     g_laser_rt.enable           = 0;
@@ -271,16 +316,39 @@ int laser_rt_safety_gate(void)
         return 1;
     }
 
-    // 2. DI 互锁检查 (仅硬件模式且 di_slave_id 配置时)
-    if (g_laser_cfg.di_slave_id >= 0 && !g_sim_mode) {
+    // 2. DI 互锁检查
+    //    硬件模式: di_slave_id >= 0 且已配置时读 PDO DI
+    //    sim 模式: RPC 0x0073 注入使能时读注入图案 (P0-3a, 补互锁测试盲区)
+    int di_check_active;
+    if (!g_sim_mode) {
+        di_check_active = (g_laser_cfg.di_slave_id >= 0);
+    } else {
+        di_check_active = (atomic_load_explicit(&g_laser_sim_di_en,
+                                                memory_order_acquire) != 0);
+    }
+    if (di_check_active) {
         uint16_t di = laser_hw_read_di(g_laser_cfg.di_slave_id);
         uint16_t mask = 0;
-        if (di & (uint16_t)(1u << g_laser_cfg.bit_di_door))       mask |= 0x0001;
-        if (di & (uint16_t)(1u << g_laser_cfg.bit_di_estop_soft)) mask |= 0x0002;
-        if (di & (uint16_t)(1u << g_laser_cfg.bit_di_laser_alm))  mask |= 0x0004;
-        if (di & (uint16_t)(1u << g_laser_cfg.bit_di_water_temp)) mask |= 0x0008;
-        if (di & (uint16_t)(1u << g_laser_cfg.bit_di_water_flow)) mask |= 0x0010;
-        if (di & (uint16_t)(1u << g_laser_cfg.bit_di_gas_press))  mask |= 0x0020;
+
+        // P0-2 (2026-09-09): 互锁链规则表驱动 (hw 参数表 [laser_interlock] / RPC 0x0074)
+        // il_count == 0 回退默认 6 路链 (bit_di_* 固定映射, 兼容既有行为)
+        if (g_laser_cfg.il_count > 0) {
+            int n = g_laser_cfg.il_count;
+            if (n > LASER_IL_MAX) n = LASER_IL_MAX;   // 越界钳制 (规则表源已校验, 双保险)
+            for (int i = 0; i < n; i++) {
+                if (di & (uint16_t)(1u << g_laser_cfg.il_bit[i]))
+                    mask |= g_laser_cfg.il_mask[i];
+            }
+        } else {
+            // 默认链 (硬编码兼容路径): 门/软急停/激光ALM/水温/水流/气压
+            if (di & (uint16_t)(1u << g_laser_cfg.bit_di_door))       mask |= 0x0001;
+            if (di & (uint16_t)(1u << g_laser_cfg.bit_di_estop_soft)) mask |= 0x0002;
+            if (di & (uint16_t)(1u << g_laser_cfg.bit_di_laser_alm))  mask |= 0x0004;
+            if (di & (uint16_t)(1u << g_laser_cfg.bit_di_water_temp)) mask |= 0x0008;
+            if (di & (uint16_t)(1u << g_laser_cfg.bit_di_water_flow)) mask |= 0x0010;
+            if (di & (uint16_t)(1u << g_laser_cfg.bit_di_gas_press))  mask |= 0x0020;
+        }
+
         if (mask) {
             laser_emergency_kill(mask);
             return 1;
@@ -414,7 +482,22 @@ void laser_rt_sync_config(const TrajectorySegment_t *seg)
 // @Context: 1ms Hard-RT Thread (alarm_reset 路径调)
 void laser_rt_reset(void)
 {
+    // P0-3c (2026-09-09): 复位审计事件 — 仅实际解除锁存时推 (防重复复位噪音);
+    // value 携带复位前的 interlock 位图, 与触发事件 0x0010 的 value 闭环对照
+    if (g_laser_rt.emergency_kill) {
+        EventLogger_Push(SEVERITY_INFO, SOURCE_LASER, 0x0014,
+                         (int32_t)g_laser_rt.interlock_status,
+                         "laser interlock reset (re-armed; M3 required)");
+    }
     g_laser_rt.emergency_kill   = 0;
     g_laser_rt.interlock_status = 0;
     // 不自动重开激光 — 用户需显式重发 M3 (避免报警复位后突然出激光)
+}
+
+// @Context: Non-RealTime (RPC 0x0073 handler 线程)
+// @Thread-Safety: 字段级 atomic, RT safety_gate acquire 读。
+void laser_sim_inject_di(uint16_t pattern, int enable)
+{
+    atomic_store_explicit(&g_laser_sim_di_pattern, pattern, memory_order_release);
+    atomic_store_explicit(&g_laser_sim_di_en, enable ? 1 : 0, memory_order_release);
 }
