@@ -45,6 +45,8 @@
 #include "smc_protocol.h"      /* SMC_MODE_SINGLE_BLOCK */
 #include "gcode_parser.h"      /* ParserControl_t */
 #include "global_def.h"        /* P3: g_axis / g_planner_config (CNC.Config 读) */
+#include "plc_core.h"          /* P1-5: CNC.PLC watch 面 (status/snapshot) */
+#include "periph_bus.h"        /* P1-5: F/G 区镜像 (atomic/seqlock 读) */
 #include "kinematics.h"        /* P3: g_kin_config / KIN_HEAD_HEAD */
 #include "param_store.h"       /* P3: CNC.Config 配置面 (写入即存 + WriteProtect) */
 
@@ -133,6 +135,20 @@ typedef enum {
     OV_LASER_SEG_FLAGS,      /* Int32: 段工艺标记 bit0/b1 */
     OV_LASER_PIERCE_COUNT,   /* Int32: 累计穿孔次数 */
     OV_LASER_ON_TIME,        /* Int64: 累计出光 ms */
+    /* ---- PLC (2026-09-12): CNC.PLC watch 面 (契约 §12, P1-5) ---- */
+    OV_PLC_STATE,            /* Int32: 0=EMPTY 1=STOPPED 2=RUNNING 3=ERROR */
+    OV_PLC_NVARS,            /* Int32: 用户变量数 */
+    OV_PLC_NSTMTS,           /* Int32: 顶层语句数 */
+    OV_PLC_TEXTLEN,          /* Int32: 程序文本字节 */
+    OV_PLC_HEARTBEAT,        /* UInt32: 扫描周期计数 */
+    OV_PLC_CYCLE_US,         /* UInt32: 最近周期耗时 µs */
+    OV_PLC_ERR_LINE,         /* Int32: 运行期错误行 (0=无) */
+    OV_PLC_ERR_MSG,          /* String */
+    OV_PLC_F_PERIPHERAL_OK,  /* Int32: F 区镜像 (watch PLC 侧发布值) */
+    OV_PLC_F_STATUS,         /* Int32 */
+    OV_PLC_F_MCODE_FIN,      /* Int32 */
+    OV_PLC_G_MCODE,          /* Int32: G 区镜像 (M 码握手调试) */
+    OV_PLC_G_MCODE_STROBE,   /* Int32 */
     OV_KIND_COUNT
 } OpcVarKind;
 
@@ -167,7 +183,13 @@ typedef enum {
     OM_LASER_SET_COUPLING,
     OM_LASER_CONFIG_GAS_RANGE,
     OM_LASER_CONFIG_MICRO_JOINT,
-    OM_LASER_CONFIG_RANGE
+    OM_LASER_CONFIG_RANGE,
+    /* ---- PLC (2026-09-12): CNC.PLC.ReadVar (watch 用户变量) ---- */
+    OM_PLC_READVAR,
+    /* ---- P1.5-2 (2026-09-15): CNC.PLC.ForceVar/ForceClear (调机工具,
+    *      运行时语义 — 刻意不入写保护白名单外的 config 语义, 见 cb 闸门) ---- */
+    OM_PLC_FORCEVAR,
+    OM_PLC_FORCECLEAR
 } OpcMethodKind;
 
 /* P3: 配置写保护 (server 级开关, 仿 Fanuc PWE 参数写使能)。
@@ -405,6 +427,59 @@ opcua_ds_read(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
     char buf[160];
 
     switch ((OpcVarKind)ctx->kind) {
+
+    /* ---- PLC (2026-09-12): CNC.PLC watch 面 (plc_core status / F-G 区镜像) ---- */
+    case OV_PLC_STATE:
+    case OV_PLC_NVARS:
+    case OV_PLC_NSTMTS:
+    case OV_PLC_TEXTLEN:
+    case OV_PLC_HEARTBEAT:
+    case OV_PLC_CYCLE_US:
+    case OV_PLC_ERR_LINE:
+    case OV_PLC_F_PERIPHERAL_OK:
+    case OV_PLC_F_STATUS:
+    case OV_PLC_F_MCODE_FIN:
+    case OV_PLC_G_MCODE:
+    case OV_PLC_G_MCODE_STROBE: {
+        PlcCoreStatus_t st;
+        plc_core_get_status(&st);
+        UA_Int32 v = 0;
+        switch ((OpcVarKind)ctx->kind) {
+        case OV_PLC_STATE:     v = (UA_Int32)st.state;    break;
+        case OV_PLC_NVARS:     v = (UA_Int32)st.n_vars;   break;
+        case OV_PLC_NSTMTS:    v = (UA_Int32)st.n_stmts;  break;
+        case OV_PLC_TEXTLEN:   v = (UA_Int32)st.text_len; break;
+        case OV_PLC_HEARTBEAT: v = (UA_Int32)st.heartbeat; break;
+        case OV_PLC_CYCLE_US:  v = (UA_Int32)st.cycle_us; break;
+        case OV_PLC_ERR_LINE:  v = (UA_Int32)st.err_line; break;
+        default: break;    /* F/G 镜像走下方 atomic 读 */
+        }
+        if ((OpcVarKind)ctx->kind == OV_PLC_F_PERIPHERAL_OK)
+            v = (UA_Int32)atomic_load_explicit(&PeriphBus_GetF()->peripheral_ok,
+                                               memory_order_acquire);
+        else if ((OpcVarKind)ctx->kind == OV_PLC_F_STATUS)
+            v = (UA_Int32)atomic_load_explicit(&PeriphBus_GetF()->f_status,
+                                               memory_order_acquire);
+        else if ((OpcVarKind)ctx->kind == OV_PLC_F_MCODE_FIN)
+            v = (UA_Int32)atomic_load_explicit(&PeriphBus_GetF()->mcode_fin,
+                                               memory_order_acquire);
+        else if ((OpcVarKind)ctx->kind == OV_PLC_G_MCODE
+                 || (OpcVarKind)ctx->kind == OV_PLC_G_MCODE_STROBE) {
+            PeriphG_t g;
+            if (PeriphBus_ReadG(&g) == 0)
+                v = ((OpcVarKind)ctx->kind == OV_PLC_G_MCODE)
+                    ? g.mcode_value : g.mcode_strobe;
+        }
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT32]);
+        break;
+    }
+    case OV_PLC_ERR_MSG: {
+        PlcCoreStatus_t st;
+        plc_core_get_status(&st);
+        UA_String s = UA_STRING(st.err_msg);
+        sc = UA_Variant_setScalarCopy(&value->value, &s, &UA_TYPES[UA_TYPES_STRING]);
+        break;
+    }
 
     /* ---- Laser (2026-09-03): Int32 组 (SMC_GetLaserState 同源, 未配置全零) ---- */
     case OV_LASER_ENABLE:
@@ -1126,8 +1201,11 @@ opcua_config_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sess
     UA_Int32 rc = -1;
     char axis_letter = '\0';
 
-    /* 公共闸门: 写保护锁定 → 全部拒绝 (含 SaveProfile, 防误触) */
-    if (g_cfg_write_protect) {
+    /* 公共闸门: 写保护锁定 → 拒绝 (含 SaveProfile, 防误触)。
+     * P1.5-2 白名单: PLC Force 族是运行时调机工具 (同 Laser 工艺方法语义,
+     * 不改档案), 不受 PWE 写保护约束。 */
+    if (g_cfg_write_protect
+        && ctx->kind != OM_PLC_FORCEVAR && ctx->kind != OM_PLC_FORCECLEAR) {
         rc = -2;
         EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_WRITE_PROTECT,
                          ctx->kind, "config method rejected (write protected)");
@@ -1247,11 +1325,38 @@ opcua_config_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sess
         break;
     }
 
+    /* ---- P1.5-2 (2026-09-15): PLC Force 族 (调机工具, 见闸门白名单) ---- */
+    case OM_PLC_FORCEVAR: {
+        /* in: String name, Double val, Int32 on (1=强制 0=解除) */
+        if (inputSize != 3 ||
+            !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]) ||
+            !UA_Variant_hasScalarType(&input[1], &UA_TYPES[UA_TYPES_DOUBLE]) ||
+            !UA_Variant_hasScalarType(&input[2], &UA_TYPES[UA_TYPES_INT32]))
+            return UA_STATUSCODE_BADINVALIDARGUMENT;
+        UA_String *s = (UA_String *)input[0].data;
+        char name[40];
+        size_t nlen = (s && s->data) ? s->length : 0;
+        if (nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+        if (nlen > 0 && s->data) memcpy(name, s->data, nlen);
+        name[nlen] = '\0';
+        UA_Double val = *(UA_Double *)input[1].data;
+        UA_Int32 on = *(UA_Int32 *)input[2].data;
+        printf("[opcua] PLC.ForceVar %s=%.6g on=%d\n", name, val, on);
+        rc = plc_core_force_var(name, val, on);
+        break;
+    }
+    case OM_PLC_FORCECLEAR: {
+        /* 无参: 清除全部强制 */
+        printf("[opcua] PLC.ForceClear\n");
+        rc = plc_core_force_var(NULL, 0.0, 0);
+        break;
+    }
+
     default:
         return UA_STATUSCODE_BADINTERNALERROR;
     }
 
-    if (rc == -1)
+    if (rc == -1 && ctx->kind < OM_PLC_FORCEVAR)
         EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_REJECT, ctx->kind,
                          "config method rejected (busy/validation)");
 
@@ -1384,6 +1489,106 @@ add_config_method(UA_Server *s, const char *id_suffix, const UA_NodeId parent,
         ctx, NULL);
     if (sc != UA_STATUSCODE_GOOD)
         fprintf(stderr, "[opcua] add config method node %s fail: 0x%08x\n", nodeid_str, sc);
+    return sc;
+}
+
+/* =====================================================================
+ *  P1-5 (2026-09-12): CNC.PLC.ReadVar — watch 用户变量
+ *  in: String 变量名 (大小写不敏感); out: Double value + Int32 ret
+ *  (0=找到 / -1=未找到或无程序)。数据源 plc_core 变量快照 (mutex 拷贝,
+ *  与 RPC 0x007A 同源; PLC 状态面无需走 config_cb 写保护)。
+ * ===================================================================== */
+static UA_StatusCode
+opcua_plc_readvar_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionContext,
+                     const UA_NodeId *methodId, void *methodContext,
+                     const UA_NodeId *objectId, void *objectContext,
+                     size_t inputSize, const UA_Variant *input,
+                     size_t outputSize, UA_Variant *output)
+{
+    (void)server; (void)sessionId; (void)sessionContext;
+    (void)methodId; (void)methodContext; (void)objectId; (void)objectContext;
+    (void)outputSize;
+    if (inputSize != 1 || !UA_Variant_hasScalarType(&input[0], &UA_TYPES[UA_TYPES_STRING]))
+        return UA_STATUSCODE_BADINVALIDARGUMENT;
+
+    /* 变量名大写规范化 (ST 变量名存储为大写) */
+    char name[40];
+    size_t nlen = ((UA_String *)input[0].data)->length;
+    if (nlen == 0 || nlen >= sizeof(name)) nlen = sizeof(name) - 1;
+    for (size_t i = 0; i < nlen; i++) {
+        char c = ((const char *)((UA_String *)input[0].data)->data)[i];
+        name[i] = (char)((c >= 'a' && c <= 'z') ? c - 'a' + 'A' : c);
+    }
+    name[nlen] = '\0';
+
+    PlcVarSnap_t snaps[PLC_USER_VAR_MAX + 4];
+    int n_total = 0;
+    int nsnap = plc_core_snapshot_vars(snaps, PLC_USER_VAR_MAX + 4, &n_total);
+    double val = 0.0;
+    UA_Int32 ret = -1;
+    for (int i = 0; i < nsnap; i++) {
+        if (strcmp(snaps[i].name, name) == 0) {
+            val = snaps[i].value;
+            ret = 0;
+            break;
+        }
+    }
+    UA_Double dv = val;
+    UA_Variant_setScalarCopy(&output[0], &dv, &UA_TYPES[UA_TYPES_DOUBLE]);
+    UA_Variant_setScalarCopy(&output[1], &ret, &UA_TYPES[UA_TYPES_INT32]);
+    return UA_STATUSCODE_GOOD;
+}
+
+/* ReadVar 注册 (专用 helper: 2 出参 Double+Int32, 既有 helper 均单出参) */
+static UA_StatusCode
+add_plc_readvar_method(UA_Server *s, const char *id_suffix, const UA_NodeId parent,
+                       const char *browse_name, const char *desc)
+{
+    OpcNodeCtx *ctx = mtd_ctx_new(OM_PLC_READVAR);
+    if (!ctx) {
+        fprintf(stderr, "[opcua] add method %s fail: ctx pool exhausted\n", id_suffix);
+        return UA_STATUSCODE_BADINTERNALERROR;
+    }
+    char nodeid_str[128];
+    snprintf(nodeid_str, sizeof(nodeid_str), "CNC.%s", id_suffix);
+
+    UA_MethodAttributes ma;
+    UA_MethodAttributes_init(&ma);
+    ma.displayName = UA_LOCALIZEDTEXT("en-US", (char *)browse_name);
+    ma.description = UA_LOCALIZEDTEXT("en-US", (char *)desc);
+    ma.executable = true;
+    ma.userExecutable = true;
+
+    UA_Argument in_arg;
+    UA_Argument_init(&in_arg);
+    in_arg.name = UA_STRING((char *)"name");
+    in_arg.description = UA_LOCALIZEDTEXT("en-US", (char *)"PLC variable name (case-insensitive)");
+    in_arg.dataType = UA_TYPES[UA_TYPES_STRING].typeId;
+    in_arg.valueRank = -1;
+
+    UA_Argument out_args[2];
+    UA_Argument_init(&out_args[0]);
+    out_args[0].name = UA_STRING((char *)"value");
+    out_args[0].description = UA_LOCALIZEDTEXT("en-US", (char *)"variable value");
+    out_args[0].dataType = UA_TYPES[UA_TYPES_DOUBLE].typeId;
+    out_args[0].valueRank = -1;
+    UA_Argument_init(&out_args[1]);
+    out_args[1].name = UA_STRING((char *)"ret");
+    out_args[1].description = UA_LOCALIZEDTEXT("en-US", (char *)"0=found / -1=not found");
+    out_args[1].dataType = UA_TYPES[UA_TYPES_INT32].typeId;
+    out_args[1].valueRank = -1;
+
+    UA_StatusCode sc = UA_Server_addMethodNode(
+        s,
+        UA_NODEID_STRING(OPCUA_NAMESPACE_INDEX, nodeid_str),
+        parent,
+        UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+        UA_QUALIFIEDNAME(OPCUA_NAMESPACE_INDEX, (char *)browse_name),
+        ma, opcua_plc_readvar_cb,
+        1, &in_arg, 2, out_args,
+        ctx, NULL);
+    if (sc != UA_STATUSCODE_GOOD)
+        fprintf(stderr, "[opcua] add method node %s fail: 0x%08x\n", nodeid_str, sc);
     return sc;
 }
 
@@ -1679,6 +1884,47 @@ static void build_laser_nodes(UA_Server *s, const UA_NodeId ns_cnc)
     }
 }
 
+/* @Context: Non-RealTime Background Thread (server 线程启动期一次)
+ * P1-5 (2026-09-12): CNC.PLC watch 面 — 契约 §12。
+ * 13 只读变量 (plc_core status / F-G 区镜像) + ReadVar 方法 (watch 用户变量)。
+ * ctx 池余量: 变量 ~129+13=142/192 OK; 方法 ~26+1=27/32 OK。 */
+static void build_plc_nodes(UA_Server *s, const UA_NodeId ns_cnc)
+{
+    UA_NodeId ns_plc = add_obj(s, "CNC.PLC", ns_cnc,
+            UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT), "PLC");
+
+    add_var(s, "PLC.State",         ns_plc, "State",         &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_STATE,     -1, false, -1);
+    add_var(s, "PLC.NVars",         ns_plc, "NVars",         &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_NVARS,     -1, false, -1);
+    add_var(s, "PLC.NStmts",        ns_plc, "NStmts",        &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_NSTMTS,    -1, false, -1);
+    add_var(s, "PLC.TextLen",       ns_plc, "TextLen",       &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_TEXTLEN,   -1, false, -1);
+    add_var(s, "PLC.Heartbeat",     ns_plc, "Heartbeat",     &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_HEARTBEAT, -1, false, -1);
+    add_var(s, "PLC.CycleUs",       ns_plc, "CycleUs",       &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_CYCLE_US,  -1, false, -1);
+    add_var(s, "PLC.ErrLine",       ns_plc, "ErrLine",       &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_ERR_LINE,  -1, false, -1);
+    add_var(s, "PLC.ErrMsg",        ns_plc, "ErrMsg",        &UA_TYPES[UA_TYPES_STRING].typeId, OV_PLC_ERR_MSG,   -1, false, -1);
+    add_var(s, "PLC.FPeripheralOk", ns_plc, "FPeripheralOk", &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_F_PERIPHERAL_OK, -1, false, -1);
+    add_var(s, "PLC.FStatus",       ns_plc, "FStatus",       &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_F_STATUS,  -1, false, -1);
+    add_var(s, "PLC.FMcodeFin",     ns_plc, "FMcodeFin",     &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_F_MCODE_FIN, -1, false, -1);
+    add_var(s, "PLC.GMcode",        ns_plc, "GMcode",        &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_G_MCODE,   -1, false, -1);
+    add_var(s, "PLC.GMcodeStrobe",  ns_plc, "GMcodeStrobe",  &UA_TYPES[UA_TYPES_INT32].typeId,  OV_PLC_G_MCODE_STROBE, -1, false, -1);
+
+    add_plc_readvar_method(s, "PLC.ReadVar", ns_plc, "ReadVar",
+                           "read PLC user variable value by name");
+
+    /* P1.5-2: Force 族 (config-style Int32 出参; 写保护白名单见 cb 闸门) */
+    {
+        UA_Argument in[3] = {
+            arg_in_string("name", "PLC variable name (case-insensitive)"),
+            arg_in_double("val",  "forced value"),
+            arg_in_int32("on",    "1=force 0=release"),
+        };
+        add_config_method(s, "PLC.ForceVar", ns_plc, "ForceVar",
+                          "force PLC user variable (output-force semantics)",
+                          OM_PLC_FORCEVAR, in, 3);
+    }
+    add_config_method(s, "PLC.ForceClear", ns_plc, "ForceClear",
+                      "clear all PLC variable forces", OM_PLC_FORCECLEAR, NULL, 0);
+}
+
 /* @Context: Non-RealTime Background Thread (server 线程启动期一次) */
 static void build_address_space(UA_Server *s)
 {
@@ -1799,6 +2045,7 @@ static void build_address_space(UA_Server *s)
 
     /* ---- Laser: CNC.Laser 激光面 (契约 §11, 2026-09-03) ---- */
     build_laser_nodes(s, ns_cnc);
+    build_plc_nodes(s, ns_cnc);      /* P1-5: CNC.PLC watch 面 */
 }
 
 /* =====================================================================
