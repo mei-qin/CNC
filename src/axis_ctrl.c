@@ -5,10 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 #include "planner.h"
 #include "gcode_parser.h"
 #include "preview_streamer.h"   /* P0-b v1: PreviewStreamer_Push */
 #include "event_logger.h"       /* P0-1: EventLogger_Push + SEVERITY_* (homing/jog 事件) */
+#include "block_timing.h"       /* 论文1 S10: block 级计时插桩 (bt_stamp_segment) */
 /************************ 全局变量定义（仅轴相关，其余在ecat_core.c） ************************/
 AxisCtrl_t g_axis[AXIS_NUM];            // 五轴核心数组，全局唯一定义
 int g_axis_map[26];                     // 动态轴映射表：'A'-'Z' → 轴索引，-1=未映射
@@ -194,6 +196,25 @@ void wait_motion_done(){
 // @Safe: 阻塞等待允许; 有超时上限, 不会永久挂死。
 // ===================================================================
 #define MOTION_START_TIMEOUT_MS 500
+
+// ===================================================================
+// G93 可行性判定的相对容差 (2026-09-19, S5 γ=0.90 block3/4 异常根因修复)
+// @Why: 判定式 `req_v > max_speed` 无容差, 而 req_v 是从 NC 文本反推出来的
+//   (v_req = dist_total / (60/F), 见 gcode_parser.c:2485-2488), 携带 NC 文本
+//   量化的相对误差: F 字写盘 4 位小数 (≈52 ⇒ ≈1e-6)、坐标写盘 4 位小数
+//   (≈58mm ⇒ ≈1e-6), 再加上 dist/axis_ratio 的 sqrt 往返。
+//   当 v_cmd 恰好等于硬限时 (S5 的 v_cmd=50 == X max_speed=50), "是否越限"
+//   就由这个 1e-6 级的舍入决定 ⇒ 同一个程序的不同块随机掉出严格模式。
+//   实测 (s5_g090_vprobe): 翻转阈值落在 X 限 ∈ (50.00001, 50.0001],
+//   即需求速度的相对越界 ∈ (2e-7, 2e-6]。
+// @语义: req_v == max_speed 是**可行**的 (不超限)。容差只把"相等"这件事判稳,
+//   不放松任何真实越限 (r 明显 >1 的判定逐位不变)。
+// @取值: 1e-5 相对 = 50 mm/s 时 5e-4 mm/s, 比实测上界 2e-6 留 5× 裕度,
+//   且远低于任何伺服/编码器可分辨的量 (0.001% 级)。
+// @Scope: 仅 G93 严格模式的可行性预检 (第三步.5)。第四步的短板限幅是连续
+//   缩放 (r = max/req → 1.0), 无断崖, 不受影响, 保持原样。
+// ===================================================================
+#define G93_FEAS_REL_EPS 1e-5
 void wait_motion_settle(void){
     int waited = 0;
     while(!atomic_load_explicit(&g_interpolator.is_moving, memory_order_acquire)
@@ -283,13 +304,142 @@ void api_move_relative(int axis_idx,double distance,double speed){
 }
 
 
-// 前向声明: 静态实现函数,所有公开包装器均调用此函数。
+/* ---- 论文1 B0′ 消融开关 (复审 P06 终解, 2026-09-17) ----
+ * g_g93_f_inherit=1: 禁用 IV-B 时间再分配 (F-inheritance 回退) — 每个微段
+ * 直接继承所属块的进给字 (dt = 整块 T_b 而非 T_b/n_b) → τ_b = n_b·T_b,
+ * 即经典 E2 陷阱 (基线 B0) 的可执行复现。分配点守卫 (3 处):
+ *   gcode_parser.c  RTCP 直线 / 圆弧的 dt_per_seg, bspline_engine.c 批内均分。
+ * 仅实验用: 默认 0; 程序运行中禁止切换 (SMC_ConfigG93Ablation 拒绝 is_running)。 */
+int g_g93_f_inherit = 0;
+
+/* ---- 论文1 B2 消融开关 (S3 planner-rate-limiting 战役, 2026-09-19) ----
+ * g_g93_strict_off=1: 关闭 G93 强一致性豁免 (is_g93_strict 强制为 0) →
+ *   下游 planner 对每段执行完整短板效应限幅 (常规 G94 路径) → 时间契约被
+ *   轴硬限速覆盖, 即基线 B2 的可执行复现 (E3 机制实证案例)。
+ * 仅实验用: 默认 0 (出厂 = Ours 强一致路径, 行为零变化)。
+ * 程序运行中禁止切换 (SMC_ConfigG93StrictOff 拒绝 is_running)。 */
+int g_g93_strict_off = 0;
+
+/* ---- 论文1 H1 消融开关 (S10 框架消融战役, 2026-09-20) ----
+ * g_g93_tip_basis=1: G93 的需求速率改按刀尖欧氏长度 L^P 反推 (旋转轴按等效
+ *   半径折算的行程**不计入** dist_total) ⇒ parser 下发的 speed = L^P/T 而非
+ *   L^M/T。执行侧不变 (G93 strict 段 v_const = dist/T 时间驱动), 但第三步.5
+ *   可行性门的 req_v 被低估 m = L^M/L^P 倍 ⇒ 门在真实需求已越限时仍判可行,
+ *   绑定轴实际跑到 m·v_ref 并突破硬限速。
+ * 仅实验用: 默认 0 (出厂 = IV-A 物理基, 行为零变化)。
+ * 程序运行中禁止切换 (SMC_ConfigG93TipBasis 拒绝 is_running)。 */
+int g_g93_tip_basis = 0;
+
+/* ---- 论文1 M1 替代设计: 事后修正 (2026-09-18) ----
+ * g_g93_posthoc=1: 关闭 IV-D 的先验长度重标定 (L_act/L_prog 与弧长 sweep
+ * ratio), 段按标称 T 执行; 段末按实测 v_act 累积"速度赤字"
+ *   debt += (v_cmd − v_act),  v_cmd = L_prog/T,  v_act = L_act/τ
+ * 并把赤字补偿到下一段: T_{b+1}^{eff} = L_prog_{b+1} / (v_cmd + debt)。
+ * 这是"先测量再修正"的可执行复现 —— 用于验证聚合指标可被事后修正救回、
+ * 而段内功率密度失配不可。分配点守卫: cutter_comp.c LINE 体
+ * (cutter_emit_line_scaled) 与 ARC 体 (discretize_offset_arc)。
+ * 仅实验用: 默认 0; 运行中禁止切换 (SMC_ConfigG93Posthoc 拒绝 is_running)。 */
+int    g_g93_posthoc = 0;
+double g_g93_posthoc_debt = 0.0;   /* mm/s, 累积速度赤字 */
+
+void api_g93_posthoc_reset(void) { g_g93_posthoc_debt = 0.0; }
+
+/* ---- 论文1 V2 仿真战役 (2026-09-18): IV-D 长度比重标定 关闭开关 ----
+ * g_g93_ratio_off=1: Naive 基线 T'=T (不按 L_act/L_prog 重标定)。
+ * 用于 S5 (E4 γ 扫描) 的 Naive vs Proposed 实测对照 —— Naive 下
+ *   v_act/v_cmd = L_act/L_prog = γ  (E4 的解析预测),
+ * Proposed (默认) 下 v_act/v_cmd ≡ 1。
+ * 仅实验用: 默认 0 = 生产行为 (IV-D 重标定生效); 运行中禁止切换。 */
+int g_g93_ratio_off = 0;
+
+/* ---- 论文1 N22 (2026-09-17): enqueue 临界区耗时统计 ----
+ * 计时范围 = api_push_trajectory_impl_inner 全体 (安全检查 + strict 剖面
+ * 预计算 + SPSC 入队), 即论文 V-C "enqueue critical section" 的实测口径。
+ * 写者: parser + bspline 线程 (双写者, 与 g_seg_id_counter 同前提);
+ * 读者: RPC 线程。relaxed 原子 RMW — ARM-safe; max 用 CAS, 竞态丢一次
+ * 更新对统计无害。单位: count 无量纲, 累计 ns。 */
+static _Atomic uint64_t g_enq_count_all     = 0;
+static _Atomic uint64_t g_enq_ns_all        = 0;
+static _Atomic uint64_t g_enq_count_strict  = 0;
+static _Atomic uint64_t g_enq_ns_strict     = 0;
+static _Atomic uint64_t g_enq_ns_max_strict = 0;
+
+// @Thread-Safety: RPC 线程调用; 与写者 relaxed 竞态, 清零瞬间最多丢一笔统计。
+void api_enqueue_stats_reset(void)
+{
+    atomic_store_explicit(&g_enq_count_all, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_enq_ns_all, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_enq_count_strict, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_enq_ns_strict, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_enq_ns_max_strict, 0, memory_order_relaxed);
+}
+
+// @Thread-Safety: relaxed 快照读; mean 在读者侧由 count/ns 商出 (除零已护)。
+void api_enqueue_stats_get(uint64_t *count_all, uint64_t *count_strict,
+                           double *mean_us_all, double *mean_us_strict,
+                           double *max_us_strict)
+{
+    uint64_t ca  = atomic_load_explicit(&g_enq_count_all, memory_order_relaxed);
+    uint64_t na  = atomic_load_explicit(&g_enq_ns_all, memory_order_relaxed);
+    uint64_t cs  = atomic_load_explicit(&g_enq_count_strict, memory_order_relaxed);
+    uint64_t nss = atomic_load_explicit(&g_enq_ns_strict, memory_order_relaxed);
+    uint64_t mx  = atomic_load_explicit(&g_enq_ns_max_strict, memory_order_relaxed);
+    if (count_all)      *count_all = ca;
+    if (count_strict)   *count_strict = cs;
+    if (mean_us_all)    *mean_us_all = ca ? (double)na / (double)ca / 1000.0 : 0.0;
+    if (mean_us_strict) *mean_us_strict = cs ? (double)nss / (double)cs / 1000.0 : 0.0;
+    if (max_us_strict)  *max_us_strict = (double)mx / 1000.0;
+}
+
+// 前向声明: 静态实现函数 (原逻辑零改动), 计时包装器转调。
+static int api_push_trajectory_impl_inner(double target_pos[AXIS_NUM],
+                                          double speed_sec_mm, double acc_sec_mm,
+                                          double dec_sec_mm, int is_g93_strict,
+                                          double g93_dt_sec, int is_fillet,
+                                          int is_rtcp_active, CoordSystem_t wcs,
+                                          const double wcs_offset_snap[AXIS_NUM],
+                                          int is_g93_slice);
+
+// @Context: Non-RealTime Background Thread (parser + bspline 双写者)
+// @Thread-Safety: 计数器 _Atomic relaxed (见上); 传参透传, 无新增共享状态。
+// 论文1 N22: 同名计时包装器接管全部 7 个公开入队入口 — impl 本体零侵入。
 static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
-                                     double speed_sec_mm, double acc_sec_mm,
-                                     double dec_sec_mm, int is_g93_strict,
-                                     double g93_dt_sec, int is_fillet,
-                                     int is_rtcp_active, CoordSystem_t wcs,
-                                     const double wcs_offset_snap[AXIS_NUM]);
+                                    double speed_sec_mm, double acc_sec_mm,
+                                    double dec_sec_mm, int is_g93_strict,
+                                    double g93_dt_sec, int is_fillet,
+                                    int is_rtcp_active, CoordSystem_t wcs,
+                                    const double wcs_offset_snap[AXIS_NUM],
+                                    int is_g93_slice)
+{
+    struct timespec ts0, ts1;
+    int ret;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    ret = api_push_trajectory_impl_inner(target_pos, speed_sec_mm, acc_sec_mm,
+                                         dec_sec_mm, is_g93_strict, g93_dt_sec,
+                                         is_fillet, is_rtcp_active, wcs,
+                                         wcs_offset_snap, is_g93_slice);
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+
+    uint64_t ns = (uint64_t)(ts1.tv_sec - ts0.tv_sec) * 1000000000u
+                + (uint64_t)(ts1.tv_nsec - ts0.tv_nsec);
+    atomic_fetch_add_explicit(&g_enq_count_all, 1, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_enq_ns_all, ns, memory_order_relaxed);
+    if (is_g93_strict && g93_dt_sec > 1e-9) {
+        uint64_t prev = atomic_load_explicit(&g_enq_ns_max_strict,
+                                             memory_order_relaxed);
+        while (ns > prev &&
+               !atomic_compare_exchange_weak_explicit(&g_enq_ns_max_strict,
+                                                      &prev, ns,
+                                                      memory_order_relaxed,
+                                                      memory_order_relaxed)) {
+            /* CAS 失败时 prev 已被刷新为当前最大, 继续重试 */
+        }
+        atomic_fetch_add_explicit(&g_enq_count_strict, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_enq_ns_strict, ns, memory_order_relaxed);
+    }
+    return ret;
+}
 
 // @Context: Non-RealTime Background Thread (parser / bspline 入队前调用)
 // @Thread-Safety: 读 g_coord_mgr.work_offsets + g_state.local_offset — 仅在 parser 线程或 setup API 上下文调用。
@@ -356,7 +506,7 @@ int api_push_trajectory(double target_pos[AXIS_NUM],
     snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
                                      acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 0,
-                                     g_state.modal_wcs, snap);
+                                     g_state.modal_wcs, snap, 0);
 }
 
 // @Context: Non-RealTime Background Thread (parser / bspline)
@@ -371,7 +521,24 @@ int api_push_trajectory_g93(double target_pos[AXIS_NUM],
     snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
                                      acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0,
-                                     g_state.modal_wcs, snap);
+                                     g_state.modal_wcs, snap, 0);
+}
+
+// @Context: Non-RealTime Background Thread (parser, RTCP 打碎路径专用)
+// @Thread-Safety: Lock-Free SPSC 队列 (假设生产者串行调用)
+// F4 (2026-09-19): 与 api_push_trajectory_g93 完全相同, 仅多带 is_g93_slice=1,
+//   供 axis_ctrl 识别"本段是 RTCP G93 时间切分产生的微段"。
+//   可行性回退时据此前述恒速通过, 避免逐微段 0→v→0 造成的爬行 (S0 B4 实测 46.7x)。
+//   详见 inc/axis_ctrl.h 中同名声明处的 @Why/@Fix/@Scope 说明。
+int api_push_trajectory_g93_slice(double target_pos[AXIS_NUM],
+                                   double speed_sec_mm, double acc_sec_mm,
+                                   double dec_sec_mm, double g93_dt_sec)
+{
+    double snap[AXIS_NUM];
+    snapshot_wcs_offset(g_state.modal_wcs, snap);
+    return api_push_trajectory_impl(target_pos, speed_sec_mm,
+                                     acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0,
+                                     g_state.modal_wcs, snap, 1);
 }
 
 // @Context: Non-RealTime Background Thread (bspline)
@@ -386,7 +553,7 @@ int api_push_trajectory_passthrough(double target_pos[AXIS_NUM],
     snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
                                      acc_sec_mm, dec_sec_mm, 0, 0.0, 1, 0,
-                                     g_state.modal_wcs, snap);
+                                     g_state.modal_wcs, snap, 0);
 }
 
 // @Context: Non-RealTime Background Thread (bspline 专用)
@@ -400,7 +567,7 @@ int api_push_trajectory_passthrough_wcs(double target_pos[AXIS_NUM],
 {
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
                                      acc_sec_mm, dec_sec_mm, 0, 0.0, 1, 0,
-                                     wcs, wcs_offset_snap);
+                                     wcs, wcs_offset_snap, 0);
 }
 
 // @Context: Non-RealTime Background Thread (bspline 专用)
@@ -414,7 +581,7 @@ int api_push_trajectory_g93_wcs(double target_pos[AXIS_NUM],
 {
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
                                      acc_sec_mm, dec_sec_mm, 1, g93_dt_sec, 1, 0,
-                                     wcs, wcs_offset_snap);
+                                     wcs, wcs_offset_snap, 0);
 }
 
 // @Context: Non-RealTime Background Thread (刀补引擎专用, parser_thread 调用)
@@ -437,7 +604,7 @@ int api_push_trajectory_cutter(double target_pos[AXIS_NUM],
                                      is_g93_strict, g93_dt_sec,
                                      1,  // is_fillet
                                      0,  // is_rtcp_active
-                                     g_state.modal_wcs, snap);
+                                     g_state.modal_wcs, snap, 0);
 }
 
 // @Context: Non-RealTime Background Thread (RTCP 路径专用)
@@ -453,7 +620,7 @@ int api_push_trajectory_rtcp(double target_pos[AXIS_NUM],
     snapshot_wcs_offset(g_state.modal_wcs, snap);
     return api_push_trajectory_impl(target_pos, speed_sec_mm,
                                      acc_sec_mm, dec_sec_mm, 0, 0.0, 0, 1,
-                                     g_state.modal_wcs, snap);
+                                     g_state.modal_wcs, snap, 0);
 }
 
 // @Context: Non-RealTime Background Thread (parser / 上层管理线程)
@@ -547,13 +714,93 @@ static void emit_resume_prelude(const double target_pos[AXIS_NUM])
     }
 }
 
-static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
-                                     double speed_sec_mm, double acc_sec_mm,
-                                     double dec_sec_mm,
-                                     int is_g93_strict, double g93_dt_sec,
-                                     int is_fillet, int is_rtcp_active,
-                                     CoordSystem_t wcs,
-                                     const double wcs_offset_snap[AXIS_NUM])
+/* ---- G93 jerk-bounded 转移剖面 (论文1 IV-E, 2026-09-16) ----
+ * 问题: 严格剖面 (IV-C) 在相邻不同 v_cmd 严格块边界产生瞬时速度阶跃。
+ * 解: 约束驱动分段 S 曲线族内的闭式转移 — Lemma 1 (对称 ramp 面积 =
+ * t(α+β)/2) + Theorem 1 (精确时间模式的巡航超速闭式解)。
+ * 阶梯: ① exact (加速边界, 超速在激光安全侧) → ② debt (减速边界,
+ * 巡航钉 v_c, 签名时长修正 |δ|≤ε_t) → ③ step (IV-C 退化, 现行为)。
+ * 恒 F 链 u=w=v_c → 全走退化分支 → 对既有测试零回归。
+ * 配置: RPC 0x007B (enable/ε_v/ε_t); 链状态: 上一严格块 v_cmd,
+ * 非严格运动入队即断链; 程序启动时 api_g93_jerk_reset 清零。 */
+int    g_g93_jerk_enable = 1;      /* 0=完全退化为 IV-C 行为 */
+double g_g93_jerk_eps_v  = 5.0;    /* exact 模式瞬时超速上限 (% v_cmd) */
+double g_g93_jerk_eps_t  = 2.0;    /* debt 模式时长修正上限 (% T) */
+static double g_g93_last_vcmd = -1.0;   /* mm/ms; -1 = 无链 (静止起点) */
+
+void api_g93_jerk_reset(void) { g_g93_last_vcmd = -1.0; }
+
+// 三角加速度双-S 对称 ramp 的最小时长 (mm/ms 单位); 返回 -1 = 不可行
+static double g93_t_ramp_min(double dv, double acc, double jerk)
+{
+    if (dv < 1e-12) return 0.0;
+    if (acc <= 1e-12 || jerk <= 1e-12) return -1.0;
+    double t_acc = 2.0 * dv / acc;             /* 峰值加速度约束: a=2dv/t */
+    double t_jrk = 2.0 * sqrt(dv / jerk);      /* 峰值 jerk 约束: j=4dv/t² */
+    return (t_jrk > t_acc) ? t_jrk : t_acc;
+}
+
+// 填充 7 相剖面 (T1..T7 = 累计边界), ramp = 对称三角加速度双-S。
+// 守恒由构造保证: A_up + v_h·t_c + A_dn == dist (调用方传入的参数满足)。
+static void g93_fill_phases(TrajectorySegment_t *seg,
+                            double u, double v_h, double w,
+                            double t_up, double t_cruise, double t_dn,
+                            double dist)
+{
+    double du = v_h - u;                        /* 入口 ramp 速度增量 */
+    double dw = v_h - w;                        /* 出口 ramp 速度减量 (w≤v_h) */
+    double h_up = t_up / 2.0, h_dn = t_dn / 2.0;
+    double j_up = (t_up > 1e-12) ? 4.0 * du / (t_up * t_up) : 0.0;
+    double j_dn = (t_dn > 1e-12) ? -4.0 * dw / (t_dn * t_dn) : 0.0;
+    double A_up = t_up * (u + v_h) / 2.0;
+    double A_dn = t_dn * (v_h + w) / 2.0;
+
+    /* 相位时长累计边界 */
+    double T1 = h_up;
+    double T2 = h_up;                            /* T2 段长 0 (三角加速度) */
+    double T3 = t_up;
+    double T4 = t_up + t_cruise;
+    double T5 = T4 + h_dn;
+    double T6 = T5;                              /* T6 段长 0 */
+    double T7 = T4 + t_dn;
+
+    seg->T1=T1; seg->T2=T2; seg->T3=T3; seg->T4=T4;
+    seg->T5=T5; seg->T6=T6; seg->T7=T7;
+
+    seg->v0 = u;
+    seg->v1 = u + du / 2.0;   seg->v2 = seg->v1;
+    seg->v3 = v_h;            seg->v4 = v_h;
+    seg->v5 = v_h - dw / 2.0; seg->v6 = seg->v5;
+
+    seg->s0 = 0.0;
+    seg->s1 = u * h_up + du * t_up / 12.0;
+    seg->s2 = seg->s1;
+    seg->s3 = A_up;
+    seg->s4 = A_up + v_h * t_cruise;
+    seg->s5 = seg->s4 + v_h * h_dn - dw * t_dn / 12.0;
+    seg->s6 = seg->s5;
+
+    seg->j1 = j_up;
+    seg->a2 = (t_up > 1e-12) ? 2.0 * du / t_up : 0.0;
+    seg->j3 = -j_up;
+    seg->j5 = j_dn;                              /* 减速: dw>0 → j5<0 */
+    seg->a6 = (t_dn > 1e-12) ? -2.0 * dw / t_dn : 0.0;
+    seg->j7 = -j_dn;
+
+    seg->v_start = u;
+    seg->v_end   = w;
+    seg->v_max   = (v_h > w && v_h > u) ? v_h : ((u > w) ? u : w);
+    (void)dist;   /* 末点 s7 = A_up+v_h·t_c+A_dn = dist 由守恒构造保证 */
+}
+
+static int api_push_trajectory_impl_inner(double target_pos[AXIS_NUM],
+                                          double speed_sec_mm, double acc_sec_mm,
+                                          double dec_sec_mm,
+                                          int is_g93_strict, double g93_dt_sec,
+                                          int is_fillet, int is_rtcp_active,
+                                          CoordSystem_t wcs,
+                                          const double wcs_offset_snap[AXIS_NUM],
+                                          int is_g93_slice)
 {
     if(atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire)==1) {
         printf("[SAFETY] 系统报警中，拒绝入队运动指令！\n");
@@ -738,15 +985,62 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
         dir_vec[i] = (dist > 1e-6) ? delta_mm[i] / dist : 0.0;
     }
 
+    // ---- 第三步.5：G93 强一致可行性预检 (S3 planner-rate-limiting 战役, 2026-09-19) ----
+    // @Why: Ours/strict 仅当"所有轴需求速度 ≤ 硬上限"时才保持时间预算;
+    //   否则该段时间契约真实不可行 (硬轴限速无法被时间契约覆盖) → 回退到
+    //   常规限速 (绝不静默超过硬上限), 由上层标 feasible=0 留给 S4 处理。
+    // @Match: 此处投影算法与下方短板上限环完全一致, 故得到的 r 与测量脚本
+    //   按几何反推的 r = v_demand/v_limit 逐值相等 (speed-only 判定, 因
+    //   strict 段恒为匀速, acc/dec/jerk 限幅本就被豁免, 不会绑定)。
+    int g93_infeasible = 0;
+    int strict_requested = (is_g93_strict && !g_g93_strict_off && g93_dt_sec > 1e-9);
+    if (strict_requested) {
+        double fr = 1.0;
+        for (int i = 0; i < AXIS_NUM; i++) {
+            if (fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
+            double axis_ratio_mm = fabs(delta_mm[i]) / dist;
+            double req_v_mm = speed_sec_mm * axis_ratio_mm;
+            double req_v;
+            if (g_axis[i].axis_type == 1 && g_axis[i].equivalent_radius > 0.0) {
+                req_v = req_v_mm / (DEG_TO_RAD * g_axis[i].equivalent_radius);
+            } else {
+                req_v = req_v_mm;
+            }
+            // 2026-09-19: 加相对容差 —— req_v == max_speed 语义上可行,
+            //   无容差会让"是否越限"被 NC 文本量化的 1e-6 级舍入决定
+            //   (详见 G93_FEAS_REL_EPS 处注释)。
+            double lim_v = g_axis[i].max_speed * (1.0 + G93_FEAS_REL_EPS);
+            if (g_axis[i].max_speed > 0.0 && req_v > lim_v) {
+                double t = g_axis[i].max_speed / req_v;
+                if (t < fr) fr = t;
+            }
+        }
+        if (fr < 1.0) g93_infeasible = 1;
+    }
+    int eff_strict = strict_requested && !g93_infeasible ? 1 : 0;
+
+    // ---- 第三步.6：F4 (2026-09-19) RTCP 时间切分微段的不可行回退策略 ----
+    // @Why: RTCP 的 G93 直线在 parser 端已按 n = ceil(T*1000) 切成 ~1ms 的微段,
+    //   **切分先于本可行性判定**。若此处判出不可行 (g93_infeasible=1), 常规
+    //   回退会让每个 1ms 微段各自做一次 0 → v → 0 的 S 曲线规划; 1ms 内
+    //   S_acc + S_dec >> S, planner 距离熔断把速度压到地板 ⇒ 宏观爬行。
+    //   实测 S0 B4: τ/T = 46.69 (正常限速只应 5.33)。
+    // @Fix: 该类微段改为**恒速通过** —— v_start = v_end = v_target, 且 v_target
+    //   已在下方第四步按绑定轴 max_speed 封顶。整块累积时长 = dist/v_capped = T·r,
+    //   峰值轴速恰为 max_speed, 绝不越限; 时间切分保留 ⇒ RTCP 几何保真不变。
+    // @Scope: 仅 is_g93_slice (RTCP 打碎) 段。非 RTCP 的 G93 整块段 (S3/S4 的
+    //   g93_nc_plain) 是单段, 回退即整块梯形, 本分支不触发, 行为逐位不变。
+    int g93_capped = (is_g93_slice && strict_requested && g93_infeasible) ? 1 : 0;
+
     // ---- 第四步：短板效应限幅（纯配置量运算，无需 mutex）----
-    // G93 强一致性模式: 完全豁免,保证刚性时间。
-    // 常规模式: 按各轴 max_* 配置等比例压低,避免单轴超载。
+    // G93 强一致性模式 (eff_strict=1): 完全豁免,保证刚性时间。
+    // 常规模式 (含 B2 消融 / strict 不可行回退): 按各轴 max_* 配置等比例压低,避免单轴超载。
     double final_speed_ratio = 1.0;
     double final_acc_ratio   = 1.0;
     double final_dec_ratio   = 1.0;
     double final_jerk_ratio  = 1.0;
 
-    if(!is_g93_strict){
+    if(!eff_strict){
         for(int i = 0; i < AXIS_NUM; i++){
             if(fabs(delta_mm[i]) < 0.0001 || dist < 1e-6) continue;
 
@@ -836,7 +1130,11 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     atomic_store_explicit(&seg->is_ready, 0, memory_order_relaxed);
     seg->cmd_type = CMD_TYPE_MOTION;
     seg->is_fillet = is_fillet ? 1 : 0;
-    seg->is_g93_strict = (is_g93_strict && g93_dt_sec > 1e-9) ? 1 : 0;
+    // F4: g93_capped 段虽已丢失"严格时间契约", 仍走恒速剖面 (速度已封顶),
+    //   故同样置 is_g93_strict=1 —— 使 planner 的全部 G93 豁免分支
+    //   (planner.c:189/738/795/810/843/872) 生效, 前瞻扫描不得改写其 v_start/v_end,
+    //   否则又会被压回 0→v→0 的爬行剖面。时间预算不再是 g93_dt_sec 而是 dist/v_capped。
+    seg->is_g93_strict = g93_capped ? 1 : eff_strict;
     seg->is_rtcp_active = is_rtcp_active ? 1 : 0;
     // P2-A-4: G09/G61 精准停盖章
     // modal_exact_stop: G61 模态开启 (后续段都精准停)
@@ -886,34 +1184,106 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->s4=0; seg->s5=0; seg->s6=0;
     seg->j1=0; seg->a2=0; seg->j3=0;
 
-    // ---- G93 强一致性预计算: 纯匀速 (T4=T_total, 加减速阶段全部为 0) ----
-    // 让 1ms 线程的绝对解析方程直接以恒定 v_target 走完整个 T_total,
-    // 不再受 planner 的 S 曲线限幅影响,绝对遵守 g93_dt_sec 时间预算。
+    // ---- G93 强一致性预计算 (论文1 IV-C/IV-E) ----
+    // IV-C 退化剖面: 纯匀速 (T4=T_total), 绝对遵守 g93_dt_sec 时间预算,
     // recompute_scurve_profile 检测到 is_g93_strict 后会跳过重算。
-    if(seg->is_g93_strict){
+    // IV-E 转移剖面 (2026-09-16): 相邻严格块 v_cmd 变化时, 在同一预算内
+    // 构造 jerk 受限的对称 ramp + 巡航剖面, 消除块间瞬时速度阶跃:
+    //   加速边界 → exact 模式 (Theorem 1 超速巡航, 激光安全侧)
+    //   减速边界 → debt  模式 (巡航钉 v_c, 签名时长修正 |δ|≤ε_t)
+    //   不可行   → step 退化 (IV-C 现行为 = 阶梯地板)
+    // 恒 F 链 u=w=v_c → ramp 时长为 0 → 逐字段退化为 IV-C, 零回归。
+    if(g93_capped){
+        // ---- F4: 不可行回退的 RTCP 微段 —— 恒速通过 (速度已按绑定轴封顶) ----
+        // 时长不再是 g93_dt_sec (那是"可行时"的时间契约), 而是真实物理时长
+        // dist / v_capped; 整块累积 = Σ(dist_i / v_c) = dist_block / v_capped = T·r。
+        // 纯 T4 巡航, 无 T1-T3/T5-T7, 与 IV-C 退化剖面同构 (故 planner 全部豁免分支适用)。
+        double v_c = seg->v_target;
+        if(v_c < 1e-9) v_c = 1e-9;
+        double T_ms = (v_c > 1e-9) ? (dist / v_c) : (g93_dt_sec * 1000.0);
+        if(T_ms < 1e-9) T_ms = 1e-9;
+        seg->T_total = T_ms;
+        seg->T1 = 0.0; seg->T2 = 0.0; seg->T3 = 0.0;
+        seg->T4 = T_ms; seg->T5 = T_ms; seg->T6 = T_ms; seg->T7 = T_ms;
+        seg->v_target = v_c; seg->v_start = v_c;
+        seg->v_end   = v_c;  seg->v_max   = v_c;
+        seg->v0 = v_c; seg->v1 = v_c; seg->v2 = v_c; seg->v3 = v_c;
+        seg->v4 = v_c; seg->v5 = v_c; seg->v6 = v_c;
+        seg->s0 = 0.0; seg->s1 = 0.0; seg->s2 = 0.0; seg->s3 = 0.0;
+        seg->s4 = dist; seg->s5 = dist; seg->s6 = dist;
+        seg->j1 = 0.0; seg->a2 = 0.0; seg->j3 = 0.0;
+        seg->j5 = 0.0; seg->a6 = 0.0; seg->j7 = 0.0;
+        g_g93_last_vcmd = v_c;   /* 恒速段: 维持 IV-E 链状态 */
+    } else if(seg->is_g93_strict){
         double T_total_ms = g93_dt_sec * 1000.0;
         double v_const = (T_total_ms > 1e-9) ? dist / T_total_ms : seg->v_target;
         if(v_const < 1e-9) v_const = 1e-9;
+        double u = (g_g93_last_vcmd >= 0.0) ? g_g93_last_vcmd : 0.0;
+        int mode = 2;   // 2=step (IV-C 退化)
 
-        seg->T_total = T_total_ms;
-        seg->T1 = 0.0; seg->T2 = 0.0; seg->T3 = 0.0;
-        seg->T4 = T_total_ms;
-        seg->T5 = T_total_ms; seg->T6 = T_total_ms; seg->T7 = T_total_ms;
-
-        seg->v_target = v_const;
-        seg->v_start  = v_const;
-        seg->v_end    = v_const;
-        seg->v_max    = v_const;
-        seg->v0 = v_const; seg->v1 = v_const; seg->v2 = v_const; seg->v3 = v_const;
-        seg->v4 = v_const; seg->v5 = v_const; seg->v6 = v_const;
-
-        seg->s0 = 0.0; seg->s1 = 0.0; seg->s2 = 0.0; seg->s3 = 0.0;
-        seg->s4 = dist; seg->s5 = dist; seg->s6 = dist;
-
-        seg->j1 = 0.0; seg->a2 = 0.0; seg->j3 = 0.0;
-        seg->j5 = 0.0; seg->a6 = 0.0; seg->j7 = 0.0;
+        if (g_g93_jerk_enable && T_total_ms > 20.0 && dist > 1e-6
+            && fabs(u - v_const) > 1e-9) {
+            double tu_min = g93_t_ramp_min(fabs(v_const - u), seg->acc, seg->jerk);
+            if (tu_min >= 0.0 && tu_min <= 0.5 * T_total_ms) {
+                if (u < v_const) {
+                    /* ---- exact 模式: (t_up,t_dn) 定点迭代 ≤3 轮 ---- */
+                    double t_up = tu_min, t_dn = 0.0, v_h = v_const;
+                    for (int it = 0; it < 3; it++) {
+                        double denom = 2.0 * T_total_ms - t_up - t_dn;
+                        /* w = v_const (边界规则: 出口交自身巡航) */
+                        v_h = v_const + t_up * (v_const - u) / denom;
+                        double tu2 = g93_t_ramp_min(fabs(v_h - u), seg->acc, seg->jerk);
+                        double td2 = g93_t_ramp_min(fabs(v_h - v_const), seg->acc, seg->jerk);
+                        if (tu2 < 0.0 || td2 < 0.0) { t_up = -1.0; break; }
+                        int done = (fabs(tu2 - t_up) < 1e-6 && fabs(td2 - t_dn) < 1e-6);
+                        t_up = tu2; t_dn = td2;
+                        if (done) break;
+                    }
+                    if (t_up >= 0.0 && t_up + t_dn <= 0.5 * T_total_ms
+                        && v_h <= v_const * (1.0 + g_g93_jerk_eps_v / 100.0)) {
+                        g93_fill_phases(seg, u, v_h, v_const,
+                                        t_up, T_total_ms - t_up - t_dn, t_dn, dist);
+                        seg->T_total = T_total_ms;
+                        seg->v_target = v_const;
+                        mode = 0;
+                    }
+                }
+                if (mode == 2) {
+                    /* ---- debt 模式: 巡航钉 v_c, 入口 ramp, 签名时长修正 ----
+                     * u < v_c: 时间债 (τ>T); u > v_c: 时间信用 (τ<T, 激光安全侧) */
+                    double short_area = tu_min * (v_const - u) / 2.0;
+                    double tau = T_total_ms + short_area / v_const;
+                    if (fabs(tau - T_total_ms) <= g_g93_jerk_eps_t / 100.0 * T_total_ms
+                        && tu_min <= 0.9 * T_total_ms) {
+                        g93_fill_phases(seg, u, v_const, v_const,
+                                        tu_min, tau - tu_min, 0.0, dist);
+                        seg->T_total = tau;
+                        seg->v_target = v_const;
+                        mode = 1;
+                    }
+                }
+            }
+        }
+        if (mode == 2) {
+            /* IV-C 退化剖面 */
+            seg->T_total = T_total_ms;
+            seg->T1 = 0.0; seg->T2 = 0.0; seg->T3 = 0.0;
+            seg->T4 = T_total_ms;
+            seg->T5 = T_total_ms; seg->T6 = T_total_ms; seg->T7 = T_total_ms;
+            seg->v_target = v_const; seg->v_start = v_const;
+            seg->v_end = v_const;    seg->v_max = v_const;
+            seg->v0 = v_const; seg->v1 = v_const; seg->v2 = v_const; seg->v3 = v_const;
+            seg->v4 = v_const; seg->v5 = v_const; seg->v6 = v_const;
+            seg->s0 = 0.0; seg->s1 = 0.0; seg->s2 = 0.0; seg->s3 = 0.0;
+            seg->s4 = dist; seg->s5 = dist; seg->s6 = dist;
+            seg->j1 = 0.0; seg->a2 = 0.0; seg->j3 = 0.0;
+            seg->j5 = 0.0; seg->a6 = 0.0; seg->j7 = 0.0;
+        }
+        g_g93_last_vcmd = v_const;   /* 链状态: 下一严格块的入口速度 */
+    } else {
+        g_g93_last_vcmd = -1.0;      /* 非严格运动入队 → 断链 */
+        seg->j5=0; seg->a6=0; seg->j7=0;   /* 初始化清零, planner 后填 */
     }
-    seg->j5=0; seg->a6=0; seg->j7=0;
 
     for(int i=0;i<AXIS_NUM;i++){
         plan_cursor[i]=target_pos[i];
@@ -928,6 +1298,10 @@ static int api_push_trajectory_impl(double target_pos[AXIS_NUM],
     seg->seg_id = atomic_fetch_add_explicit(&g_seg_id_counter, 1, memory_order_relaxed);
     seg->line_no = g_current_line_no;
     seg->motion_type = g_current_motion_type;
+    /* 论文1 S10 (2026-09-20): block 归属盖章 —— 未插桩路径得 uid=0, RT 忽略。
+     * 必须在 PreviewStreamer_Push 之前完成 (fork 副本要带上完整元数据)。 */
+    bt_stamp_segment(&seg->block_uid, &seg->block_seg_index, &seg->block_seg_count,
+                     &seg->block_budget_cmd_ms, &seg->block_budget_sum_ms);
     seg->seg_flags = g_state.laser_seg_flags;   // Laser B4: 引线/微连接段标记
     PreviewStreamer_Push(seg);
 

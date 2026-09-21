@@ -48,6 +48,16 @@ extern "C" {
 /* ---- 档案文件版本 ---- */
 #define PS_PROFILE_VERSION   1
 
+/* ---- P0-2 (2026-09-09): 激光互锁规则表条数上限 (与 smc_protocol.h LASER_IL_MAX 对齐,
+ *      kernel apply 侧 min() 双保险, 改任一必须同步另一处) ---- */
+#define PS_LASER_IL_MAX      8
+
+/* ---- P0-4a (2026-09-10): EtherCAT 期望拓扑表条数上限 (与 ecat_core.h ECAT_TOPO_MAX 对齐) ---- */
+#define PS_ECAT_TOPO_MAX     32
+
+/* ---- P1.5-1 (2026-09-14): 外围 AI 通道数上限 (与 periph_ai.h PERIPH_AI_CH_MAX 对齐) ---- */
+#define PS_PERIPH_AI_MAX     4
+
 /* ---- 审计事件 code (source = SOURCE_CONFIG, 见 event_logger.h 分段表) ---- */
 #define PS_EV_LOAD_OK        0x0001   /* profile 文件加载成功 */
 #define PS_EV_LOAD_FALLBACK  0x0002   /* 加载失败回退编译期默认 */
@@ -115,6 +125,25 @@ typedef struct {
     /* 回零全局 */
     char   homing_order[16];              /* "ZXYBC" */
     int    auto_on_init;
+    /* 激光互锁规则表 (立即级, P0-2 2026-09-09): count=0 = 内核默认 6 路链 */
+    int    laser_il_count;                /* 0..PS_LASER_IL_MAX */
+    int    laser_il_bit[PS_LASER_IL_MAX]; /* DI bit 0-15 */
+    int    laser_il_mask[PS_LASER_IL_MAX];/* interlock 置位码 (bit0-14) */
+    /* 激光 I/O 端子 PDO 布局 (立即级, P0-4a 2026-09-10): 默认 EL 级 16-bit */
+    int    laser_io_di_off, laser_io_di_bytes;   /* 0-63 / 1-2 */
+    int    laser_io_do_off, laser_io_do_bytes;
+    int    laser_io_ao_off, laser_io_ao_stride;  /* 0-63 / 2-4 */
+    /* 外围 AI 模拟输入 (立即级, P1.5-1 2026-09-14): 默认未配置 (count=0) */
+    int    periph_ai_slave;                      /* -1 / 0-63 */
+    int    periph_ai_off;                        /* byte 0-63 */
+    int    periph_ai_stride;                     /* 2/4 */
+    int    periph_ai_count;                      /* 0-4 */
+    double periph_ai_fs[PS_PERIPH_AI_MAX];       /* 每通道满量程 (<=0 未配) */
+    /* EtherCAT 期望拓扑 (重启级, P0-4a): bring-up 枚举后对照 SII vendor/product,
+     * 不符拒绝进 OP (防 slave 索引漂移: 增减/换序从站)。count=0 = 不校验 */
+    int    ecat_topo_count;                          /* 0..PS_ECAT_TOPO_MAX */
+    uint32_t ecat_topo_vendor[PS_ECAT_TOPO_MAX];     /* SII manufacturer, 0=通配 */
+    uint32_t ecat_topo_product[PS_ECAT_TOPO_MAX];    /* SII product code, 0=通配 */
 } MachineProfile_t;
 
 /* =====================================================================

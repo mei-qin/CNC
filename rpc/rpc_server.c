@@ -32,13 +32,19 @@
 #include "kinematics.h"
 #include "macro_eval.h"
 #include "snapshot_hub.h"      /* P0-a: SnapshotHub_Init */
+#include "periph_bus.h"        /* P0-1: PeriphBus_Init (软 PLC 地基) */
 #include "rpc_push_server.h"   /* P0-a: rpc_push_server_start */
 #include "preview_streamer.h"  /* P0-b v1: PreviewStreamer_Init */
 #include "rpc_preview_server.h" /* P0-b v1: rpc_preview_server_start */
 #include "event_logger.h"      /* P1-b: EventLogger_Init */
+#include "block_timing.h"      /* 论文1 S10: g_bt / bt_reset_all (RPC 0x0089) */
 #include "rpc_event_server.h"  /* P1-b: rpc_event_server_start */
 #include "opcua_server.h"      /* 契约 P4: opcua_server_start (OPC UA 4840 对外通道) */
 #include "param_store.h"       /* P1+P2: 机床参数档案 (kernel_init_hw 数据源) */
+#include "ecat_core.h"         /* P0-4a: ecat_set_expected_topo (拓扑校验) */
+#include "plc_core.h"          /* P1 软 PLC: plc_core_download/get_state (0x0076/0x0079) */
+#include "periph_ai.h"         /* P1.5-1: AI 通道 (0x007C/0x007D + init) */
+#include "plc_trace.h"         /* P1.5-3: Trace (0x007F-0x0081) */
 
 #define SMC_RPC_PORT      9527
 #define SMC_RPC_BACKLOG   8
@@ -538,6 +544,315 @@ static int handle_client_request(int client_fd)
         resp_payload_len = sizeof(SmcConfigLaserPierceTableRes);
         break;
     }
+    case SMC_CMD_CONFIG_LASER_INTERLOCK: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserInterlockReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserInterlockReq *req = (SmcConfigLaserInterlockReq *)payload;
+        SmcConfigLaserInterlockRes *res = (SmcConfigLaserInterlockRes *)resp_buf;
+        /* count/bit/mask 越界由 SMC_ConfigLaserInterlock 内部校验, 返回 -1 */
+        res->ret_code = SMC_ConfigLaserInterlock(req->rules, req->count);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserInterlockRes);
+        break;
+    }
+    case SMC_CMD_INJECT_LASER_DI: {
+        if (req_hdr.data_len < sizeof(SmcInjectLaserDiReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcInjectLaserDiReq *req = (SmcInjectLaserDiReq *)payload;
+        SmcInjectLaserDiRes *res = (SmcInjectLaserDiRes *)resp_buf;
+        res->ret_code = SMC_InjectLaserDi(req->pattern, req->enable);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcInjectLaserDiRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_LASER_PDO_LAYOUT: {
+        if (req_hdr.data_len < sizeof(SmcConfigLaserPdoLayoutReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigLaserPdoLayoutReq *req = (SmcConfigLaserPdoLayoutReq *)payload;
+        SmcConfigLaserPdoLayoutRes *res = (SmcConfigLaserPdoLayoutRes *)resp_buf;
+        res->ret_code = SMC_ConfigLaserPdoLayout(req->di_byte_off, req->di_bytes,
+                                                 req->do_byte_off, req->do_bytes,
+                                                 req->ao_byte_off, req->ao_stride,
+                                                 req->reserved);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigLaserPdoLayoutRes);
+        break;
+    }
+    case SMC_CMD_PLC_DOWNLOAD: {
+        /* Req 变长: 8B 头 + text_len 字节; 协议层 err 仅在头不完整时用 */
+        SmcPlcDownloadRes *res = (SmcPlcDownloadRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcDownloadRes);
+        if (req_hdr.data_len < sizeof(SmcPlcDownloadReqHead)) {
+            res->ret_code = -2;
+            break;
+        }
+        SmcPlcDownloadReqHead *h = (SmcPlcDownloadReqHead *)payload;
+        if (h->text_len < 1 || h->text_len > SMC_PLC_TEXT_MAX
+            || (size_t)h->text_len + sizeof(*h) > req_hdr.data_len) {
+            res->ret_code = -2;
+            break;
+        }
+        PlcDiag_t diags[SMC_PLC_DIAG_IN_RESP];
+        int nd = 0;
+        res->ret_code = plc_core_download((const char *)payload + sizeof(*h),
+                                          h->text_len, h->crc32,
+                                          diags, SMC_PLC_DIAG_IN_RESP, &nd);
+        if (res->ret_code == -1) {
+            int ncopy = (nd < SMC_PLC_DIAG_IN_RESP) ? nd : SMC_PLC_DIAG_IN_RESP;
+            res->n_diag_total = nd;
+            res->n_diag_included = ncopy;
+            memcpy(res->diags, diags, (size_t)ncopy * sizeof(SmcPlcDiag_t));
+            printf("[rpc] PLC 下载: 编译失败 ret=-1 诊断 %d 条 (首条: 行 %d %s)\n",
+                   nd, ncopy > 0 ? diags[0].line : -1,
+                   ncopy > 0 ? diags[0].msg : "");
+        } else {
+            printf("[rpc] PLC 下载: ret=%d\n", res->ret_code);
+        }
+        break;
+    }
+    case SMC_CMD_PLC_GET_STATE: {
+        SmcPlcGetStateRes *res = (SmcPlcGetStateRes *)resp_buf;
+        PlcCoreStatus_t st;
+        plc_core_get_status(&st);
+        res->state = st.state;
+        res->n_vars = st.n_vars;
+        res->n_stmts = st.n_stmts;
+        res->text_len = st.text_len;
+        res->heartbeat = st.heartbeat;
+        res->cycle_us = st.cycle_us;
+        res->err_line = st.err_line;
+        memset(res->err_msg, 0, sizeof(res->err_msg));
+        strncpy(res->err_msg, st.err_msg, sizeof(res->err_msg) - 1);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcGetStateRes);
+        break;
+    }
+    case SMC_CMD_PLC_CTRL: {
+        if (req_hdr.data_len < sizeof(SmcPlcCtrlReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcCtrlReq *req = (SmcPlcCtrlReq *)payload;
+        SmcPlcCtrlRes *res = (SmcPlcCtrlRes *)resp_buf;
+        res->ret_code = plc_core_ctrl(req->action);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcCtrlRes);
+        printf("[rpc] PLC ctrl: action=%d ret=%d\n", req->action, res->ret_code);
+        break;
+    }
+    case SMC_CMD_PLC_TEST_HOOK: {
+        if (req_hdr.data_len < sizeof(SmcPlcTestHookReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcTestHookReq *req = (SmcPlcTestHookReq *)payload;
+        SmcPlcTestHookRes *res = (SmcPlcTestHookRes *)resp_buf;
+        res->ret_code = plc_core_test_freeze(req->freeze_hb);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcTestHookRes);
+        break;
+    }
+    case SMC_CMD_CONFIG_PERIPH_AI: {
+        if (req_hdr.data_len < sizeof(SmcConfigPeriphAiReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigPeriphAiReq *req = (SmcConfigPeriphAiReq *)payload;
+        SmcConfigPeriphAiRes *res = (SmcConfigPeriphAiRes *)resp_buf;
+        if (req->reserved != 0) {
+            res->ret_code = -1;
+        } else {
+            res->ret_code = SMC_ConfigPeriphAi(req->slave_id, req->byte_off,
+                                               req->stride, req->count, req->fs);
+        }
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigPeriphAiRes);
+        break;
+    }
+    case SMC_CMD_INJECT_PERIPH_AI: {
+        if (req_hdr.data_len < sizeof(SmcInjectPeriphAiReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcInjectPeriphAiReq *req = (SmcInjectPeriphAiReq *)payload;
+        SmcInjectPeriphAiRes *res = (SmcInjectPeriphAiRes *)resp_buf;
+        res->ret_code = SMC_InjectPeriphAi(req->ch, req->val);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcInjectPeriphAiRes);
+        break;
+    }
+    case SMC_CMD_PLC_FORCE_VAR: {
+        if (req_hdr.data_len < sizeof(SmcPlcForceVarReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcForceVarReq *req = (SmcPlcForceVarReq *)payload;
+        SmcPlcForceVarRes *res = (SmcPlcForceVarRes *)resp_buf;
+        /* name NUL 终结防御: 结构体尾是 reserved, name 可能未终结 */
+        char name[33];
+        memcpy(name, req->name, 32);
+        name[32] = '\0';
+        if (req->reserved != 0) {
+            res->ret_code = -1;
+        } else {
+            res->ret_code = SMC_PlcForceVar(name, req->val, req->on);
+        }
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcForceVarRes);
+        break;
+    }
+    case SMC_CMD_PLC_TRACE_CONFIG: {
+        if (req_hdr.data_len < sizeof(SmcPlcTraceConfigReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcTraceConfigReq *req = (SmcPlcTraceConfigReq *)payload;
+        SmcPlcTraceConfigRes *res = (SmcPlcTraceConfigRes *)resp_buf;
+        PlcTraceCfg_t cfg;
+        memset(&cfg, 0, sizeof(cfg));
+        cfg.n_ch = req->n_ch;
+        cfg.div = req->div;
+        cfg.trig_kind = req->trig_kind;
+        cfg.trig_ch = req->trig_ch;
+        cfg.trig_threshold = req->trig_threshold;
+        for (int i = 0; i < SMC_PLC_TRACE_CH_MAX; i++) {
+            memcpy(cfg.names[i], req->names[i], 32);
+            cfg.names[i][31] = '\0';   /* NUL 终结防御 */
+        }
+        res->ret_code = plc_trace_config(&cfg);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcTraceConfigRes);
+        break;
+    }
+    case SMC_CMD_PLC_TRACE_CTRL: {
+        if (req_hdr.data_len < sizeof(SmcPlcTraceCtrlReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcTraceCtrlReq *req = (SmcPlcTraceCtrlReq *)payload;
+        SmcPlcTraceCtrlRes *res = (SmcPlcTraceCtrlRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcTraceCtrlRes);
+        switch (req->action) {
+        case 1:
+            res->ret_code = plc_core_trace_arm();
+            break;
+        case 0:
+            res->ret_code = plc_trace_stop();
+            break;
+        case 2:
+            res->ret_code = plc_trace_abort();
+            break;
+        case 3:
+            res->ret_code = 0;
+            break;
+        default:
+            res->ret_code = -1;
+            break;
+        }
+        int st = 0, n = 0;
+        plc_trace_get_state(&st, &n);
+        res->state = st;
+        res->n_samples = n;
+        break;
+    }
+    case SMC_CMD_PLC_TRACE_READ: {
+        if (req_hdr.data_len < sizeof(SmcPlcTraceReadReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcTraceReadReq *req = (SmcPlcTraceReadReq *)payload;
+        SmcPlcTraceReadRes *res = (SmcPlcTraceReadRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = 16;      /* 无样本时仅头 */
+        PlcTraceSample_t s[SMC_PLC_TRACE_PER_PAGE];
+        int n_total = 0;
+        int n = plc_trace_read(req->offset, s, SMC_PLC_TRACE_PER_PAGE, &n_total);
+        res->n_total = n_total;
+        if (n == -3 || n == -2) {
+            res->ret_code = n;
+            res->next_offset = -1;
+            break;
+        }
+        for (int i = 0; i < n; i++) {
+            res->samples[i].seq = s[i].seq;
+            res->samples[i].t_ms = s[i].t_ms;
+            for (int c = 0; c < SMC_PLC_TRACE_CH_MAX; c++)
+                res->samples[i].v[c] = s[i].v[c];
+        }
+        res->ret_code = 0;
+        res->n_included = n;
+        res->next_offset = (req->offset + n < n_total) ? (req->offset + n) : -1;
+        resp_payload_len = 16 + (uint32_t)n * sizeof(SmcPlcTraceSample_t);
+        break;
+    }
+    case SMC_CMD_PLC_UPLOAD: {
+        if (req_hdr.data_len < sizeof(SmcPlcUploadReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcUploadReq *req = (SmcPlcUploadReq *)payload;
+        SmcPlcUploadRes *res = (SmcPlcUploadRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = 16;          /* 无 chunk 时仅头 */
+        const char *text = NULL;
+        int tlen = 0;
+        if (plc_core_get_text(&text, &tlen) != 0) {
+            res->ret_code = -1;
+            res->next_offset = -1;
+            break;
+        }
+        if (req->offset < 0 || req->offset >= tlen) {
+            res->ret_code = -2;
+            res->total_len = tlen;
+            res->next_offset = -1;
+            break;
+        }
+        int n = tlen - req->offset;
+        if (n > SMC_PLC_UPLOAD_CHUNK) n = SMC_PLC_UPLOAD_CHUNK;
+        memcpy(res->chunk, text + req->offset, (size_t)n);
+        res->ret_code = 0;
+        res->total_len = tlen;
+        res->n_included = n;
+        res->next_offset = (req->offset + n < tlen) ? (req->offset + n) : -1;
+        resp_payload_len = 16 + (uint32_t)n;
+        break;
+    }
+    case SMC_CMD_PLC_READ_VARS: {
+        if (req_hdr.data_len < sizeof(SmcPlcReadVarsReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcPlcReadVarsReq *req = (SmcPlcReadVarsReq *)payload;
+        SmcPlcReadVarsRes *res = (SmcPlcReadVarsRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcPlcReadVarsRes);
+        int n_total = 0;
+        PlcVarSnap_t all[PLC_USER_VAR_MAX + 4];
+        int n = plc_core_snapshot_vars(all, PLC_USER_VAR_MAX + 4, &n_total);
+        res->n_total = n_total;
+        if (req->offset < 0 || req->offset >= n_total) {
+            res->ret_code = -1;      /* offset 越界 */
+            res->next_offset = -1;
+            break;
+        }
+        int avail = n - req->offset;  /* snapshot 拷贝上限内 */
+        if (avail > SMC_PLC_VARS_PER_PAGE) avail = SMC_PLC_VARS_PER_PAGE;
+        if (avail < 0) avail = 0;
+        for (int i = 0; i < avail; i++) {
+            PlcVarSnap_t *s = &all[req->offset + i];
+            strncpy(res->vars[i].name, s->name, 31);
+            res->vars[i].name[31] = '\0';
+            res->vars[i].type = s->type;
+            res->vars[i].cls = s->cls;
+            res->vars[i].fb = s->fb;
+            res->vars[i].forced = s->forced;   /* P1.5-2: 暴露强制标志, watch 可见 */
+            res->vars[i].value = s->value;
+        }
+        res->ret_code = 0;
+        res->n_included = avail;
+        res->next_offset = (req->offset + avail < n_total) ? (req->offset + avail) : -1;
+        break;
+    }
     case SMC_CMD_SET_OPTIONAL_STOP_ENABLE: {
         if (req_hdr.data_len < sizeof(SmcSetOptionalStopEnableReq)) {
             res_hdr.err_code = SMC_ERR_PARAM; break;
@@ -695,6 +1010,163 @@ static int handle_client_request(int client_fd)
         SMC_GetResumeState(res);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcGetResumeRes);
+        break;
+    }
+
+    /* ===== 论文1 IV-E (2026-09-16): G93 jerk-bounded 转移剖面 0x0082 ===== */
+    case SMC_CMD_CONFIG_G93_JERK: {
+        if (req_hdr.data_len < sizeof(SmcConfigG93JerkReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigG93JerkReq *req = (SmcConfigG93JerkReq *)payload;
+        printf("[rpc] ConfigG93Jerk: enable=%d eps_v=%.1f%% eps_t=%.1f%%\n",
+               req->enable, req->eps_v_pct, req->eps_t_pct);
+        SmcConfigG93JerkRes *res = (SmcConfigG93JerkRes *)resp_buf;
+        res->ret_code = SMC_ConfigG93Jerk(req->enable, req->eps_v_pct, req->eps_t_pct);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigG93JerkRes);
+        break;
+    }
+
+    /* ===== 论文1 B0′ 消融 (2026-09-17): F-inheritance 回退开关 0x0083 ===== */
+    case SMC_CMD_CONFIG_G93_ABLATION: {
+        if (req_hdr.data_len < sizeof(SmcConfigG93AblationReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigG93AblationReq *req = (SmcConfigG93AblationReq *)payload;
+        printf("[rpc] ConfigG93Ablation: f_inherit=%d\n", req->f_inherit);
+        SmcConfigG93AblationRes *res = (SmcConfigG93AblationRes *)resp_buf;
+        res->ret_code = SMC_ConfigG93Ablation(req->f_inherit);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigG93AblationRes);
+        break;
+    }
+
+    /* ===== 论文1 M1 替代设计: 事后修正开关 0x0085 (2026-09-18) ===== */
+    case SMC_CMD_CONFIG_G93_POSTHOC: {
+        if (req_hdr.data_len < sizeof(SmcConfigG93PosthocReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigG93PosthocReq *req = (SmcConfigG93PosthocReq *)payload;
+        printf("[rpc] ConfigG93Posthoc: enable=%d\n", req->enable);
+        SmcConfigG93PosthocRes *res = (SmcConfigG93PosthocRes *)resp_buf;
+        res->ret_code = SMC_ConfigG93Posthoc(req->enable);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigG93PosthocRes);
+        break;
+    }
+
+    case SMC_CMD_CONFIG_G93_RATIO: {
+        if (req_hdr.data_len < sizeof(SmcConfigG93RatioReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigG93RatioReq *req = (SmcConfigG93RatioReq *)payload;
+        printf("[rpc] ConfigG93Ratio: ratio_off=%d\n", req->ratio_off);
+        SmcConfigG93RatioRes *res = (SmcConfigG93RatioRes *)resp_buf;
+        res->ret_code = SMC_ConfigG93Ratio(req->ratio_off);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigG93RatioRes);
+        break;
+    }
+
+    case SMC_CMD_CONFIG_G93_STRICT_OFF: {
+        if (req_hdr.data_len < sizeof(SmcConfigG93StrictOffReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigG93StrictOffReq *req = (SmcConfigG93StrictOffReq *)payload;
+        printf("[rpc] ConfigG93StrictOff: strict_off=%d\n", req->strict_off);
+        SmcConfigG93StrictOffRes *res = (SmcConfigG93StrictOffRes *)resp_buf;
+        res->ret_code = SMC_ConfigG93StrictOff(req->strict_off);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigG93StrictOffRes);
+        break;
+    }
+
+    /* ===== 论文1 S10-H1 长度基消融开关 0x0088 (2026-09-20) ===== */
+    case SMC_CMD_CONFIG_G93_TIP_BASIS: {
+        if (req_hdr.data_len < sizeof(SmcConfigG93TipBasisReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcConfigG93TipBasisReq *req = (SmcConfigG93TipBasisReq *)payload;
+        printf("[rpc] ConfigG93TipBasis: tip_basis=%d\n", req->tip_basis);
+        SmcConfigG93TipBasisRes *res = (SmcConfigG93TipBasisRes *)resp_buf;
+        res->ret_code = SMC_ConfigG93TipBasis(req->tip_basis);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcConfigG93TipBasisRes);
+        break;
+    }
+
+    /* ===== 论文1 S10 (2026-09-20): 控制器内 block 级计时查询 0x0089 ===== */
+    case SMC_CMD_QUERY_BLOCK_TIMING: {
+        uint8_t bt_op = 0;
+        if (req_hdr.data_len >= sizeof(SmcBlockTimingReq)) {
+            bt_op = ((SmcBlockTimingReq *)payload)->op;
+        }
+        if (bt_op == 1) {
+            bt_reset_all();       /* 清零 (宿主在每次 run 前显式调用) */
+        }
+        SmcBlockTimingRes *res = (SmcBlockTimingRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = 0;
+        res->block_uid                 = g_bt.block_uid;
+        res->block_line_no             = g_bt.block_line_no;
+        res->block_start_cycle         = g_bt.block_start_cycle;
+        res->block_end_cycle_exclusive = g_bt.block_end_cycle_exclusive;
+        res->block_elapsed_cycles      = g_bt.block_elapsed_cycles;
+        res->block_stall_cycles        = g_bt.block_stall_cycles;
+        res->segments_generated        = g_bt.segments_generated;
+        res->segments_completed        = g_bt.segments_completed;
+        res->block_budget_cmd_ms       = g_bt.block_budget_cmd_ms;
+        res->block_budget_sum_ms       = g_bt.block_budget_sum_ms;
+        res->block_virtual_ms          = g_bt.block_virtual_ms;
+        res->ctrl_start_cycle          = g_bt.ctrl_start_cycle;
+        res->ctrl_end_cycle_exclusive  = g_bt.ctrl_end_cycle_exclusive;
+        res->controller_elapsed_cycles = g_bt.controller_elapsed_cycles;
+        res->controller_elapsed_ms     = g_bt.controller_elapsed_ms;
+        res->virtual_elapsed_ms        = g_bt.virtual_elapsed_ms;
+        res->hold_active_cycles        = g_bt.hold_active_cycles;
+        res->hold_active_ms            = g_bt.hold_active_ms;
+        res->hold_frozen_cycles        = g_bt.hold_frozen_cycles;
+        res->override_eff_sum          = g_bt.override_eff_sum;
+        res->override_eff_cycles       = g_bt.override_eff_cycles;
+        res->virtual_model_ms          = g_bt.virtual_model_ms;
+        res->segments_completed_total  = g_bt.segments_completed_total;
+        res->blocks_closed             = g_bt.blocks_closed;
+        res->rt_cycle_counter          = g_bt.rt_cycle_counter;
+        printf("[rpc] BlockTiming(op=%u): uid=%u line=%d elapsed=%llu cyc "
+               "(gen=%u done=%u, cmd=%.3fms sum=%.3fms) | ctrl=%llu cyc, "
+               "virt=%.3fms, hold=%llu cyc\n",
+               (unsigned)bt_op, res->block_uid, res->block_line_no,
+               (unsigned long long)res->block_elapsed_cycles,
+               res->segments_generated, res->segments_completed,
+               res->block_budget_cmd_ms, res->block_budget_sum_ms,
+               (unsigned long long)res->controller_elapsed_cycles,
+               res->virtual_elapsed_ms,
+               (unsigned long long)res->hold_active_cycles);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcBlockTimingRes);
+        break;
+    }
+
+    /* ===== 论文1 N22 (2026-09-17): enqueue 临界区耗时统计 0x0084 ===== */
+    case SMC_CMD_QUERY_ENQUEUE_STATS: {
+        uint8_t stats_reset = 0;
+        if (req_hdr.data_len >= sizeof(SmcEnqueueStatsReq)) {
+            stats_reset = ((SmcEnqueueStatsReq *)payload)->reset;
+        }
+        SmcEnqueueStatsRes *res = (SmcEnqueueStatsRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = 0;
+        SMC_GetEnqueueStats(stats_reset,
+                            &res->count_all, &res->count_strict,
+                            &res->mean_us_all, &res->mean_us_strict,
+                            &res->max_us_strict);
+        printf("[rpc] EnqueueStats: all=%lu (%.2f μs) strict=%lu (%.2f μs, max %.2f)\n",
+               (unsigned long)res->count_all, res->mean_us_all,
+               (unsigned long)res->count_strict, res->mean_us_strict,
+               res->max_us_strict);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcEnqueueStatsRes);
         break;
     }
     case SMC_CMD_CLEAR_ALARM: {
@@ -980,11 +1452,20 @@ static int kernel_init(const char *iface)
     /* P0-a: 状态快照中心初始化 (RT 线程启动前必须就绪, 否则首次 Publish 读未初始化字段) */
     SnapshotHub_Init();
 
+    /* P0-1: 外围 G/F 信号表初始化 (RT 线程启动前, 同上约束) */
+    PeriphBus_Init();
+
+    /* P1-b: 事件/报警流推送中心初始化 (须早于 plc_core_init — autoload 的
+     * 编译失败事件 0x0001 否则会在 EventLogger_Init 清环时丢失) */
+    EventLogger_Init();
+
+    /* P1: 软 PLC 程序槽初始化 (boot autoload ./plc_prog.st; 须晚于
+     * EventLogger_Init — autoload 编译失败事件 0x0001 否则被清环丢失) */
+    periph_ai_init();       /* P1.5-1: 外围 AI 通道 (RT 启动前就绪) */
+    plc_core_init();
+
     /* P0-b v1: 段流推送中心初始化 (parser 启动前必须就绪, 否则首次 Push 写未初始化 ring) */
     PreviewStreamer_Init();
-
-    /* P1-b: 事件/报警流推送中心初始化 */
-    EventLogger_Init();
 
     /* 2. 默认轴拓扑 — MoveControl 启动后通过 RPC 覆盖 */
     SMC_ConfigAxisTopology("X", 0, 5, 0);
@@ -1083,8 +1564,11 @@ static int kernel_init_hw(const char *iface)
     axis_sys_init();
     Macro_Init();
     SnapshotHub_Init();
+    PeriphBus_Init();       /* P0-1: 外围 G/F 信号表 (RT 启动前就绪) */
+    EventLogger_Init();     /* P1-b: 事件中心 (须早于 plc_core_init, 同 kernel_init) */
+    periph_ai_init();       /* P1.5-1: 外围 AI 通道 */
+    plc_core_init();        /* P1: 软 PLC 程序槽 + autoload */
     PreviewStreamer_Init();
-    EventLogger_Init();
 
     /* 2. 档案加载 + A/B/C 哨兵校验 (A 级未填 → 拒绝启动, 防 sim 值上实机) */
     param_store_load();
@@ -1176,6 +1660,46 @@ static int kernel_init_hw(const char *iface)
                              hw->ax[i].hm_timeout_ms);
     if (hw->homing_order[0] != '\0')
         SMC_ConfigHomingAllEx(hw->homing_order, hw->auto_on_init);
+
+    /* 11.5 P0-2 (2026-09-09): 激光互锁规则表 (软 PLC 地基, 数据驱动互锁)
+     *     count=0 跳过 = 内核默认 6 路链 (laser_ctrl.c bit_di_* 固定映射);
+     *     越界已被 param_store 解析层拒绝, 此处 min() 双保险 */
+    if (hw->laser_il_count > 0) {
+        LaserIlRule_t rules[LASER_IL_MAX];
+        int n = (hw->laser_il_count < LASER_IL_MAX) ? hw->laser_il_count : LASER_IL_MAX;
+        for (int i = 0; i < n; i++) {
+            rules[i].bit      = (uint8_t)hw->laser_il_bit[i];
+            rules[i].reserved = 0;
+            rules[i].mask     = (uint16_t)hw->laser_il_mask[i];
+        }
+        SMC_ConfigLaserInterlock(rules, n);
+    }
+
+    /* 11.6 P0-4a (2026-09-10): 激光 I/O 端子 PDO 布局 (选型适配骨架)
+     *     默认 EL 级 16-bit; 换端子 = 改档案 [laser_io], 内核代码不动 */
+    SMC_ConfigLaserPdoLayout((uint8_t)hw->laser_io_di_off, (uint8_t)hw->laser_io_di_bytes,
+                             (uint8_t)hw->laser_io_do_off, (uint8_t)hw->laser_io_do_bytes,
+                             (uint8_t)hw->laser_io_ao_off, (uint8_t)hw->laser_io_ao_stride,
+                             NULL);
+
+    /* 11.6b P1.5-1 (2026-09-14): 外围 AI 通道 (默认未配置, count=0 跳过) */
+    if (hw->periph_ai_count > 0 && hw->periph_ai_slave >= 0) {
+        SMC_ConfigPeriphAi(hw->periph_ai_slave, hw->periph_ai_off,
+                           hw->periph_ai_stride, hw->periph_ai_count,
+                           hw->periph_ai_fs);
+    }
+
+    /* 11.7 P0-4a: 期望拓扑表 (空表 = 不校验; 配置后 bring-up 失配拒绝进 OP,
+     *     防 slave_id 按位置漂移)。必须在 SMC_InitAndStart (ecat_bringup) 之前 */
+    if (hw->ecat_topo_count > 0) {
+        EcatTopoExpect_t topo[ECAT_TOPO_MAX];
+        int n = (hw->ecat_topo_count < ECAT_TOPO_MAX) ? hw->ecat_topo_count : ECAT_TOPO_MAX;
+        for (int i = 0; i < n; i++) {
+            topo[i].vendor  = hw->ecat_topo_vendor[i];
+            topo[i].product = hw->ecat_topo_product[i];
+        }
+        ecat_set_expected_topo(topo, n);
+    }
 
     /* 12. 启动内核 (实机 = EtherCAT 组态 + CiA402 使能; sim = 软件驱动) */
     if (SMC_InitAndStart(iface) != 0) {

@@ -195,6 +195,51 @@ int SMC_ResumeStart(void);
 void SMC_GetResumeState(SmcGetResumeRes *out);
 
 // =======================================================
+// 论文1 IV-E (2026-09-16): G93 jerk-bounded 转移剖面配置 (RPC 0x0082)
+// =======================================================
+// enable=1: 相邻不同 v_cmd 严格块边界构造 jerk 受限转移 (加速→exact 超速模式 /
+//           减速→debt 签名时长模式); enable=0: 完全退化 IV-C 纯匀速 (A/B 对照开关)
+// 返回: 0=已生效, -1=ε 参数非法
+int SMC_ConfigG93Jerk(int enable, double eps_v_pct, double eps_t_pct);
+
+// =======================================================
+// 论文1 B0′ 消融 + N22 实时性 (2026-09-17, 复审 P06/P12)
+// =======================================================
+// SMC_ConfigG93Ablation (RPC 0x0083): f_inherit=1 禁用 IV-B 时间再分配,
+// 每微段继承整块进给字 (τ_b=n_b·T_b, 基线 B0 可执行复现)。会话级开关,
+// 不持久化 (server 重启即回默认 OFF)。返回: 0=已生效, -2=程序运行中拒绝
+int SMC_ConfigG93Ablation(int f_inherit);
+
+// SMC_ConfigG93Posthoc (RPC 0x0085, 论文1 M1 替代设计): enable=1 关闭 IV-D
+// 的先验长度重标定, 段按标称 T 执行并在段末按实测速度累积赤字补偿到下一段
+// ("先测量再修正"的可执行复现)。会话级开关。返回: 0=已生效, -2=运行中拒绝
+int SMC_ConfigG93Posthoc(int enable);
+
+// SMC_ConfigG93Ratio (RPC 0x0086, 论文1 V2 仿真战役): ratio_off=1 关闭 IV-D
+// 长度比重标定 (Naive 基线 T'=T, 使 v_act/v_cmd ≡ L_act/L_prog = γ), 用于
+// E4 γ 扫描的 Naive vs Proposed 实测对照。会话级开关。返回: 0=已生效, -2=运行中拒绝
+int SMC_ConfigG93Ratio(int ratio_off);
+
+// SMC_ConfigG93StrictOff (RPC 0x0087, 论文1 S3 planner-rate-limiting 战役):
+// strict_off=1 关闭 G93 强一致豁免, 下游 planner 对每段执行完整短板效应限幅
+// (基线 B2 的可执行复现, E3 机制实证); strict_off=0 恢复 Ours 强一致路径 (出厂默认)。
+// 会话级开关。返回: 0=已生效, -2=运行中拒绝切换
+int SMC_ConfigG93StrictOff(int strict_off);
+
+// SMC_ConfigG93TipBasis (RPC 0x0088, 论文1 S10-H1 长度基消融):
+// tip_basis=1 把 G93 需求速率的长度基从机械轴等效长度 L^M 换成刀尖欧氏长度
+// L^P (旋转轴折算不计), 使第三步.5 可行性门低估绑定轴需求 m=L^M/L^P 倍并
+// 放行本应判不可行的段 (绑定轴突破硬限速); tip_basis=0 = IV-A 物理基 (出厂默认)。
+// 会话级开关。返回: 0=已生效, -2=运行中拒绝切换
+int SMC_ConfigG93TipBasis(int tip_basis);
+
+// SMC_GetEnqueueStats (RPC 0x0084): enqueue 临界区耗时统计 (论文 V-C 实测)。
+// reset=1 读后清零。单位: μs; strict 路径 = is_g93_strict 入队 (含剖面预计算)。
+void SMC_GetEnqueueStats(int reset, uint64_t *count_all, uint64_t *count_strict,
+                         double *mean_us_all, double *mean_us_strict,
+                         double *max_us_strict);
+
+// =======================================================
 // P1-b: ClearAlarm (清除系统报警)
 // =======================================================
 // 触发 RT alarm_reset_request, RT 在安全点 (queue 空 + 驱动就绪) 时实际清。
@@ -292,6 +337,44 @@ int SMC_ConfigLaserDOBits(uint8_t b_enable, uint8_t b_shutter,
 // 3.配置 DI bit 偏移 (0-15)
 int SMC_ConfigLaserDIBits(uint8_t b_door, uint8_t b_estop, uint8_t b_laser_alm,
                           uint8_t b_water_t, uint8_t b_water_f, uint8_t b_gas_p);
+
+// P0-2 (2026-09-09): 配置互锁链规则表 (软 PLC 地基, 数据驱动互锁)
+// count: 0..LASER_IL_MAX; 0 = 回退默认 6 路链 (bit_di_* 固定映射)
+// 校验: bit<=15, mask 非 0 且不含 bit15 (0x8000 保留 system_alarm)
+// 返回: 0=成功, -1=参数越界
+int SMC_ConfigLaserInterlock(const LaserIlRule_t *rules, int count);
+
+// P0-3a (2026-09-09): DI 注入/强制 (P1.5-2 起 sim+实机均有效)
+//   sim: 传感器模拟 (互锁链可测); 实机: DI 强制 (覆盖 PDO 物理读数,
+//   调机隔离故障点; 实机开关推 LASER 事件 0x0015 审计)
+// pattern: bit=1 该位异常 (如 0x0008=水温); enable: 1=使能 0=清除
+// 返回: 0=成功
+int SMC_InjectLaserDi(uint16_t pattern, uint16_t enable);
+
+// P1.5-2 (2026-09-15): PLC 用户变量强制 (输出强制语义, 周期末覆写)
+// name: 变量名 (大小写不敏感); name 空且 on=0 = 清除全部; 仅 RUNNING 有效
+// 返回: 0=成功, -1=变量不存在, -3=非 RUNNING
+int SMC_PlcForceVar(const char *name, double val, int on);
+
+// P0-4a (2026-09-10): I/O 端子 PDO 布局 (byte 偏移/宽度, 选型适配)
+// di/do: 起始字节 + 宽度 1/2; ao: 通道 0 起始字节 + 每通道字节 2/4
+// reserved: 2 字节保留 (协议对齐), 必须填 0; 传 NULL 跳过检查
+// 返回: 0=成功, -1=参数越界
+int SMC_ConfigLaserPdoLayout(uint8_t di_off, uint8_t di_bytes,
+                             uint8_t do_off, uint8_t do_bytes,
+                             uint8_t ao_off, uint8_t ao_stride,
+                             const uint8_t *reserved);
+
+// P1.5-1 (2026-09-14): 配置外围 AI 模拟输入通道 (水温/气压/流量传感器)
+// RT 周期采样: PDO raw 16-bit → 0..fs[ch] 工程量 → PLC 系统变量 G_AI0..3
+// fs[i] <= 0 = 该通道未配置 (G_AIx 恒 0); count=0 整体关闭
+// 返回: 0=成功, -1=参数越界
+int SMC_ConfigPeriphAi(int slave_id, int byte_off, int stride, int count,
+                       const double *fs);
+
+// P1.5-1 (2026-09-14): sim-only 注入传感器工程量 (G_AIx 呈现值)
+// 返回: 0=成功, -1=通道越界, -2=非 sim 模式
+int SMC_InjectPeriphAi(int ch, double val);
 
 // 4.配置 AO 通道偏移
 int SMC_ConfigLaserAOChannels(uint8_t ch_power, uint8_t ch_freq);

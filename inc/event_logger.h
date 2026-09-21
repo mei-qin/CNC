@@ -65,7 +65,11 @@ extern "C" {
 
 /* ---- event code 规范 (按 source 分段) ----
  * DRIVE=4:   0x0001 sync err / 0x0002 SW_ERROR / 0x0003 follow err hard / 0x0004 follow err warn
- * LASER=3:   0x0010 safety door / 0x0011 estop soft / 0x0012 laser ALM / 0x0013 water/gas
+ * LASER=3:   0x0010 互锁触发 (实际用法: 通用, value=interlock 位图; 0x8000=系统报警联动)
+ *            0x0011 estop soft / 0x0012 laser ALM / 0x0013 water/gas (预留细分, 未用)
+ *            0x0014 互锁复位 (INFO, value=复位前位图, 与 0x0010 闭环对照; P0-3c 2026-09-09)
+ *            0x0015 DI 强制使能/清除 (WARN, 实机 0x0073; value=(pattern<<16)|enable;
+ *                    物理互锁旁路审计, P1.5-2 2026-09-15; sim 注入不推)
  * PARSER=1:  0x0020 M3/M4 rpm<=0 / 0x0021 M67/M68 oob / 0x0022 G04 neg / 0x0023 M70/M71 oob
  *            0x0024 软限位拒绝 (api push 级, value=轴idx) / 0x0025 旋转轴 wrap 应用 (value=轴idx)
  *            0x0026 RTCP 奇异点报警 (value=R_max*10)
@@ -79,6 +83,10 @@ extern "C" {
  * CONFIG=7:  0x0001 profile 加载成功 / 0x0002 加载失败回退默认 / 0x0003 参数变更审计
  *            0x0004 参数被拒 / 0x0005 档案落盘 (0=ok, -1=fail) / 0x0006 写保护拒绝
  *            (code 定义见 param_store.h PS_EV_*)
+ * PLC=5:     0x0001 编译错误 (value=行号, P1-4) / 0x0002 启动 INFO (P1-4) / 0x0003 停止 INFO (P1-4)
+ *            0x0004 看门狗: heartbeat 30ms 未刷新 (value=停滞 ms, RT 推, P1-3 2026-09-12)
+ *            0x0005 PLC 域 M 码 FIN 超时 (value=M 码值, RT 推, P1-3)
+ *            0x0006 运行期错误 (value=行号, P1-4)
  */
 
 #pragma pack(push, 1)

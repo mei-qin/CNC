@@ -130,6 +130,24 @@ static void ps_default_profile(MachineProfile_t *p)
     /* 回零全局 */
     strcpy(p->homing_order, "ZXYBC");
     p->auto_on_init = 0;
+
+    /* 激光互锁规则表: 默认空 = 内核默认 6 路链 (laser_ctrl.c bit_di_* 固定映射) */
+    p->laser_il_count = 0;
+
+    /* 激光 I/O 端子 PDO 布局: 默认 EL 级 16-bit (EL1809/EL2809/EL4132 类) */
+    p->laser_io_di_off = 0;  p->laser_io_di_bytes = 2;
+    p->laser_io_do_off = 0;  p->laser_io_do_bytes = 2;
+    p->laser_io_ao_off = 0;  p->laser_io_ao_stride = 2;
+
+    /* 外围 AI: 默认未配置 (等端子; sim 下用 RPC 0x007D 注入验证链路) */
+    p->periph_ai_slave = -1;
+    p->periph_ai_off = 0;
+    p->periph_ai_stride = 2;
+    p->periph_ai_count = 0;
+    for (int i = 0; i < PS_PERIPH_AI_MAX; i++) p->periph_ai_fs[i] = 0.0;
+
+    /* EtherCAT 期望拓扑: 默认空表 = 不校验 (兼容现状, 实机配端子后填) */
+    p->ecat_topo_count = 0;
 }
 
 /* =====================================================================
@@ -245,6 +263,141 @@ static int ps_parse_global_line(MachineProfile_t *p, const char *section,
         if      (strcmp(key, "order") == 0)        strncpy(p->homing_order, val, sizeof(p->homing_order) - 1);
         else if (strcmp(key, "auto_on_init") == 0) p->auto_on_init = (int)strtol(val, NULL, 10);
         else { printf("[param_store] 行 %d: 未知 [homing] key '%s' (忽略)\n", lineno, key); }
+        return 0;
+    }
+    if (strcmp(section, "laser_interlock") == 0) {
+        /* P0-2 (2026-09-09): count=N + bit_i/mask_i 对 (i: 0..N-1)。
+         * 安全参数越界不做静默降级: 返回 -1 → ps_parse_file 判致命 →
+         * 整档案拒绝加载回退编译期默认 (默认 6 路链, 安全方向) */
+        if (strcmp(key, "count") == 0) {
+            int n = (int)strtol(val, NULL, 10);
+            if (n < 0 || n > PS_LASER_IL_MAX) {
+                printf("[param_store] 行 %d: laser_interlock count=%d 越界 (0..%d)\n",
+                       lineno, n, PS_LASER_IL_MAX);
+                return -1;
+            }
+            p->laser_il_count = n;
+            return 0;
+        }
+        int idx = -1;
+        if (strncmp(key, "bit_", 4) == 0) {
+            if (sscanf(key + 4, "%d", &idx) != 1 || idx < 0 || idx >= PS_LASER_IL_MAX) {
+                printf("[param_store] 行 %d: 非法 key '%s'\n", lineno, key);
+                return -1;
+            }
+            int b = (int)strtol(val, NULL, 10);
+            if (b < 0 || b > 15) {
+                printf("[param_store] 行 %d: bit_%d=%d 越界 (0-15)\n", lineno, idx, b);
+                return -1;
+            }
+            p->laser_il_bit[idx] = b;
+            return 0;
+        }
+        if (strncmp(key, "mask_", 5) == 0) {
+            if (sscanf(key + 5, "%d", &idx) != 1 || idx < 0 || idx >= PS_LASER_IL_MAX) {
+                printf("[param_store] 行 %d: 非法 key '%s'\n", lineno, key);
+                return -1;
+            }
+            int m = (int)strtol(val, NULL, 0);   /* 支持 0x 前缀 */
+            if (m <= 0 || (m & 0x8000)) {
+                printf("[param_store] 行 %d: mask_%d=0x%X 非法 (须>0 且不含 bit15)\n",
+                       lineno, idx, m);
+                return -1;
+            }
+            p->laser_il_mask[idx] = m;
+            return 0;
+        }
+        printf("[param_store] 行 %d: 未知 [laser_interlock] key '%s' (忽略)\n",
+               lineno, key);
+        return 0;
+    }
+    if (strcmp(section, "laser_io") == 0) {
+        /* P0-4a (2026-09-10): PDO 布局 6 参数。安全方向同 laser_interlock:
+         * 越界整档案拒绝 (防 8 点端子误配 2 字节 → IOmap 越界读邻站) */
+        int v = (int)strtol(val, NULL, 10);
+        if      (strcmp(key, "di_byte_off") == 0) p->laser_io_di_off = v;
+        else if (strcmp(key, "di_bytes") == 0)    p->laser_io_di_bytes = v;
+        else if (strcmp(key, "do_byte_off") == 0) p->laser_io_do_off = v;
+        else if (strcmp(key, "do_bytes") == 0)    p->laser_io_do_bytes = v;
+        else if (strcmp(key, "ao_byte_off") == 0) p->laser_io_ao_off = v;
+        else if (strcmp(key, "ao_stride") == 0)   p->laser_io_ao_stride = v;
+        else {
+            printf("[param_store] 行 %d: 未知 [laser_io] key '%s' (忽略)\n", lineno, key);
+            return 0;
+        }
+        if ((p->laser_io_di_off < 0 || p->laser_io_di_off > 63)
+            || (p->laser_io_do_off < 0 || p->laser_io_do_off > 63)
+            || (p->laser_io_ao_off < 0 || p->laser_io_ao_off > 63)
+            || (p->laser_io_di_bytes != 1 && p->laser_io_di_bytes != 2)
+            || (p->laser_io_do_bytes != 1 && p->laser_io_do_bytes != 2)
+            || (p->laser_io_ao_stride != 2 && p->laser_io_ao_stride != 4)) {
+            printf("[param_store] 行 %d: [laser_io] %s=%d 越界 (off 0-63, "
+                   "bytes 1/2, stride 2/4)\n", lineno, key, v);
+            return -1;
+        }
+        return 0;
+    }
+    if (strcmp(section, "periph_ai") == 0) {
+        /* P1.5-1 (2026-09-14): AI 通道 4 参数 + 每通道满量程。
+         * 越界整档案拒绝 (同 laser_io 语义)。 */
+        if (strcmp(key, "slave") == 0)      p->periph_ai_slave = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "byte_off") == 0) p->periph_ai_off = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "stride") == 0)   p->periph_ai_stride = (int)strtol(val, NULL, 10);
+        else if (strcmp(key, "count") == 0)    p->periph_ai_count = (int)strtol(val, NULL, 10);
+        else if (strncmp(key, "fs_", 3) == 0) {
+            int idx = -1;
+            if (sscanf(key + 3, "%d", &idx) != 1
+                || idx < 0 || idx >= PS_PERIPH_AI_MAX) {
+                printf("[param_store] 行 %d: 非法 key '%s'\n", lineno, key);
+                return -1;
+            }
+            p->periph_ai_fs[idx] = strtod(val, NULL);
+            return 0;
+        }
+        else {
+            printf("[param_store] 行 %d: 未知 [periph_ai] key '%s' (忽略)\n", lineno, key);
+            return 0;
+        }
+        if (p->periph_ai_slave < -1 || p->periph_ai_off < 0 || p->periph_ai_off > 63
+            || (p->periph_ai_stride != 2 && p->periph_ai_stride != 4)
+            || p->periph_ai_count < 0 || p->periph_ai_count > PS_PERIPH_AI_MAX) {
+            printf("[param_store] 行 %d: [periph_ai] %s 越界 "
+                   "(slave>=-1, off 0-63, stride 2/4, count 0-4)\n", lineno, key);
+            return -1;
+        }
+        return 0;
+    }
+    if (strcmp(section, "ecat_topo") == 0) {
+        /* P0-4a: 期望拓扑表 — count=N + vendor_i/product_i 对 (0x 前缀, 0=通配) */
+        if (strcmp(key, "count") == 0) {
+            int n = (int)strtol(val, NULL, 10);
+            if (n < 0 || n > PS_ECAT_TOPO_MAX) {
+                printf("[param_store] 行 %d: ecat_topo count=%d 越界 (0..%d)\n",
+                       lineno, n, PS_ECAT_TOPO_MAX);
+                return -1;
+            }
+            p->ecat_topo_count = n;
+            return 0;
+        }
+        int idx = -1;
+        if (strncmp(key, "vendor_", 7) == 0) {
+            if (sscanf(key + 7, "%d", &idx) != 1 || idx < 0 || idx >= PS_ECAT_TOPO_MAX) {
+                printf("[param_store] 行 %d: 非法 key '%s'\n", lineno, key);
+                return -1;
+            }
+            p->ecat_topo_vendor[idx] = (uint32_t)strtoul(val, NULL, 0);
+            return 0;
+        }
+        if (strncmp(key, "product_", 8) == 0) {
+            if (sscanf(key + 8, "%d", &idx) != 1 || idx < 0 || idx >= PS_ECAT_TOPO_MAX) {
+                printf("[param_store] 行 %d: 非法 key '%s'\n", lineno, key);
+                return -1;
+            }
+            p->ecat_topo_product[idx] = (uint32_t)strtoul(val, NULL, 0);
+            return 0;
+        }
+        printf("[param_store] 行 %d: 未知 [ecat_topo] key '%s' (忽略)\n",
+               lineno, key);
         return 0;
     }
     return -1;   /* 未知 section — 由调用方决定是否致命 */
@@ -433,6 +586,40 @@ static int ps_save_locked(const MachineProfile_t *p)
     fprintf(fp, "\n[homing]\n");
     fprintf(fp, "order=%s\n",        p->homing_order);
     fprintf(fp, "auto_on_init=%d\n", p->auto_on_init);
+
+    /* P0-2 (2026-09-09): 激光互锁规则表 (count=0 不写 bit/mask 对) */
+    fprintf(fp, "\n[laser_interlock]\n");
+    fprintf(fp, "count=%d\n", p->laser_il_count);
+    for (int i = 0; i < p->laser_il_count && i < PS_LASER_IL_MAX; i++) {
+        fprintf(fp, "bit_%d=%d\n",  i, p->laser_il_bit[i]);
+        fprintf(fp, "mask_%d=0x%04X\n", i, (unsigned)p->laser_il_mask[i]);
+    }
+
+    /* P0-4a (2026-09-10): 激光 I/O 端子 PDO 布局 */
+    fprintf(fp, "\n[laser_io]\n");
+    fprintf(fp, "di_byte_off=%d\n", p->laser_io_di_off);
+    fprintf(fp, "di_bytes=%d\n",    p->laser_io_di_bytes);
+    fprintf(fp, "do_byte_off=%d\n", p->laser_io_do_off);
+    fprintf(fp, "do_bytes=%d\n",    p->laser_io_do_bytes);
+    fprintf(fp, "ao_byte_off=%d\n", p->laser_io_ao_off);
+    fprintf(fp, "ao_stride=%d\n",   p->laser_io_ao_stride);
+
+    /* P1.5-1 (2026-09-14): 外围 AI 通道 */
+    fprintf(fp, "\n[periph_ai]\n");
+    fprintf(fp, "slave=%d\n",    p->periph_ai_slave);
+    fprintf(fp, "byte_off=%d\n", p->periph_ai_off);
+    fprintf(fp, "stride=%d\n",   p->periph_ai_stride);
+    fprintf(fp, "count=%d\n",    p->periph_ai_count);
+    for (int i = 0; i < PS_PERIPH_AI_MAX; i++)
+        fprintf(fp, "fs_%d=%.6f\n", i, p->periph_ai_fs[i]);
+
+    /* P0-4a: EtherCAT 期望拓扑 (count=0 不写 vendor/product 对) */
+    fprintf(fp, "\n[ecat_topo]\n");
+    fprintf(fp, "count=%d\n", p->ecat_topo_count);
+    for (int i = 0; i < p->ecat_topo_count && i < PS_ECAT_TOPO_MAX; i++) {
+        fprintf(fp, "vendor_%d=0x%08X\n",  i, (unsigned)p->ecat_topo_vendor[i]);
+        fprintf(fp, "product_%d=0x%08X\n", i, (unsigned)p->ecat_topo_product[i]);
+    }
     fprintf(fp, "\n");
 
     if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {

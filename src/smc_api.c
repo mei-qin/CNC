@@ -10,6 +10,8 @@
 #include "preview_streamer.h"   /* P0-b v2: PreviewStreamer_GetWriteSeq */
 #include "event_logger.h"       /* P1-b: EventLogger_Push */
 #include "param_store.h"        /* P2 (2026-08-28): Config* 钩子 — 写入即存 + 审计 */
+#include "periph_ai.h"          /* P1.5-1: AI 通道 (G_AIx 数据源) */
+#include "plc_core.h"           /* P1.5-2: plc_core_force_var */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -821,6 +823,127 @@ void SMC_GetResumeState(SmcGetResumeRes *out)
            sizeof(double) * AXIS_NUM);
 }
 
+// @Context: Non-RealTime Background Thread (RPC client thread, 程序运行中也可调)
+// G93 jerk-bounded 转移剖面配置 (论文1 IV-E, 2026-09-16, RPC 0x0082):
+// enable=0 时严格块完全退化为 IV-C 现行为 (实验 A/B 对照开关)。
+// 返回: 0=已生效, -1=参数非法 (ε 超界)
+int SMC_ConfigG93Jerk(int enable, double eps_v_pct, double eps_t_pct)
+{
+    if (eps_v_pct < 0.1 || eps_v_pct > 50.0) return -1;
+    if (eps_t_pct < 0.1 || eps_t_pct > 20.0) return -1;
+    g_g93_jerk_enable = enable ? 1 : 0;
+    g_g93_jerk_eps_v  = eps_v_pct;
+    g_g93_jerk_eps_t  = eps_t_pct;
+    printf("[SMC_API] G93 jerk 转移: enable=%d eps_v=%.1f%% eps_t=%.1f%%\n",
+           g_g93_jerk_enable, g_g93_jerk_eps_v, g_g93_jerk_eps_t);
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 论文1 B0′ 消融配置 (复审 P06 终解, 2026-09-17, RPC 0x0083):
+// f_inherit=1 时禁用 IV-B 时间再分配, 每微段继承整块进给字 (τ_b=n_b·T_b),
+// 即基线 B0 的可执行复现 (E2 消融)。
+// 返回: 0=已生效, -2=程序运行中拒绝切换 (防同程序内混合语义段)
+int SMC_ConfigG93Ablation(int f_inherit)
+{
+    if (f_inherit && g_parser_ctrl.is_running) {
+        printf("[SMC_API] G93 B0′ 消融: 程序运行中拒绝切换\n");
+        return -2;
+    }
+    g_g93_f_inherit = f_inherit ? 1 : 0;
+    printf("[SMC_API] G93 B0′ F-inheritance 消融: %s\n",
+           g_g93_f_inherit ? "ON (τ=n·T)" : "OFF (IV-B 正常分配)");
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 论文1 M1 替代设计 (2026-09-18, RPC 0x0085): 事后修正 (post-hoc correction)。
+// enable=1 时关闭 IV-D 的先验长度重标定, 段按标称 T 执行, 段末按实测速度
+// 累积赤字并把补偿落到下一段 (先测量再修正的可执行复现)。
+// 返回: 0=已生效, -2=程序运行中拒绝切换 (防同程序内混合语义段)
+int SMC_ConfigG93Posthoc(int enable)
+{
+    if (enable && g_parser_ctrl.is_running) {
+        printf("[SMC_API] G93 M1 事后修正: 程序运行中拒绝切换\n");
+        return -2;
+    }
+    g_g93_posthoc = enable ? 1 : 0;
+    g_g93_posthoc_debt = 0.0;
+    printf("[SMC_API] G93 M1 事后修正: %s\n",
+           g_g93_posthoc ? "ON (标称 T + 速度赤字 carry-over)"
+                         : "OFF (IV-D 先验长度重标定)");
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 论文1 V2 仿真战役 (2026-09-18, RPC 0x0086): IV-D 长度比重标定 关闭开关
+// (Naive 基线)。ratio_off=1 时 LINE 体不按 L_act/L_prog 重标定, 段按标称
+// 整段 T 执行 → v_act/v_cmd = γ, 用于 S5 的 Naive vs Proposed 实测对照。
+// 返回: 0=已生效, -2=程序运行中拒绝切换
+int SMC_ConfigG93Ratio(int ratio_off)
+{
+    if (g_parser_ctrl.is_running) {
+        printf("[SMC_API] G93 ratio-off: 程序运行中拒绝切换\n");
+        return -2;
+    }
+    g_g93_ratio_off = ratio_off ? 1 : 0;
+    printf("[SMC_API] G93 长度比重标定: %s\n",
+           g_g93_ratio_off ? "OFF (Naive 基线 T'=T)"
+                           : "ON (IV-D T'=T×L_act/L_prog)");
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 论文1 B2 消融 (S3 planner-rate-limiting 战役, 2026-09-19, RPC 0x0087):
+// strict_off=1 时关闭 G93 强一致性豁免, 下游 planner 对每段执行完整短板效应
+// 限幅 (常规 G94 路径) — 即基线 B2 的可执行复现 (E3 机制实证案例)。
+// strict_off=0 时恢复 Ours 强一致路径 (出厂默认)。
+// 返回: 0=已生效, -2=程序运行中拒绝切换 (防同程序内混合语义段)
+int SMC_ConfigG93StrictOff(int strict_off)
+{
+    if (g_parser_ctrl.is_running) {
+        printf("[SMC_API] G93 strict-off: 程序运行中拒绝切换\n");
+        return -2;
+    }
+    g_g93_strict_off = strict_off ? 1 : 0;
+    printf("[SMC_API] G93 强一致豁免: %s\n",
+           g_g93_strict_off ? "OFF (B2 下游 planner 正常限速)"
+                            : "ON (Ours 保持 G93 时间预算)");
+    return 0;
+}
+
+// 论文1 S10-H1 长度基消融 (IV-A 物理基, 2026-09-20, RPC 0x0088):
+// tip_basis=1 时 RTCP G93 微段的"声明速度"改用刀尖欧氏长度 L^P 反推
+//   (旋转轴折算不计入), 即 -H1 基线 —— 可行性门因此看不到旋转轴带来的
+//   机械轴真实需求, 不可行段被判为可行, 绑定轴实际跑到 m·v_ref
+//   (m = L^M/L^P)。这正是归档 S0 (B/C 越限达 5.33×) 的形态。
+// tip_basis=0 时恢复 IV-A: 声明速度 = 机械轴等效长度 L^M / 时间预算。
+// 返回: 0=已生效, -2=程序运行中拒绝切换 (防同程序内混合语义段)
+int SMC_ConfigG93TipBasis(int tip_basis)
+{
+    if (g_parser_ctrl.is_running) {
+        printf("[SMC_API] G93 tip-basis: 程序运行中拒绝切换\n");
+        return -2;
+    }
+    g_g93_tip_basis = tip_basis ? 1 : 0;
+    printf("[SMC_API] G93 RTCP 长度基: %s\n",
+           g_g93_tip_basis ? "刀尖欧氏长度 L^P (-H1 消融)"
+                           : "机械轴等效长度 L^M (IV-A 物理基)");
+    return 0;
+}
+
+// @Context: Non-RealTime Background Thread (RPC client thread)
+// 论文1 N22 (2026-09-17, RPC 0x0084): enqueue 临界区耗时统计查询。
+// reset=1 时读后清零 (下一 run 从零累计)。
+void SMC_GetEnqueueStats(int reset, uint64_t *count_all, uint64_t *count_strict,
+                         double *mean_us_all, double *mean_us_strict,
+                         double *max_us_strict)
+{
+    api_enqueue_stats_get(count_all, count_strict,
+                          mean_us_all, mean_us_strict, max_us_strict);
+    if (reset) api_enqueue_stats_reset();
+}
+
 int SMC_GetProgramStructure(SmcGetProgramStructureRes *out) {
     if (out == NULL) return -1;
     memset(out, 0, sizeof(*out));
@@ -1011,6 +1134,115 @@ int SMC_ConfigLaserDIBits(uint8_t b_door, uint8_t b_estop, uint8_t b_laser_alm,
     g_laser_cfg.bit_di_water_temp = laser_validate_bit(b_water_t);
     g_laser_cfg.bit_di_water_flow = laser_validate_bit(b_water_f);
     g_laser_cfg.bit_di_gas_press  = laser_validate_bit(b_gas_p);
+    return 0;
+}
+
+// P0-2 (2026-09-09): 互锁链规则表配置
+// @Thread-Safety: init 阶段单写者 (hw 参数表 apply / RPC 0x0074);
+//                RT safety_gate 只读 — 与 couple_table 同模式。
+// count=0 显式清规则表 = 回退默认 6 路链。
+int SMC_ConfigLaserInterlock(const LaserIlRule_t *rules, int count)
+{
+    if (count < 0 || count > LASER_IL_MAX) {
+        printf("[SMC_API] ConfigLaserInterlock count=%d 越界 (0..%d)\n",
+               count, LASER_IL_MAX);
+        return -1;
+    }
+    for (int i = 0; i < count; i++) {
+        if (rules[i].bit > 15) {
+            printf("[SMC_API] ConfigLaserInterlock 规则 %d bit=%d 越界 (0-15)\n",
+                   i, rules[i].bit);
+            return -1;
+        }
+        if (rules[i].mask == 0 || (rules[i].mask & 0x8000) || rules[i].reserved != 0) {
+            printf("[SMC_API] ConfigLaserInterlock 规则 %d mask=0x%04X 非法 "
+                   "(须非 0 且不含 bit15)\n", i, rules[i].mask);
+            return -1;
+        }
+    }
+    for (int i = 0; i < count; i++) {
+        g_laser_cfg.il_bit[i]  = rules[i].bit;
+        g_laser_cfg.il_mask[i] = rules[i].mask;
+    }
+    g_laser_cfg.il_count = count;
+    printf("[SMC_API] 激光互锁规则表: %d 条%s\n", count,
+           (count == 0) ? " (回退默认 6 路链)" : "");
+    return 0;
+}
+
+// P0-3a (2026-09-09): DI 注入/强制 (P1.5-2 起实机亦有效)
+//   sim: 传感器模拟 (互锁链可测); 实机: DI 强制 (调机隔离故障点, 覆盖 PDO)。
+//   实机开/关强制推 LASER 事件 0x0015 审计 (物理互锁旁路属敏感操作)。
+// @Thread-Safety: laser_sim_inject_di 字段级 atomic, RT acquire 读。
+int SMC_InjectLaserDi(uint16_t pattern, uint16_t enable)
+{
+    laser_sim_inject_di(pattern, enable ? 1 : 0);
+    if (!g_sim_mode) {
+        EventLogger_Push(SEVERITY_WARN, SOURCE_LASER, 0x0015,
+                         (int32_t)(((uint32_t)pattern << 16) | (enable ? 1u : 0u)),
+                         enable ? "laser DI FORCE enabled (bypasses PDO)"
+                                : "laser DI force cleared");
+    }
+    printf("[SMC_API] DI %s: pattern=0x%04X enable=%d%s\n",
+           g_sim_mode ? "注入(sim)" : "强制(实机)", pattern, enable ? 1 : 0,
+           g_sim_mode ? "" : " [物理互锁被旁路!]");
+    return 0;
+}
+
+// P1.5-1 (2026-09-14): 外围 AI 通道配置 (透传 periph_ai, 校验在其内部)
+int SMC_ConfigPeriphAi(int slave_id, int byte_off, int stride, int count,
+                       const double *fs)
+{
+    return periph_ai_config(slave_id, byte_off, stride, count, fs);
+}
+
+// P1.5-1: sim-only 传感器值注入
+int SMC_InjectPeriphAi(int ch, double val)
+{
+    return periph_ai_inject(ch, val);
+}
+
+// P1.5-2 (2026-09-15): PLC 变量强制 (透传 plc_core)
+int SMC_PlcForceVar(const char *name, double val, int on)
+{
+    return plc_core_force_var(name, val, on);
+}
+
+// P0-4a (2026-09-10): I/O 端子 PDO 布局配置 (选型适配)
+// @Thread-Safety: init 阶段单写者 (hw 档案 apply / RPC 0x0075); RT HAL 只读。
+int SMC_ConfigLaserPdoLayout(uint8_t di_off, uint8_t di_bytes,
+                             uint8_t do_off, uint8_t do_bytes,
+                             uint8_t ao_off, uint8_t ao_stride,
+                             const uint8_t *reserved)
+{
+    if (di_bytes != 1 && di_bytes != 2) {
+        printf("[SMC_API] ConfigLaserPdoLayout di_bytes=%d 非法 (1 或 2)\n", di_bytes);
+        return -1;
+    }
+    if (do_bytes != 1 && do_bytes != 2) {
+        printf("[SMC_API] ConfigLaserPdoLayout do_bytes=%d 非法 (1 或 2)\n", do_bytes);
+        return -1;
+    }
+    if (ao_stride != 2 && ao_stride != 4) {
+        printf("[SMC_API] ConfigLaserPdoLayout ao_stride=%d 非法 (2 或 4)\n", ao_stride);
+        return -1;
+    }
+    if (di_off > 63 || do_off > 63 || ao_off > 63) {
+        printf("[SMC_API] ConfigLaserPdoLayout byte_off > 63\n");
+        return -1;
+    }
+    if (reserved != NULL && (reserved[0] != 0 || reserved[1] != 0)) {
+        printf("[SMC_API] ConfigLaserPdoLayout reserved 必须 0\n");
+        return -1;
+    }
+    g_laser_cfg.di_byte_off = di_off;
+    g_laser_cfg.di_bytes    = di_bytes;
+    g_laser_cfg.do_byte_off = do_off;
+    g_laser_cfg.do_bytes    = do_bytes;
+    g_laser_cfg.ao_byte_off = ao_off;
+    g_laser_cfg.ao_stride   = ao_stride;
+    printf("[SMC_API] 激光 PDO 布局: DI off=%d bytes=%d | DO off=%d bytes=%d | "
+           "AO off=%d stride=%d\n", di_off, di_bytes, do_off, do_bytes, ao_off, ao_stride);
     return 0;
 }
 
