@@ -81,10 +81,24 @@ void bt_rt_block_start(uint32_t uid, int32_t line_no, uint32_t gen,
     g_bt.block_budget_sum_ms       = sum_ms;
     g_bt.block_virtual_ms          = 0.0;
     g_bt.block_finish_cycle        = 0;
+    /* V13.1 H3: T_plan 累计器随 block 开始清零 (RT 单写者, 见 inc/block_timing.h) */
+    g_bt.block_plan_sum_ms         = 0.0;
+    g_bt.plan_segments_loaded      = 0;
 
     if (g_bt.ctrl_start_cycle == 0) {
         g_bt.ctrl_start_cycle = (uint64_t)cycle;   /* 程序首个运动段 */
     }
+}
+
+/* V13.1 H3 (2026-09-22): 微段首次装载时累计 planner 最终 T_total。
+ * 调用契约: 每个微段恰好一次 (rt_bt_on_segment_load), 不得每 1ms cycle 重复调用,
+ * 不得用实际完成时长回填 —— 那是 T_sem (bt_rt_cycle) 的职责, 两者是独立观测量。 */
+void bt_rt_record_plan_segment(double T_total_ms)
+{
+    if (!g_bt.cur_active) return;
+
+    g_bt.block_plan_sum_ms    += T_total_ms;
+    g_bt.plan_segments_loaded++;
 }
 
 void bt_rt_segment_done(int cycle)
@@ -137,8 +151,19 @@ void bt_rt_cycle(int cycle, double virtual_inc_ms, int hold_active,
         g_bt.hold_active_ms += cycle_time_ms;
         if (virtual_inc_ms <= 0.0) g_bt.hold_frozen_cycles++;
     }
-    /* ---- 实测倍率 (只统计 is_moving 周期; 静止周期 eff_scale 不含 override) ---- */
-    if (inflight && moving) {
+    /* ---- 实测倍率 ----
+     * Phase-0 fix (2026-09-23): 原门控只判 `moving`, 与 block_virtual_ms 累加所
+     * 用的 virtual_inc 不同窗 —— 末微段完成后仍有虚拟推进的周期 moving=0,
+     * 使 Σ s_eff·Ts 比 block_virtual_ms 少 1 个周期; 而 moving=1 & virtual_inc=0
+     * 的静止周期若计入又会多 1 个。两侧实测:
+     *     moving 门控        -> 2499.0 ms (少 1)
+     *     moving||virt_inc>0 -> 2501.0 ms (多 1)
+     *     virt_inc>0         -> 2500.0 ms (与 block_virtual_ms 一致)
+     * 故门控取 `virtual_inc_ms > 0.0`: 只统计真正消费了时间预算的周期,
+     * 这正是 §25 定义的 Σ s_eff·Ts 语义。hold 周期 virt_inc=0 自然被排除,
+     * 与"feedhold 冻结虚拟时间"语义一致。
+     * eff_cycles 同增, s_eff = eff_sum/eff_cyc 语义不变。 */
+    if (inflight && virtual_inc_ms > 0.0) {
         g_bt.override_eff_sum    += eff_scale;
         g_bt.override_eff_cycles += 1;
     }

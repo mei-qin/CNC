@@ -92,6 +92,9 @@ static void rt_bt_on_segment_load(const TrajectorySegment_t *seg, int cyc)
         bt_rt_block_start(seg->block_uid, seg->line_no, seg->block_seg_count,
                           seg->block_budget_cmd_ms, seg->block_budget_sum_ms, cyc);
     }
+    /* V13.1 H3: 装载时刻的 T_total = planner 最终决定值 (段被消费后 planner
+     * 不再改写), 每段恰好记录一次。normal 段与 snap 微段共用本钩子。 */
+    bt_rt_record_plan_segment(seg->T_total);
 }
 static void rt_bt_on_segment_done(int cyc)
 {

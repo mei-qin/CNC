@@ -227,6 +227,9 @@ typedef enum {
     SMC_CMD_CONFIG_G93_STRICT_OFF     = 0x0087, /* S3 planner-rate-limiting: 1=关闭强一致豁免(B2 下游限速), 0=Ours(默认) */
     SMC_CMD_CONFIG_G93_TIP_BASIS      = 0x0088, /* S10-H1 RTCP 长度基消融: 1=刀尖欧氏长度 L^P (忽略旋转轴折算, 门看不到机械轴真实需求), 0=机械轴等效长度 L^M (Ours 默认) */
     SMC_CMD_QUERY_BLOCK_TIMING        = 0x0089, /* 论文1 S10: 控制器内 block 级计时查询 (op: 0=读, 1=清零后读) */
+
+    /* --- V13.1 (2026-09-22): G93 语义变换事件 (geometry-policy / M1 因果态) --- */
+    SMC_CMD_QUERY_G93_SEMANTIC_EVENTS = 0x008A, /* 事件环形缓冲分页查询 (op: 0=读, 1=复位后读) */
 } SmcCmdType;
 
 /* ============================================================
@@ -631,8 +634,9 @@ typedef struct { int32_t ret_code; } SmcConfigG93TipBasisRes;
  *   controller_elapsed_cycles = T_ctrl 的周期数 (真实流逝, 含 feedhold)
  *   host_runtime_ms           = T_host  —— 不在本结构, 由宿主墙钟测
  *
- * Req pack(1) 下 1+3pad = 4B; Res pack(1) 下 = 184B
- * Python: struct.unpack("<IiIQQQIIIdddQQQddQdQdQdQQQ", resp[:184])
+ * Req pack(1) 下 1+3pad = 4B; Res pack(1) 下 = 196B (V13.1 前 184B, 尾部追加
+ *        block_plan_sum_ms + plan_segments_loaded —— 旧宿主脚本需同步更新)
+ * Python: struct.unpack("<IiIQQQIIIdddQQQddQdQdQdQQQdI", resp[:196])
  * ============================================================ */
 typedef struct {
     uint8_t  op;           /* 0=只读, 1=读前清零 (下一 run 从零累计) */
@@ -670,7 +674,79 @@ typedef struct {
     uint64_t segments_completed_total;
     uint64_t blocks_closed;
     uint64_t rt_cycle_counter;          /* 读数时刻的 RT 全局 cycle */
+
+    /* ---- V13.1 H3 (2026-09-22): planner 最终目标 (T_plan, 独立于 T_sem) ---- */
+    double   block_plan_sum_ms;         /* 本 block 实际装载微段的 Σ T_total (ms), RT 装载时累计 */
+    uint32_t plan_segments_loaded;      /* 实际装载微段数 (对照 segments_generated) */
 } SmcBlockTimingRes;
+
+/* ============================================================
+ * SMC_QUERY_G93_SEMANTIC_EVENTS (0x008A, V13.1, 2026-09-22)
+ *
+ * 职责: G93 语义变换证据 (reference channel ≠ observation channel 的
+ *       controller-native 侧)。事件由刀补引擎在**真正计算几何策略**的
+ *       位置记录 (cutter_comp.c 三处策略分叉), 记录的是控制器实际产出,
+ *       严禁由宿主按 γ·T_decl 反构 observed value。
+ *
+ * 策略枚举映射 (控制器实际配置开关, 非 V13.1 新增逻辑):
+ *   RATE_PRESERVE = IV-D "Ours" 默认:  T' = T·γ, γ = L_act/L_prog
+ *   TIME_IDENTITY = Naive (0x0086 ratio_off): T' = T (不变量破坏基线)
+ *   POSTHOC       = M1   (0x0085):      T' = L_prog/v_eff, 速度赤字 carry-over
+ *
+ * M1/S7b 字段: m1_* 仅 policy=POSTHOC 时有意义 (其余策略记 0)。
+ *   u_pre = v_eff/v_cmd 是块前因果态, T_decl/T_actual 只能作 execution
+ *   diagnostic, 不得冒充 u_b。
+ *
+ * 缓冲: 控制器内 256 条环形 (SMC_G93_SEM_EVENT_CAP), 单写者 = parser 线程
+ *   (刀补引擎), 读者 = RPC 线程。宿主应在 run 结束后查询 (与 0x0084/0x0089
+ *   同一使用模式); run 进行中读取可能得到撕裂条目, 由事件 seq 连续性校验。
+ *   超出容量的最老事件被驱逐, dropped_events 暴露驱逐数 (channel validity)。
+ *
+ * 分页: SMC_RESP_BUF_LEN=512B 硬约束, 单事件 pack(1)=100B ⇒ 每页 4 条,
+ *   请求携带 start_seq (1-based, 全局递增事件号)。
+ *
+ * Req pack(1) 下 12B; Res pack(1) 下定长 16+4×100 = 416B
+ * ============================================================ */
+#define SMC_G93_SEM_EVENT_CAP            256   /* 控制器内环形容量 */
+#define SMC_G93_SEM_EVENT_MAX_PER_RSP    4     /* 512B resp_buf 约束下的每页条数 */
+
+typedef enum {
+    G93_SEM_POLICY_NONE           = 0,
+    G93_SEM_POLICY_RATE_PRESERVE  = 1,  /* IV-D 默认: T' = T·γ */
+    G93_SEM_POLICY_TIME_IDENTITY  = 2,  /* Naive (ratio_off): T' = T */
+    G93_SEM_POLICY_POSTHOC        = 3   /* M1 (posthoc): T' = L_prog/v_eff */
+} G93SemPolicy_t;
+
+typedef struct {
+    uint32_t seq;             /* 全局递增事件号 (1-based, 复位后重新从 1 起) */
+    int32_t  source_line;     /* G 代码源行号 (记录时刻 parser 的 g_current_line_no) */
+    double   T_in_ms;         /* 输入时间预算 T_in (ms) */
+    double   L_prog_mm;       /* 编程轮廓长度 (记录点控制器实际使用的量纲) */
+    double   L_act_mm;        /* 实际执行长度 */
+    double   gamma;           /* = L_act/L_prog (控制器记录点真实计算值) */
+    int32_t  policy_id;       /* G93SemPolicy_t */
+    double   T_policy_ms;     /* 控制器 native 策略输出 (实际下发的预算, ms) */
+    double   m1_debt_before;  /* S7b: 本事件修正前速度赤字 (mm/s) */
+    double   m1_v_cmd;        /* S7b: v_cmd = L_prog/T_in (mm/s) */
+    double   m1_v_eff;        /* S7b: v_eff = v_cmd + debt_before */
+    double   m1_u_pre;        /* S7b: u_pre = v_eff/v_cmd (正式 S7b 的 u_b) */
+    double   m1_debt_after;   /* 本事件修正后速度赤字 */
+} SmcG93SemEvent;             /* pack(1) 下 = 100B */
+
+typedef struct {
+    uint8_t  op;              /* 0=读取, 1=复位计数器 (响应体为复位后状态) */
+    uint8_t  _pad[3];
+    uint32_t start_seq;       /* 请求起始事件 seq (1-based; 早于最老可用则服务端钳到最老) */
+    uint32_t max_count;       /* 请求条数 (服务端钳到 SMC_G93_SEM_EVENT_MAX_PER_RSP) */
+} SmcG93SemEventsReq;         /* pack(1) 下 = 12B */
+
+typedef struct {
+    int32_t  ret_code;        /* 恒 0 */
+    uint32_t total_count;     /* 累计记录事件数 (monotonic, 复位清零) */
+    uint32_t dropped_events;  /* 环形驱逐数 = (total > CAP) ? total - CAP : 0 */
+    uint32_t returned_count;  /* 本页实际拷贝条数 (events[] 前 returned_count 个有效) */
+    SmcG93SemEvent events[SMC_G93_SEM_EVENT_MAX_PER_RSP];
+} SmcG93SemEventsRes;         /* pack(1) 下 = 16 + 400 = 416B */
 
 
 /* SMC_QUERY_ENQUEUE_STATS: Req pack(1) 下 1+3pad = 4B;

@@ -15,6 +15,43 @@ extern int    g_g93_posthoc;
 extern double g_g93_posthoc_debt;
 extern int    g_g93_ratio_off;   /* V2 战役: Naive 基线 (关闭 IV-D 比重标定) */
 
+// ================== V13.1 (2026-09-22): G93 semantic-event recorder ==================
+// 纯插桩: 只读取下方三处策略分支**已算出**的量, 不参与任何几何/预算决策。
+// γ = L_act/L_prog 一律取控制器记录点真实使用的量纲 (LINE=编程轮廓直线距离,
+// 外角弧= Lp/(Lp+arc_len), 弧体= 编程轮廓弧长; POSTHOC 弧体含螺旋非平面分量)。
+// 单写者 = parser 线程 (本引擎), 读者 = RPC 0x008A 线程 (run 后查询)。
+static SmcG93SemEvent g_g93_sem_events[SMC_G93_SEM_EVENT_CAP];
+static uint32_t g_g93_sem_total    = 0;   /* 累计记录数 (monotonic) */
+static uint32_t g_g93_sem_dropped  = 0;   /* 环内最老被驱逐数 */
+
+// @Context: Non-RealTime Background Thread (parser, 策略分叉内)
+// @Safe: 纯内存写, 无阻塞。m1_* 仅 POSTHOC 策略有效, 其余策略传 0。
+static void g93_sem_record(int32_t source_line,
+                           double T_in_ms, double L_prog_mm, double L_act_mm,
+                           int32_t policy_id, double T_policy_ms,
+                           double m1_debt_before, double m1_v_cmd,
+                           double m1_v_eff, double m1_debt_after)
+{
+    if (g_g93_sem_total >= SMC_G93_SEM_EVENT_CAP) g_g93_sem_dropped++;
+    uint32_t seq = ++g_g93_sem_total;
+
+    SmcG93SemEvent *ev = &g_g93_sem_events[(seq - 1) % SMC_G93_SEM_EVENT_CAP];
+    ev->seq            = seq;
+    ev->source_line    = source_line;
+    ev->T_in_ms        = T_in_ms;
+    ev->L_prog_mm      = L_prog_mm;
+    ev->L_act_mm       = L_act_mm;
+    ev->gamma          = (L_prog_mm > COMP_ZERO_LEN_TOL)
+                          ? (L_act_mm / L_prog_mm) : 1.0;
+    ev->policy_id      = policy_id;
+    ev->T_policy_ms    = T_policy_ms;
+    ev->m1_debt_before = m1_debt_before;
+    ev->m1_v_cmd       = m1_v_cmd;
+    ev->m1_v_eff       = m1_v_eff;
+    ev->m1_u_pre       = (m1_v_cmd > 1e-9) ? (m1_v_eff / m1_v_cmd) : 1.0;
+    ev->m1_debt_after  = m1_debt_after;
+}
+
 // ================== 全局引擎状态 ==================
 static CutterCompState_t g_comp;
 
@@ -389,12 +426,17 @@ static int cutter_emit_line_scaled(const CompSegment_t *seg,
     // 论文1 V2 仿真战役 (2026-09-18): Naive 基线 (g_g93_ratio_off=1) ——
     // 不做先验长度重标定, 段按标称整段 T 执行 → v_act/v_cmd = γ (E4 解析预测)。
     if(g_g93_ratio_off && !g_g93_posthoc) {
+        // V13.1 H4: native policy witness —— T' = T (标称, 无重标定)
+        g93_sem_record(seg->source_line, seg->g93_dt_sec * 1000.0,
+                       l_prog, l_act, G93_SEM_POLICY_TIME_IDENTITY,
+                       seg->g93_dt_sec * 1000.0, 0, 0, 0, 0);
         return cutter_emit_dt(pos, speed, acc, dec, 1, seg->g93_dt_sec);
     }
 
     // 论文1 M1 替代设计 (2026-09-18): 事后修正 —— 不做先验长度重标定,
     // 段按标称 T 执行; 段末按实测 v_act 累积速度赤字, 补偿到下一段。
     if(g_g93_posthoc && seg->g93_dt_sec > 1e-9 && l_prog > COMP_ZERO_LEN_TOL) {
+        double sem_debt_before = g_g93_posthoc_debt;      // V13.1 S7b: 块前因果态
         double v_cmd = l_prog / seg->g93_dt_sec;          // mm/s
         double dt    = seg->g93_dt_sec;                   // 标称, 无先验缩放
         double v_eff = v_cmd + g_g93_posthoc_debt;        // 上一段赤字补偿
@@ -403,9 +445,18 @@ static int cutter_emit_line_scaled(const CompSegment_t *seg,
         // 段末"测量": 实际走过 l_act, 实际耗时 dt
         double v_act = l_act / dt;
         g_g93_posthoc_debt += (v_cmd - v_act);
+        // V13.1 H4+S7b: T' = l_prog/v_eff (含赤字效应的 native 输出);
+        // u_pre = v_eff/v_cmd 是正式 S7b 的 u_b (非 T_decl/T_actual)
+        g93_sem_record(seg->source_line, seg->g93_dt_sec * 1000.0,
+                       l_prog, l_act, G93_SEM_POLICY_POSTHOC, dt * 1000.0,
+                       sem_debt_before, v_cmd, v_eff, g_g93_posthoc_debt);
         return cutter_emit_dt(pos, speed, acc, dec, 1, dt);
     }
 
+    // V13.1 H4: IV-D "Ours" 默认 —— T' = T·γ (先验长度比重标定)
+    g93_sem_record(seg->source_line, seg->g93_dt_sec * 1000.0,
+                   l_prog, l_act, G93_SEM_POLICY_RATE_PRESERVE,
+                   seg->g93_dt_sec * ratio * 1000.0, 0, 0, 0, 0);
     return cutter_emit_dt(pos, speed, acc, dec, 1, seg->g93_dt_sec * ratio);
 }
 
@@ -600,13 +651,19 @@ static int process_corner_line_line(const CompSegment_t *segA,
         double dt_line = T_seg;   // 直线体预算 (默认 Ours 语义)
         double dt_arc  = 0.0;     // 过渡弧预算 (总数, 再按 num_seg 均分)
         if(is_g93) {
+            // V13.1 H4/S7b: 策略事件采集 (纯读, 不改预算)
+            int    sem_pol = G93_SEM_POLICY_RATE_PRESERVE;
+            double sem_db = 0.0, sem_vc = 0.0, sem_ve = 0.0;
             if(g_g93_ratio_off && !g_g93_posthoc) {
                 // Naive: 直线体+弧共享整段 T, 各按实际长度占比分配
+                sem_pol = G93_SEM_POLICY_TIME_IDENTITY;
                 double L_act = Lp + arc_len;
                 dt_line = (L_act > COMP_ZERO_LEN_TOL) ? T_seg * (Lp / L_act) : T_seg;
                 dt_arc  = T_seg - dt_line;
             } else if(g_g93_posthoc) {
                 // M1: 直线体按 nominal T 跑并累积速度赤字 (与 cutter_emit_line_scaled 同口径)
+                sem_pol = G93_SEM_POLICY_POSTHOC;
+                sem_db  = g_g93_posthoc_debt;           // V13.1 S7b: 修正前
                 double l_act_line = g_comp.last_emit_valid
                                     ? comp_axis_dist(g_comp.last_emit_pos, ptA) : Lp;
                 double v_eff = v_cmd + g_g93_posthoc_debt;
@@ -615,10 +672,19 @@ static int process_corner_line_line(const CompSegment_t *segA,
                 double v_act_line = (dt_line > 1e-9) ? (l_act_line / dt_line) : 0.0;
                 g_g93_posthoc_debt += (v_cmd - v_act_line);
                 dt_arc = arc_len / v_cmd;   // 弧按自身弧长计预算 (不累积赤字)
+                sem_vc = v_cmd;
+                sem_ve = v_eff;
             } else {
                 // Ours (IV-D 默认): 直线体占整段 T, 弧按弧长追加
                 dt_arc = arc_len / v_cmd;
             }
+            // V13.1 H4: 外角过渡策略点 native 输出 —— γ = (Lp+arc_len)/Lp,
+            // T' = dt_line+dt_arc (RATE_PRESERVE 下 = T+arc_len/v_cmd = γ·T)
+            g93_sem_record(segA->source_line, T_seg * 1000.0, Lp, Lp + arc_len,
+                           sem_pol, (dt_line + dt_arc) * 1000.0,
+                           sem_db, sem_vc, sem_ve,
+                           (sem_pol == G93_SEM_POLICY_POSTHOC)
+                             ? g_g93_posthoc_debt : 0.0);
         }
 
         cutter_emit_dt(ptA, speed, acc, dec, is_g93, dt_line);
@@ -942,6 +1008,18 @@ static void discretize_offset_arc(const CompSegment_t *arc,
         T_portion = arc->g93_dt_sec;
     }
 
+    // V13.1 H4/S7b: 弧体策略事件采集 (纯读, 不改预算)。
+    // L_prog/L_act 取控制器记录点实际量纲: POSTHOC 用含非平面分量的
+    // l_prog_full/l_act_arc; 其余策略用平面弧长 (γ 解析 = |s_end/sweep|)。
+    int    sem_pol3 = 0;
+    double sem3_lp = 0.0, sem3_la = 0.0;
+    double sem3_db = 0.0, sem3_vc = 0.0, sem3_ve = 0.0;
+    if (arc->g93_dt_sec > 1e-9) {
+        sem_pol3 = g_g93_posthoc ? G93_SEM_POLICY_POSTHOC
+                  : (g_g93_ratio_off ? G93_SEM_POLICY_TIME_IDENTITY
+                                     : G93_SEM_POLICY_RATE_PRESERVE);
+    }
+
     // 论文1 M1 替代设计 (2026-09-18): 事后修正 —— 弧体同样不做先验扫角占比
     // 缩放; 按标称 T 执行, 段末按实测 (v_act = L_act/T_eff) 累积速度赤字,
     // 并补偿到下一段。
@@ -977,12 +1055,31 @@ static void discretize_offset_arc(const CompSegment_t *arc,
                                     * (dnon * fabs(sweep_ratio)));
         double v_cmd = (l_prog_full > COMP_ZERO_LEN_TOL)
                        ? l_prog_full / arc->g93_dt_sec : 0.0;
+        sem3_lp = l_prog_full;
+        sem3_la = l_act_arc;
+        sem_pol3 = G93_SEM_POLICY_POSTHOC;   // v_cmd 退化时无修正, T' 保持 T·|ratio|
         if(v_cmd > 1e-9) {
+            sem3_db = g_g93_posthoc_debt;    // V13.1 S7b: 修正前
             double v_eff = v_cmd + g_g93_posthoc_debt;
             T_portion = (v_eff > 1e-9) ? (l_prog_full / v_eff) : arc->g93_dt_sec;
             double v_act = l_act_arc / T_portion;
             g_g93_posthoc_debt += (v_cmd - v_act);
+            sem3_vc = v_cmd;
+            sem3_ve = v_eff;
         }
+    }
+    if(arc->g93_dt_sec > 1e-9 && sem_pol3 != G93_SEM_POLICY_POSTHOC) {
+        // 非 POSTHOC (Naive/IV-D): 统一平面弧长量纲 (γ 解析 = |s_end/s_full|)
+        double R_sem = fabs(arc->radius);
+        sem3_lp  = fabs(arc->sweep) * R_sem;
+        sem3_la  = fabs(s_end) * R_sem;
+    }
+    if(arc->g93_dt_sec > 1e-9) {
+        g93_sem_record(arc->source_line, arc->g93_dt_sec * 1000.0,
+                       sem3_lp, sem3_la, sem_pol3, T_portion * 1000.0,
+                       sem3_db, sem3_vc, sem3_ve,
+                       (sem_pol3 == G93_SEM_POLICY_POSTHOC)
+                         ? g_g93_posthoc_debt : 0.0);
     }
     int is_g93_arc = (T_portion > 1e-9) ? 1 : 0;
 
@@ -1780,7 +1877,8 @@ void CutterComp_SetOutput(CutterOutputCB fn)
 //   入口缓存 G93 到 g_comp, cutter_emit / 直通路径 读取后透传到 output_fn.
 int CutterComp_PushPoint(double pos[AXIS_NUM], double speed,
                          double acc, double dec,
-                         int is_g93_strict, double g93_dt_sec)
+                         int is_g93_strict, double g93_dt_sec,
+                         int32_t source_line)
 {
     // C3: 缓存 G93 上下文 (cutter_emit / 后续 cutter_emit 调用读取)
     g_comp.g93_strict_pending = is_g93_strict;
@@ -1831,6 +1929,10 @@ int CutterComp_PushPoint(double pos[AXIS_NUM], double speed,
     // 不能用 g_comp.g93_dt_sec_pending 顶替: LINE 体是【延迟一段】输出的,
     // pending 此时已被下一段覆盖 (相邻块 F 不同会吃错预算)。
     new_seg.g93_dt_sec = g93_dt_sec;
+
+    // V13.1 Phase-0: semantic owner 捕获于此 (创建时刻), 而非 emit 时刻。
+    // 补偿输出延迟一~二段, emit 时读 g_current_line_no 会拿到"未来的行"。
+    new_seg.source_line = source_line;
 
     // 第一次推入 (window_count==1): 仅填窗口, 不触发拐角处理
     // (因为没有 segA 可配对)
@@ -1920,7 +2022,7 @@ static int push_arc_strategy_a_discretize(const CompSegment_t *arc,
                        : 0.0;
         int is_g93_seg = (seg_T > 1e-9) ? 1 : 0;
         if(CutterComp_PushPoint(pt, arc->speed, arc->acc, arc->dec,
-                                  is_g93_seg, seg_T) < 0) return -1;
+                                  is_g93_seg, seg_T, arc->source_line) < 0) return -1;
     }
     return 0;
 }
@@ -1994,4 +2096,43 @@ int CutterComp_PushArc(const CompSegment_t *arc)
 double CutterComp_GetRadius(void)
 {
     return g_comp.radius;
+}
+
+// ================== V13.1: G93 semantic-event 读取 API (RPC 0x008A) ==================
+
+// @Context: Non-RealTime Background Thread (RPC 线程调用)
+// @Thread-Safety: 单写者 (parser) / 对齐 u32 计数器, 读侧无锁。
+void CutterComp_G93SemReset(void)
+{
+    g_g93_sem_total   = 0;
+    g_g93_sem_dropped = 0;
+}
+
+uint32_t CutterComp_G93SemTotal(void)
+{
+    return g_g93_sem_total;
+}
+
+uint32_t CutterComp_G93SemDropped(void)
+{
+    return g_g93_sem_dropped;
+}
+
+int CutterComp_G93SemCopy(uint32_t start_seq, uint32_t max_count,
+                          SmcG93SemEvent *out)
+{
+    if(out == 0 || max_count == 0) return 0;
+    uint32_t total = g_g93_sem_total;
+    if(total == 0 || start_seq > total) return 0;
+
+    uint32_t oldest = (total > SMC_G93_SEM_EVENT_CAP)
+                      ? (total - SMC_G93_SEM_EVENT_CAP + 1) : 1;
+    if(start_seq < oldest) start_seq = oldest;
+
+    uint32_t n = total - start_seq + 1;
+    if(n > max_count) n = max_count;
+    for(uint32_t k = 0; k < n; k++) {
+        out[k] = g_g93_sem_events[(start_seq + k - 1) % SMC_G93_SEM_EVENT_CAP];
+    }
+    return (int)n;
 }

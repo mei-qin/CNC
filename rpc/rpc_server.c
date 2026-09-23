@@ -38,6 +38,7 @@
 #include "rpc_preview_server.h" /* P0-b v1: rpc_preview_server_start */
 #include "event_logger.h"      /* P1-b: EventLogger_Init */
 #include "block_timing.h"      /* 论文1 S10: g_bt / bt_reset_all (RPC 0x0089) */
+#include "cutter_comp.h"       /* V13.1: CutterComp_G93Sem* (RPC 0x008A) */
 #include "rpc_event_server.h"  /* P1-b: rpc_event_server_start */
 #include "opcua_server.h"      /* 契约 P4: opcua_server_start (OPC UA 4840 对外通道) */
 #include "param_store.h"       /* P1+P2: 机床参数档案 (kernel_init_hw 数据源) */
@@ -1133,18 +1134,57 @@ static int handle_client_request(int client_fd)
         res->segments_completed_total  = g_bt.segments_completed_total;
         res->blocks_closed             = g_bt.blocks_closed;
         res->rt_cycle_counter          = g_bt.rt_cycle_counter;
+        /* V13.1 H3 (2026-09-22): planner 最终目标 (T_plan), 独立于 T_sem */
+        res->block_plan_sum_ms         = g_bt.block_plan_sum_ms;
+        res->plan_segments_loaded      = g_bt.plan_segments_loaded;
         printf("[rpc] BlockTiming(op=%u): uid=%u line=%d elapsed=%llu cyc "
                "(gen=%u done=%u, cmd=%.3fms sum=%.3fms) | ctrl=%llu cyc, "
-               "virt=%.3fms, hold=%llu cyc\n",
+               "virt=%.3fms, hold=%llu cyc, plan=%.3fms/%u\n",
                (unsigned)bt_op, res->block_uid, res->block_line_no,
                (unsigned long long)res->block_elapsed_cycles,
                res->segments_generated, res->segments_completed,
                res->block_budget_cmd_ms, res->block_budget_sum_ms,
                (unsigned long long)res->controller_elapsed_cycles,
                res->virtual_elapsed_ms,
-               (unsigned long long)res->hold_active_cycles);
+               (unsigned long long)res->hold_active_cycles,
+               res->block_plan_sum_ms, res->plan_segments_loaded);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcBlockTimingRes);
+        break;
+    }
+
+    /* ===== V13.1 (2026-09-22): G93 语义变换事件查询 0x008A ===== */
+    case SMC_CMD_QUERY_G93_SEMANTIC_EVENTS: {
+        uint8_t  sem_op = 0;
+        uint32_t start_seq = 1;
+        uint32_t max_count = SMC_G93_SEM_EVENT_MAX_PER_RSP;
+        if (req_hdr.data_len >= sizeof(SmcG93SemEventsReq)) {
+            SmcG93SemEventsReq *sem_req = (SmcG93SemEventsReq *)payload;
+            sem_op     = sem_req->op;
+            start_seq  = sem_req->start_seq;
+            max_count  = sem_req->max_count;
+        }
+        if (max_count == 0 || max_count > SMC_G93_SEM_EVENT_MAX_PER_RSP) {
+            max_count = SMC_G93_SEM_EVENT_MAX_PER_RSP;
+        }
+        if (sem_op == 1) {
+            CutterComp_G93SemReset();   /* 宿主在每次 run 前显式调用 */
+        }
+        SmcG93SemEventsRes *res = (SmcG93SemEventsRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code       = 0;
+        res->total_count    = CutterComp_G93SemTotal();
+        res->dropped_events = CutterComp_G93SemDropped();
+        res->returned_count = (uint32_t)CutterComp_G93SemCopy(start_seq, max_count,
+                                                              res->events);
+        printf("[rpc] G93SemEvents(op=%u): start=%lu total=%lu dropped=%lu "
+               "returned=%lu\n",
+               (unsigned)sem_op, (unsigned long)start_seq,
+               (unsigned long)res->total_count,
+               (unsigned long)res->dropped_events,
+               (unsigned long)res->returned_count);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcG93SemEventsRes);
         break;
     }
 

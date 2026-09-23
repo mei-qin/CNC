@@ -2586,6 +2586,8 @@ int parse_gcode_line(const char *gcode_line)
                 arc_seg.dec = DEFAULT_DEC;
                 // C3 (2026-07-27): G93 强一致性时间预算 (PushArc 内部均分到离散微段)
                 arc_seg.g93_dt_sec = (g_state.feed_mode == FEED_MODE_G93) ? g93_T_sec : 0.0;
+                // V13.1 Phase-0: semantic owner —— 本行是 arc_seg.g93_dt_sec 的来源
+                arc_seg.source_line = g_current_line_no;
 
                 if(CutterComp_PushArc(&arc_seg) < 0){
                     printf("[Parser] 刀补圆弧入队失败(报警)，中止当前文件！\n");
@@ -2622,7 +2624,8 @@ int parse_gcode_line(const char *gcode_line)
                 int is_g93_here = (g_state.feed_mode == FEED_MODE_G93) ? 1 : 0;
                 if(CutterComp_PushPoint(machine_target_pos, speed_mm_sec,
                                         DEFAULT_ACC, DEFAULT_DEC,
-                                        is_g93_here, g93_T_sec) < 0){
+                                        is_g93_here, g93_T_sec,
+                                        g_current_line_no) < 0){
                     printf("[Parser] 刀补引擎入队失败(报警)，中止当前文件！\n");
                     return -1;
                 }

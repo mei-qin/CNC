@@ -2,6 +2,7 @@
 #define CUTTER_COMP_H
 
 #include "axis_cfg.h"
+#include "smc_protocol.h"   /* V13.1: SmcG93SemEvent (0x008A 事件契约, gcode_parser.c 同先例) */
 
 // ================== 2D 刀具半径补偿引擎 ==================
 // 插入于 gcode_parser 与 B-Spline/Planner 之间的计算几何层。
@@ -51,6 +52,14 @@ typedef struct {
     double radius;                // 圆弧半径 (mm)
     double sweep;                 // 扫角 (rad, 正=CCW G03, 负=CW G02)
     int    is_CW;                 // 1=G02 CW, 0=G03 CCW
+    /* V13.1 Phase-0 (2026-09-23): semantic ownership。
+     * 补偿输出是【延迟】的 (两段滑动窗口) —— emit 第 N 段时 parser 已推进到
+     * N+1/N+2 行, 故 g93_sem_record() **禁止**再读全局 g_current_line_no,
+     * 必须读本字段 (= 本段创建时刻 PushPoint/PushArc 入口捕获的行号)。
+     * 语义定义: source_line = owner of T_in (该 CompSegment_t 的 g93_dt_sec
+     * 被哪一行消费)。传播靠结构体整体赋值 (window_seg[0]=window_seg[1]),
+     * 故随滑动窗口自动流转, 无需逐字段维护。 */
+    int32_t source_line;
 } CompSegment_t;
 
 // ---- 几何容差与圆弧离散化参数 ----
@@ -140,10 +149,14 @@ void CutterComp_SetOutput(CutterOutputCB fn);
 // dec:   减速度 (mm/s^2)
 // is_g93_strict: 0=常规 G94 路径, 1=G93 强一致性 (C3 2026-07-27)
 // g93_dt_sec: G93 段时间预算 (秒), 仅 is_g93_strict=1 时生效
+// V13.1 Phase-0 (2026-09-23): source_line 为本 segment 的 semantic owner
+// (== 创建本 CompSegment_t 时 parser 正在解析的 G-code 源行号)。
+// 必须显式传入, 不得由补偿引擎内部再读 g_current_line_no —— 延迟窗口下不可靠。
 // 返回 0=成功, -1=输出回调失败
 int  CutterComp_PushPoint(double pos[AXIS_NUM], double speed,
                           double acc, double dec,
-                          int is_g93_strict, double g93_dt_sec);
+                          int is_g93_strict, double g93_dt_sec,
+                          int32_t source_line);
 
 // @Context: Non-RealTime Background Thread (parser 调用)
 // @Thread-Safety: 由 parser 线程独占调用。
@@ -160,5 +173,27 @@ int  CutterComp_GetMode(void);
 // @Context: Non-RealTime Background Thread
 // 查询当前刀具半径 (mm)
 double CutterComp_GetRadius(void);
+
+// ================== V13.1 (2026-09-22): G93 semantic-event 读取 API ==================
+// 事件环由本引擎 (parser 线程) 单写者填充, RPC 0x008A 线程只读。
+// 纯插桩: 不改变任何刀补几何/预算决策, 记录点见 cutter_comp.c 三处策略分叉。
+
+// @Context: Non-RealTime Background Thread (RPC 线程调用)
+// @Thread-Safety: 计数器为对齐 u32, 单写者 (parser) 读侧无锁。
+// 复位事件环计数 (宿主在每次 run 前经 0x008A op=1 调用)
+void CutterComp_G93SemReset(void);
+
+// 累计记录事件数 (monotonic)
+uint32_t CutterComp_G93SemTotal(void);
+
+// 环形驱逐数 (total - CAP, 超出部分的最老事件已不可读)
+uint32_t CutterComp_G93SemDropped(void);
+
+// 拷贝 [start_seq, start_seq+max_count) 中仍在环内的事件到 out。
+// start_seq 早于最老可用则钳到最老; 返回实际拷贝条数。
+// 建议 run 结束后调用 (与 0x0084/0x0089 同模式); 进行中调用可能得到撕裂条目,
+// 宿主用事件 seq 连续性校验有效性。
+int CutterComp_G93SemCopy(uint32_t start_seq, uint32_t max_count,
+                          SmcG93SemEvent *out);
 
 #endif // CUTTER_COMP_H

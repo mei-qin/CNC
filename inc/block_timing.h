@@ -71,6 +71,19 @@ typedef struct {
      * 用 cur_active 门控, 程序尾部空转周期会被误计入 stall/virtual。 */
     uint64_t block_finish_cycle;
 
+    /* ---- V13.1 H3 (2026-09-22): planner 最终目标 (T_plan) ----
+     * block_plan_sum_ms    = 本 block 实际进入 RT 执行的微段 T_total 之和 (ms)。
+     *                        在 RT 首次装载各微段时累计 —— 装载时刻的 T_total
+     *                        即 planner 的最终决定值 (段被消费后 planner 不再改写)。
+     * plan_segments_loaded = 实际装载微段数 (与 segments_generated 对照, 含 snap)。
+     * ⚠ T_plan != T_sem (block_virtual_ms): 前者是 planner 目标, 后者是运行时
+     *   语义实现 (被 override/feedhold 缩放) —— H3 要求两者独立可读。
+     * ⚠ 清零/累计均在 RT 侧单写者完成 (bt_rt_block_start / bt_rt_record_plan_segment),
+     *   严禁在 parser 侧 bt_block_open 清零 —— 队列积压时 parser 领先 RT 数百段,
+     *   跨线程清零会毁掉 RT 正在累计的旧块数据。 */
+    double   block_plan_sum_ms;
+    uint32_t plan_segments_loaded;
+
     /* ---- RT 侧: block 切换检测 ---- */
     uint32_t cur_uid;               /* 当前 in-flight block 的 uid */
     int      cur_active;            /* 1 = 已有 in-flight block */
@@ -117,5 +130,7 @@ void bt_rt_block_start(uint32_t uid, int32_t line_no, uint32_t gen,
 void bt_rt_segment_done(int cycle);
 void bt_rt_cycle(int cycle, double virtual_inc_ms, int hold_active,
                  double cycle_time_ms, double eff_scale, int moving);
+/* V13.1 H3: 微段首次进入 RT 执行时记录其最终 T_total (每段恰好一次) */
+void bt_rt_record_plan_segment(double T_total_ms);
 
 #endif /* BLOCK_TIMING_H */
