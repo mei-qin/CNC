@@ -6,12 +6,15 @@
 #  10 halui.feed-override.value
 # 注: motion.feed-hold 为 IN 引脚不可 net 进 sampler (IN→IN),
 #     P6 由 feed_upm==0 特征窗口 + 运行时刻表联合判定 (M_PRED P6 口径)
-loadrt sampler cfg=fffffffssf depth=16384
+# 修正 (2026-09-28 首接触, README checklist#8 预告类): 发行版 core_sim.hal 已把
+# joint.N.motor-pos-cmd 挂到信号 Xpos/Ypos/Zpos (输出引脚仅属一个信号),
+# 故位置通道并入既有信号而非重新 net 源引脚。
+loadrt sampler cfg=fffffffssf depth=65536
 addf sampler.0 servo-thread
 
-net l15:j0 joint.0.motor-pos-cmd   => sampler.0.pin.0
-net l15:j1 joint.1.motor-pos-cmd   => sampler.0.pin.1
-net l15:j2 joint.2.motor-pos-cmd   => sampler.0.pin.2
+net Xpos sampler.0.pin.0
+net Ypos sampler.0.pin.1
+net Zpos sampler.0.pin.2
 net l15:cv  motion.current-vel     => sampler.0.pin.3
 net l15:rv  motion.requested-vel   => sampler.0.pin.4
 net l15:fu  motion.feed-upm        => sampler.0.pin.5

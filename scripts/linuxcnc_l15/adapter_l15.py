@@ -17,7 +17,7 @@ from statistics import median
 
 TOL_PIN, TOL_OVR, H1_MARGIN, HOLD_MIN = 0.02, 0.03, 0.01, 0.1
 
-COLS = ["sample", "j0", "j1", "j2", "cur_vel", "req_vel",
+COLS = ["j0", "j1", "j2", "cur_vel", "req_vel",
         "feed_upm", "dtg", "mtype", "pline", "ovr"]
 
 
@@ -83,6 +83,7 @@ def load_capture(path):
     for raw in open(path):
         parts = raw.split()
         if len(parts) != len(COLS):
+            continue
             continue
         try:
             vals = [float(x) for x in parts]
@@ -178,7 +179,7 @@ def main():
             while j < len(rows) and rows[j]["mtype"] in (2.0, 3.0) \
                     and rows[j]["feed_upm"] < 1e-9:
                 j += 1
-            dur = (rows[j - 1]["sample"] - rows[i]["sample"] + 1) * ts
+            dur = (j - i) * ts
             if dur >= HOLD_MIN:
                 holds.append(dict(i0=i, i1=j - 1, dur_s=round(dur, 3)))
             i = j
@@ -190,9 +191,7 @@ def main():
     for ax, col in (("X", "j0"), ("Y", "j1"), ("Z", "j2")):
         vmax = 0.0
         for k in range(1, len(rows)):
-            dn = rows[k]["sample"] - rows[k - 1]["sample"]
-            if dn > 0:
-                vmax = max(vmax, abs(rows[k][col] - rows[k - 1][col]) / (dn * ts))
+            vmax = max(vmax, abs(rows[k][col] - rows[k - 1][col]) / ts)  # 行连续, dn=1
         limit = lim.get(ax, {}).get("MAX_VELOCITY", float("inf"))
         h1[ax] = dict(v_ref_max=round(vmax, 3), limit=limit,
                       ok=vmax <= limit * (1 + H1_MARGIN))
