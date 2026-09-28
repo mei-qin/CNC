@@ -41,14 +41,18 @@ r3: 10.0s IDLE, hold 1.003s, capture 11214 行 (sha256 8e4baa66ccaf75)
 ### F-1 源码定性 (2026-09-29, 2.9@fe72abb 源码核对)
 
 - `convert_straight` (interp_convert.cc:4844→4851): `inverse_time_rate_straight` 换算并覆写
-  `settings->feed_rate` → **显式 `write_canon_state_tag`** → STRAIGHT_FEED ⇒ tag.F = 本块正确值
-- `convert_arc2` (602→606): `inverse_time_rate_arc` 换算 → **直接 ARC_FEED, 路径无 tag 刷新**
+  `settings->feed_rate` → **再 `write_canon_state_tag`** → STRAIGHT_FEED ⇒ tag.F = 本块正确值
+- 圆弧路径 (2026-09-29 v2.1 修正, 初版表述不准确): `convert_arc` 分发层在进入 `convert_arc2`
+  **之前**打包标签 (interp_convert.cc:479, 注释自述 settings 变更此时应已完成), 而
+  `inverse_time_rate_arc` 换算发生在被分发的 `convert_arc2` 内部、ARC_FEED 之前 (602→606);
+  该路径换算后无再次打包 ⇒ **弧的 state tag 在逆时间换算之前被捕获**
 - `enqueue_ARC_FEED` (interp_queue.cc:343-370) 只入队运动参数; tag 经全局 `state_tag`
-  (interp_internal.hh:667) 旁路作用于 flush 时的 canon 调用 ⇒ **弧命令携带上一块的陈旧 tag.F**
+  (interp_internal.hh:667) 旁路作用于 flush 时的 canon 调用 ⇒ **弧命令携带换算前的陈旧 tag.F**
   (观测值 600.00 = B3 的 L×F, 吻合)
-- **性质**: `motion.feed-upm` 文档语义 ("program F value × override") 在 G93 弧上失效,
-  报告的是上一块的换算速率 —— 诊断见证缺陷; 运动本体不受影响 (requested-vel 精确、
-  轨迹与完成时序正确, P2/H1 PASS)。
+- **性质** (v2.1 收紧口径): **诊断见证的确定性传播不一致** (diagnostic witness propagation
+  inconsistency), 非运动规划/进给执行缺陷 —— `motion.feed-upm` 文档语义 ("program F value ×
+  override") 在 G93 弧上失效, 报告上一块换算速率; 本文采集的命令侧运动观测 (requested-vel/
+  指令轨迹/完成时序) 未显示对应偏离 (P2/H1 PASS)。
 - **方法论意义**: 该缺陷由"两原生见证一致性"检查暴露 (P1 vs P2 分叉), 而一切运动层输出
   全部正常 —— 论文核心论点 (输出验收不覆盖见证级语义) 在第三方控制器上的活例。
 - 上游是否已修: 未核查 (master 分支, 网络受限); 如投稿需要可补。
