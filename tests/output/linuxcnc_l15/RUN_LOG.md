@@ -30,10 +30,36 @@ capture_r1.csv: 11214 行, SHA256 前缀 ce7a8b461d402523。程序 10.0s 完成 
 **处置**: 记为 L2 源码调查项(interp_inverse.cc 已读, convert_arc 分支未逐行核);
 在定性前仅描述为"stock 2.9.4 上 arc 块两见证分歧的确定性观测(r1 单样本)"。
 
-## r2/r3 (无效, 2026-09-29)
+## r2/r3 (有效, 2026-09-29 补跑; 共 3/3 有效)
 
-iocontrol 间歇性楔死(已知 WSL 弱点): task 卡 RUNNING、capture 全 idle、65536 行陈旧。
-r2/r3 归档仅为完整性;不进入任何对照统计。
+清场仪式 + (r3 起) io 就绪门 (oneshot.sh 轮询 iocontrol.0.user-enable-out) 后:
+r2: 10.0s IDLE, hold 1.001s, capture 11215 行 (sha256 b39a9a31c5dcd2)
+r3: 10.0s IDLE, hold 1.003s, capture 11214 行 (sha256 8e4baa66ccaf75)
+**F-1 圆弧分叉三跑逐位一致: fu=600.00, ratio=0.3183, rv=31.4159** —— 确定性, 非噪声。
+(首次 r2/r3 尝试曾楔死于 iocontrol 间歇失效; io 就绪门后未再复现, 属环境级问题)
+
+### F-1 源码定性 (2026-09-29, 2.9@fe72abb 源码核对)
+
+- `convert_straight` (interp_convert.cc:4844→4851): `inverse_time_rate_straight` 换算并覆写
+  `settings->feed_rate` → **显式 `write_canon_state_tag`** → STRAIGHT_FEED ⇒ tag.F = 本块正确值
+- `convert_arc2` (602→606): `inverse_time_rate_arc` 换算 → **直接 ARC_FEED, 路径无 tag 刷新**
+- `enqueue_ARC_FEED` (interp_queue.cc:343-370) 只入队运动参数; tag 经全局 `state_tag`
+  (interp_internal.hh:667) 旁路作用于 flush 时的 canon 调用 ⇒ **弧命令携带上一块的陈旧 tag.F**
+  (观测值 600.00 = B3 的 L×F, 吻合)
+- **性质**: `motion.feed-upm` 文档语义 ("program F value × override") 在 G93 弧上失效,
+  报告的是上一块的换算速率 —— 诊断见证缺陷; 运动本体不受影响 (requested-vel 精确、
+  轨迹与完成时序正确, P2/H1 PASS)。
+- **方法论意义**: 该缺陷由"两原生见证一致性"检查暴露 (P1 vs P2 分叉), 而一切运动层输出
+  全部正常 —— 论文核心论点 (输出验收不覆盖见证级语义) 在第三方控制器上的活例。
+- 上游是否已修: 未核查 (master 分支, 网络受限); 如投稿需要可补。
+
+## 判定汇总 (3/3 有效运行)
+
+| 判定 | r1/r2/r3 |
+|---|---|
+| P2/P3/P4/P5/P6/H1 | PASS ×3 |
+| P1 | FAIL ×3 — 仅 G93 弧块 (F-1, 已定性); 直线块 ×5 精确 PASS ×3 |
+| M_obs | = M_PRED 完全一致 ×3 |
 
 ## 遗留与对策
 

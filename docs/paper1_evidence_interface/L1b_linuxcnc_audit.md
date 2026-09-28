@@ -65,6 +65,13 @@ $$
 3. `motion.program-line` 是运动侧执行见证 (tc->id),块身份所有权绑定合法。
 4. L=0 → rate=0.1 硬编码 corner (issue #2410):LinuxCNC 对零长度 G93 块的既定处理,L1.5 测试程序应避开或显式预期。
 5. H2 在第二控制器上可能落在 **N/A 而非 UNOBSERVABLE**——判词分类学在跨控制器场景的分辨力直接体现 (N/A=责任不发生 vs UNOBSERVABLE=责任发生但无见证)。
+6. **F-1 (L1.5 实测+源码定性, 2026-09-29)**: G93 弧路径缺 `write_canon_state_tag`
+   (convert_straight:4851 有, convert_arc2:602-606 无) → `motion.feed-upm` 在 G93 弧上
+   报告上一块的陈旧换算速率 (3 次运行逐位复现: 600.00 vs 1884.96),文档语义失效;
+   运动本体不受影响 (requested-vel/轨迹/时序全对)。**注:此发现修正 §1.1 中
+   `feed-upm` 在弧上的语义可用性——作为 H4 见证时弧块不可信,直线块可信。**
+   这是"输出验收不覆盖见证级语义"论点在第三方控制器上的实证。详见
+   tests/output/linuxcnc_l15/RUN_LOG.md。
 
 ## 6. 状态
 
@@ -74,5 +81,5 @@ $$
 - [x] 源码审计:program-line 归属 (control.c:1942 / tp.c:2628)
 - [x] 源码审计:tp 无预算外显确认 (tc 结构内部,无导出)
 - [x] 版本钉死:2.9 @ fe72abb
-- [ ] M_PRED 冻结 (git commit,由用户执行)
+- [x] M_PRED 冻结: commit `2bfa94e` (2026-09-28;docs/ 整体 gitignore 为既有政策,仅此 3 文件 force-add 作时间戳锚)
 - [ ] L1.5 实测对照 (Task #2)

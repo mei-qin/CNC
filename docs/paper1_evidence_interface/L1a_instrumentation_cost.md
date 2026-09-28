@@ -27,7 +27,7 @@
 | ΔLOC | **~580 行 (含设计注释;纯代码约 ~380)** = block_timing 模块 341 (189c+152h) + 调用点插入 ~25 + 0x008A 系统 ~70 + 协议结构 ~45 + RPC handler ~96 |
 | N_probe | **14 个生产位点** (RT 4 + Non-RT 10) |
 | B_trace | 每块 196 B (0x0089 快照) + 每提交段 100 B (0x008A 事件);静态内存 +25.6 KB (环) + ~196 B (`g_bt`) + 28 B/段 (队列载荷)。例:B2 单块 20 子段 → 事件 2 KB/块 |
-| ΔCPU / ΔT | **待 WSL2 实测** → `scripts/measure_evidence_overhead_wsl2.sh` (micro-bench 草案)。预期量级:RT 侧每周期 1 次 `bt_rt_cycle` + 摊销段事件,均为 O(1) 算术;**在实测前不作数值主张** |
+| ΔCPU / ΔT | **已实测** (2026-09-28, WSL2 x86-64, gcc 13.3 -O2, 函数指针调用保守口径): `bt_rt_cycle` 3.5 ns/call → RT 周期净增 **0.0003%** of 1 ms 预算;含 20 段/块摊销最坏周期 **0.0009%**;`bt_rt_block_start` 3.2 / `bt_rt_record_plan_segment` 3.3 / `bt_rt_segment_done` 2.1 ns。口径注:sim 验证宿主测量,非实机 RT 硬件代表值;结论取"开销量级 <0.001% of 周期预算",不外推具体 ns |
 | ControlPathChange | **全部 = No** (逐位点核实,见表 1) |
 
 ## 3. 核实备注
@@ -36,6 +36,7 @@
 2. 插桩语义曾经历多次观测正确性修复 (inflight 门控 2026-09-20、`virt_inc>0` 门控 Phase-0、块级配对 V13.1.1 修复 A)——这些修复均只改观测窗口,**不影响控制输出**;注释链完整保留在源码中,可作为"instrumentation discipline"的代码级证据引用。
 3. `V13_SOURCE_PACK/INDEX.md` 为 S10 期快照 (覆盖 0x0083-0x0089,不含 0x008A);本表已按当前工作树补全 0x008A。
 4. Non-RT 侧成本 (`bt_block_open` 每块 1 次、`g93_sem_record` 每段 1 次) 不占 RT 预算且为 O(1) 内存写,不单独 bench;如需可仿脚本 [A] 段扩展。
+5. bench 实测于 2026-09-28 执行 (`scripts/measure_evidence_overhead_wsl2.sh`,WSL2 Ubuntu 24.04 / gcc 13.3.0);函数指针调用阻断内联,为偏保守上界。
 
 ## 4. 论文接入点
 
