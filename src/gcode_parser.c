@@ -80,11 +80,24 @@ const char* skip_spaces(const char* str)
     return str;
 }
 
+// ====================================================================
+// Cross-Semantics Pose 实验 (2026-09-30) — 注入配置 static 区
+// (上移至首个使用点 apply_rtcp_to_pos 之前; getenv 解析在 helper 内)
+// ====================================================================
+static double g_pose_inject_deg     = 0.0;
+static int    g_pose_inject_beg     = 0;
+static int    g_pose_inject_end     = 0;
+static int    g_pose_inject_mode    = 0;
+static int    g_pose_inject_init    = 0;
+static int    g_pose_inject_prev_on = 0;
+
 // @Context: Non-RealTime Background Thread
 // @Safe: 纯坐标变换，调用 Kinematics_Inverse 纯函数。
 // 动态适配 AC / BC / ABC 构型：
 //   - X/Y/Z 必须全部映射，否则无法逆解
 //   - A/B/C 未映射时角度取 0.0，不影响已配置的旋转轴
+static double pose_inject_delta_deg(int src_line);   // C2 注入点引用 (定义在下方)
+
 static void apply_rtcp_to_pos(double pos[AXIS_NUM])
 {
     int idx_x = g_axis_map['X' - 'A'];
@@ -106,6 +119,14 @@ static void apply_rtcp_to_pos(double pos[AXIS_NUM])
     pos[idx_x] = joint[0];
     pos[idx_y] = joint[1];
     pos[idx_z] = joint[2];
+
+    // Cross-Semantics Pose 实验 C2 (uncompensated, MODE=1): RTCP 逆解之后仅对
+    // B 命令加 δ, X/Z 保持 clean 补偿 → 姿态偏差传播到 TCP (positive control)。
+    // 注入点在软限位 0x0024 检查之后 (prereg §1 已注明); 窗口行号判定限制
+    // 注入范围, MODE=0/缺省时零影响。
+    if (g_pose_inject_mode == 1 && idx_b >= 0) {
+        pos[idx_b] += pose_inject_delta_deg((int)g_current_line_no);
+    }
 }
 
 // ====================================================================
@@ -184,21 +205,23 @@ static void g435_vector_alarm(int reason, int src_line)
 //   CNC_POSE_INJECT_DEG  δ 峰值 (度, 叠加到 rot_1 解算输出 s1; 0/缺省 = OFF)
 //   CNC_POSE_INJECT_BEG  窗口起 (G 代码 line_no, 含端点; 缺省 0)
 //   CNC_POSE_INJECT_END  窗口止 (含端点; BEG=END=0 → 全程注入)
+//   CNC_POSE_INJECT_MODE 0=C1 masked (缺省): solve 后 s1+=δ, 经完整正常管线;
+//                        1=C2 uncompensated: RTCP 逆解后仅 B 命令 += δ,
+//                        X/Z 保持 clean 补偿 → TCP 不再恢复 (positive control,
+//                        prereg POSE-CROSS-SEMANTICS-1 冻结后追加 2026-09-30)
 //
-// 注入点在 SolveOrientation 之后: s1 += δ 再走正常 wrap + 软限位 0x0024 +
+// C1 注入点在 SolveOrientation 之后: s1 += δ 再走正常 wrap + 软限位 0x0024 +
 // RTCP 逆解管线 (Inverse(tip, θ+δ) 数学保证 TCP 严格不变, u_tool 精确偏差 δ
 // —— "TCP-preserved / pose-deviated" 的受控化, 即 declared≠executed 姿态)。
+// C2 注入点在 apply_rtcp_to_pos 尾部 (逆解之后): B 命令偏 δ 而 X/Z 不再
+// 补偿 → 偏差传播到 TCP (预期 ≈ 2L·sin(δ/2), 正式批 TCP oracle 应 FAIL)。
 // 安全网交互: 奇异 0x0026 在解算器内部, 不在注入路径; 软限位 0x0024 会检查
-// 注入后目标 → δ 必须选在旋转轴软限位余量内 (实验设计约束, 见实验方案 §7)。
+// C1 注入后目标 → δ 必须选在旋转轴软限位余量内 (实验设计约束, 见实验方案 §7);
+// C2 注入点在 0x0024 检查之后 (prereg §1 已注明该差异)。
 // 窗口激活/退出各发一次 0x003B 事件 (provenance 标记, 防 run 条件混淆;
-// OFF 沿需窗口后存在下一段 G43.5 段才触发, 程序尾缺失可接受)。
+// MODE=1 下事件由 apply_rtcp_to_pos 注入点发出, OFF 沿需窗口后存在下一段
+// 运动段才触发, 程序尾缺失可接受)。
 // ====================================================================
-static double g_pose_inject_deg     = 0.0;
-static int    g_pose_inject_beg     = 0;
-static int    g_pose_inject_end     = 0;
-static int    g_pose_inject_init    = 0;
-static int    g_pose_inject_prev_on = 0;
-
 static double pose_inject_delta_deg(int src_line)
 {
     if (!g_pose_inject_init) {
@@ -206,10 +229,12 @@ static double pose_inject_delta_deg(int src_line)
         if ((s = getenv("CNC_POSE_INJECT_DEG")) != NULL) g_pose_inject_deg = strtod(s, NULL);
         if ((s = getenv("CNC_POSE_INJECT_BEG")) != NULL) g_pose_inject_beg = atoi(s);
         if ((s = getenv("CNC_POSE_INJECT_END")) != NULL) g_pose_inject_end = atoi(s);
+        if ((s = getenv("CNC_POSE_INJECT_MODE")) != NULL) g_pose_inject_mode = atoi(s);
         g_pose_inject_init = 1;
         if (g_pose_inject_deg != 0.0)
-            printf("[Parser] pose-inject armed: d=%+.3fdeg win=[%d,%d]\n",
-                   g_pose_inject_deg, g_pose_inject_beg, g_pose_inject_end);
+            printf("[Parser] pose-inject armed: d=%+.3fdeg win=[%d,%d] mode=%d\n",
+                   g_pose_inject_deg, g_pose_inject_beg, g_pose_inject_end,
+                   g_pose_inject_mode);
     }
     int on = (g_pose_inject_deg != 0.0)
           && ((g_pose_inject_beg == 0 && g_pose_inject_end == 0)
@@ -1699,9 +1724,12 @@ int parse_gcode_line(const char *gcode_line)
                 return -1;
             }
             // 矢量是绝对姿态语义; G91 下转增量 (等效 target = s)
-            // Cross-Semantics Pose 实验: 解算输出受控偏差 (declared≠executed)。
-            // δ 之后流经完整正常管线 (wrap/软限位/RTCP 逆解) — TCP 数学保持。
-            s1 += pose_inject_delta_deg(src_line);
+            // Cross-Semantics Pose 实验 C1 (MODE=0): 解算输出受控偏差
+            // (declared≠executed)。δ 之后流经完整正常管线 (wrap/软限位/RTCP
+            // 逆解) — TCP 数学保持。MODE=1 (C2) 时此处不注入 (0x003B 事件与
+            // 注入移至 apply_rtcp_to_pos 尾部)。
+            if (g_pose_inject_mode == 0)
+                s1 += pose_inject_delta_deg(src_line);
             val_axis[r1] = g_state.is_absolute ? s1 : (s1 - cur1);
             has_axis[r1] = 1;
             if (n_solved >= 2) {
