@@ -76,8 +76,12 @@ extern "C" {
  *            0x0027 G43.5 矢量编程报警 (value: 0=不可达 1=IJK×轴字冲突 2=零矢量 3=圆弧禁止)
  *            0x0028 G68.2 倾斜面报警 (value: 0=不可达 1=法向非法 2=圆弧禁止 3=固定循环禁止 4=定位被拒)
  *            0x0029 倾斜面激活 (INFO) / 0x002A 倾斜面取消 (INFO, G69/M30)
+ *            0x002B G43.5 矢量解算成功 (INFO, value=rot1 毫度; message 含 declared
+ *                    I/J/K + 解算角 — pose 实验 declared witness, 2026-09-30)
  *            0x0030 LoadProgram start / 0x0031 LoadProgram done
  *            0x0032 RunLoadedProgram start / 0x0033 program done (M30) / 0x0034 abort
+ *            0x003B 姿态偏差注入 ON/OFF (WARN/INFO, value=line_no; sim 实验装置
+ *                    provenance 标记, 由 CNC_POSE_INJECT_* 环境变量门控, 2026-09-30)
  * MANUAL=6:  0x0040 ClearAlarm req / 0x0041 alarm cleared (RT confirmed)
  *            0x0044 safe_lift config rejected (over soft limit)
  * CONFIG=7:  0x0001 profile 加载成功 / 0x0002 加载失败回退默认 / 0x0003 参数变更审计

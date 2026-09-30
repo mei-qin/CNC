@@ -9,6 +9,7 @@
 #include "smc_protocol.h"    // P2-A: SMC_MODE_* 位定义 (M30 override 重置用)
 #include "block_timing.h"    // 论文1 S10: block 级计时插桩 (bt_block_open/close/reset)
 #include <math.h>
+#include <stdlib.h>       // getenv/strtod/atoi (pose-inject 实验开关, Non-RT)
 #include <stdatomic.h>    // atomic_store_explicit (M3 S 值保护报警)
 #define PI 3.14159265358979323846
 #define ARC_SEGMENT_LENGTH_MM 0.5 // 圆弧插补时的分段长度，单位mm
@@ -172,6 +173,57 @@ static void g435_vector_alarm(int reason, int src_line)
     printf("[Parser][ALARM] %s, 源行 %d\n", msg[reason & 3], src_line);
     atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
     EventLogger_Push(SEVERITY_ALARM, SOURCE_PARSER, 0x0027, reason, msg[reason & 3]);
+}
+
+// ====================================================================
+// Cross-Semantics Pose 实验 (2026-09-30): C1 受控姿态偏差注入 — sim 实验装置
+// @Context: Non-RealTime Background Thread (parser 调用)
+// @Safe: getenv 仅首次调用解析并缓存; 此后纯标量比较。
+//
+// 环境变量 (WSL2 跑批前设置; 全部缺省 = 注入关闭, 行为与主线路径完全一致):
+//   CNC_POSE_INJECT_DEG  δ 峰值 (度, 叠加到 rot_1 解算输出 s1; 0/缺省 = OFF)
+//   CNC_POSE_INJECT_BEG  窗口起 (G 代码 line_no, 含端点; 缺省 0)
+//   CNC_POSE_INJECT_END  窗口止 (含端点; BEG=END=0 → 全程注入)
+//
+// 注入点在 SolveOrientation 之后: s1 += δ 再走正常 wrap + 软限位 0x0024 +
+// RTCP 逆解管线 (Inverse(tip, θ+δ) 数学保证 TCP 严格不变, u_tool 精确偏差 δ
+// —— "TCP-preserved / pose-deviated" 的受控化, 即 declared≠executed 姿态)。
+// 安全网交互: 奇异 0x0026 在解算器内部, 不在注入路径; 软限位 0x0024 会检查
+// 注入后目标 → δ 必须选在旋转轴软限位余量内 (实验设计约束, 见实验方案 §7)。
+// 窗口激活/退出各发一次 0x003B 事件 (provenance 标记, 防 run 条件混淆;
+// OFF 沿需窗口后存在下一段 G43.5 段才触发, 程序尾缺失可接受)。
+// ====================================================================
+static double g_pose_inject_deg     = 0.0;
+static int    g_pose_inject_beg     = 0;
+static int    g_pose_inject_end     = 0;
+static int    g_pose_inject_init    = 0;
+static int    g_pose_inject_prev_on = 0;
+
+static double pose_inject_delta_deg(int src_line)
+{
+    if (!g_pose_inject_init) {
+        const char *s;
+        if ((s = getenv("CNC_POSE_INJECT_DEG")) != NULL) g_pose_inject_deg = strtod(s, NULL);
+        if ((s = getenv("CNC_POSE_INJECT_BEG")) != NULL) g_pose_inject_beg = atoi(s);
+        if ((s = getenv("CNC_POSE_INJECT_END")) != NULL) g_pose_inject_end = atoi(s);
+        g_pose_inject_init = 1;
+        if (g_pose_inject_deg != 0.0)
+            printf("[Parser] pose-inject armed: d=%+.3fdeg win=[%d,%d]\n",
+                   g_pose_inject_deg, g_pose_inject_beg, g_pose_inject_end);
+    }
+    int on = (g_pose_inject_deg != 0.0)
+          && ((g_pose_inject_beg == 0 && g_pose_inject_end == 0)
+                ? 1
+                : (src_line >= g_pose_inject_beg && src_line <= g_pose_inject_end));
+    if (on != g_pose_inject_prev_on) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "pose inject %s d=%+.3fdeg",
+                 on ? "ON" : "OFF", g_pose_inject_deg);
+        EventLogger_Push(on ? SEVERITY_WARN : SEVERITY_INFO,
+                         SOURCE_PARSER, 0x003B, src_line, msg);
+        g_pose_inject_prev_on = on;
+    }
+    return on ? g_pose_inject_deg : 0.0;
 }
 
 // ====================================================================
@@ -1647,6 +1699,9 @@ int parse_gcode_line(const char *gcode_line)
                 return -1;
             }
             // 矢量是绝对姿态语义; G91 下转增量 (等效 target = s)
+            // Cross-Semantics Pose 实验: 解算输出受控偏差 (declared≠executed)。
+            // δ 之后流经完整正常管线 (wrap/软限位/RTCP 逆解) — TCP 数学保持。
+            s1 += pose_inject_delta_deg(src_line);
             val_axis[r1] = g_state.is_absolute ? s1 : (s1 - cur1);
             has_axis[r1] = 1;
             if (n_solved >= 2) {
@@ -1660,6 +1715,24 @@ int parse_gcode_line(const char *gcode_line)
             if (n_solved >= 2) {
                 printf("[Parser] G43.5            %s=%.3f (双解取近)\n",
                        g_axis[r2].axis_name, s2);
+            }
+            // Cross-Semantics Pose 实验: declared u_tool witness — 事件 0x002B
+            // message 记 G 代码声明的原始 I/J/K (declared) + 解算输出角 (含注入,
+            // 即 parser 域的 executed 代理; RT 域 native executed witness = CSV
+            // B/C 列与 u_tool_* 列)。value = rot1 毫度。
+            {
+                char ev[64];
+                if (n_solved >= 2)
+                    snprintf(ev, sizeof(ev), "G43.5 u=(%.3f,%.3f,%.3f) %s=%.3f %s=%.3f",
+                             offset_i, offset_j, offset_k,
+                             g_axis[r1].axis_name, s1,
+                             g_axis[r2].axis_name, s2);
+                else
+                    snprintf(ev, sizeof(ev), "G43.5 u=(%.3f,%.3f,%.3f) %s=%.3f [r2h]",
+                             offset_i, offset_j, offset_k,
+                             g_axis[r1].axis_name, s1);
+                EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x002B,
+                                 (int32_t)(s1 * 1000.0), ev);
             }
             offset_i = offset_j = offset_k = 0.0;    // 防御性清残留
         }

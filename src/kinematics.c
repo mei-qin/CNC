@@ -104,6 +104,15 @@ void Mat4x4_ApplyPoint(const Mat4x4 m, const double p_in[3], double p_out[3])
     p_out[2] = rz;
 }
 
+// Cross-Semantics Pose 实验 (2026-09-30): 方向矢量变换 (w=0, 平移列不贡献)
+void Mat4x4_ApplyDir(const Mat4x4 m, const double v_in[3], double v_out[3])
+{
+    double x = v_in[0], y = v_in[1], z = v_in[2];
+    v_out[0] = m[0][0]*x + m[0][1]*y + m[0][2]*z;
+    v_out[1] = m[1][0]*x + m[1][1]*y + m[1][2]*z;
+    v_out[2] = m[2][0]*x + m[2][1]*y + m[2][2]*z;
+}
+
 // ====================================================================
 // 内部工具：根据轴索引查表获取旋转角度
 // g_axis_map['A'-'A']==idx → rot_a, 'B'→rot_b, 'C'→rot_c
@@ -247,6 +256,83 @@ void Kinematics_Inverse(double tip_xyz[3], double rot_a, double rot_b, double ro
                      + (vec_table[i] - vec_table_0[i])
                      - (vec_head[i]  - vec_head_0[i]);
     }
+}
+
+// ====================================================================
+// Cross-Semantics Pose 实验 (2026-09-30): 前向运动学 — joint + 旋转角 → 刀尖 + 刀轴
+// @Context: Non-RealTime Background Thread (sim_engine 落盘线程调用)
+// @Safe: 纯数学 (sin/cos 可重入), 全程局部变量, 无静态状态。
+//
+// T_head 装配与 Kinematics_Inverse 逐链序复刻 — 故意不抽公共代码:
+// Inverse 属已验证路径, 保持零字节改动; 本函数独立演化。
+// ====================================================================
+
+int Kinematics_Forward(const double joint_xyz[3], double rot_a, double rot_b, double rot_c,
+                       double tip_xyz[3], double u_tool[3])
+{
+    KinConfig_t *cfg = &g_kin_config;
+
+    // KIN_NONE / 未配置: 直通 (joint = tip, 刀轴竖直)
+    if (cfg->type == KIN_NONE || cfg->rot_1_idx < 0 || cfg->rot_2_idx < 0) {
+        memcpy(tip_xyz, joint_xyz, 3 * sizeof(double));
+        u_tool[0] = 0.0; u_tool[1] = 0.0; u_tool[2] = -1.0;
+        return 0;
+    }
+
+    // TABLE_TABLE / MIXED: 前向数学不同 (tip 随动台旋转), 未实现 — 直通返回 -1
+    if (cfg->type != KIN_HEAD_HEAD) {
+        memcpy(tip_xyz, joint_xyz, 3 * sizeof(double));
+        u_tool[0] = 0.0; u_tool[1] = 0.0; u_tool[2] = -1.0;
+        return -1;
+    }
+
+    double angle1 = get_angle_for_idx(cfg->rot_1_idx, rot_a, rot_b, rot_c) * DEG2RAD;
+    double angle2 = get_angle_for_idx(cfg->rot_2_idx, rot_a, rot_b, rot_c) * DEG2RAD;
+
+    Mat4x4 R1, R2;
+    Mat4x4_RotateAxis(R1, cfg->rot_1_axis, angle1);
+    Mat4x4_RotateAxis(R2, cfg->rot_2_axis, angle2);
+
+    Mat4x4 T_tool;
+    Mat4x4_Translate(T_tool, -cfg->tool_offset[0], -cfg->tool_offset[1], -cfg->tool_offset[2]);
+
+    Mat4x4 T_pivot;
+    Mat4x4_Translate(T_pivot, cfg->pivot_offset[0], cfg->pivot_offset[1], cfg->pivot_offset[2]);
+
+    // ---- T_head 装配 (与 Inverse 同链序) ----
+    Mat4x4 T_head, tmp_a, tmp_b;
+    if (cfg->chain_order == 0) {
+        Mat4x4_Multiply(tmp_a, R2, T_tool);        // R2 * T_tool
+        Mat4x4_Multiply(tmp_b, T_pivot, tmp_a);     // T_pivot * R2 * T_tool
+        Mat4x4_Multiply(T_head, R1, tmp_b);         // R1 * T_pivot * R2 * T_tool
+    } else {
+        Mat4x4_Multiply(tmp_a, R1, T_tool);        // R1 * T_tool
+        Mat4x4_Multiply(tmp_b, T_pivot, tmp_a);     // T_pivot * R1 * T_tool
+        Mat4x4_Multiply(T_head, R2, tmp_b);         // R2 * T_pivot * R1 * T_tool
+    }
+
+    // 零位矩阵 (θ=0 时 R1=R2=I, 两链序数值相同): T_head_0 = T_pivot * T_tool
+    Mat4x4 T_head_0;
+    Mat4x4_Multiply(T_head_0, T_pivot, T_tool);
+
+    // tip = joint + (T_head(θ)·O − T_head(0)·O)
+    static const double origin[3] = {0.0, 0.0, 0.0};
+    double vec_head[3], vec_head_0[3];
+    Mat4x4_ApplyPoint(T_head, origin, vec_head);
+    Mat4x4_ApplyPoint(T_head_0, origin, vec_head_0);
+    for (int i = 0; i < 3; i++)
+        tip_xyz[i] = joint_xyz[i] + (vec_head[i] - vec_head_0[i]);
+
+    // u_tool = 旋转链 × (0,0,-1) (内层先作用; 平移矩阵对方向不贡献)
+    double t0[3] = {0.0, 0.0, -1.0}, t1[3];
+    if (cfg->chain_order == 0) {
+        Mat4x4_ApplyDir(R2, t0, t1);
+        Mat4x4_ApplyDir(R1, t1, u_tool);
+    } else {
+        Mat4x4_ApplyDir(R1, t0, t1);
+        Mat4x4_ApplyDir(R2, t1, u_tool);
+    }
+    return 0;
 }
 
 // ====================================================================

@@ -1,5 +1,6 @@
 #include "sim_engine.h"
 #include "global_def.h"
+#include "kinematics.h"   // Cross-Semantics Pose 实验: Kinematics_Forward (落盘线程正解 witness)
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -116,6 +117,12 @@ int sim_engine_init(const char *output_path, int use_binary)
                 "home_offset_dump_B,home_offset_dump_C"
                 ",homing_shift_dump_X,homing_shift_dump_Y,homing_shift_dump_Z,"
                 "homing_shift_dump_B,homing_shift_dump_C");
+        // Cross-Semantics Pose 实验 (2026-09-30): 前向运动学 witness 6 列
+        //   tcp_x/y/z_mm: 由本行机械坐标 + 旋转角正解的刀尖位置 (executed TCP)
+        //   u_tool_x/y/z: 刀轴单位方向 (executed orientation)
+        // 落盘时现算 (record 结构与 RT 缓冲不变, RT 路径零改动)
+        fprintf(g_sim_logger.fp,
+                ",tcp_x_mm,tcp_y_mm,tcp_z_mm,u_tool_x,u_tool_y,u_tool_z");
         fprintf(g_sim_logger.fp, "\n");
         fflush(g_sim_logger.fp);
     }
@@ -193,7 +200,8 @@ void *sim_flush_thread_func(void *arg)
             } else {
                 // 输出列序: cycle, stage_id, virtual_time_ms, 5×pos, v_target,
                 //            coord_rt, 5×logical_pos, 3×active_offset, off_g54_X,
-                //            spindle_mode, spindle_rpm, coolant, tool_id
+                //            spindle_mode, spindle_rpm, coolant, tool_id, ...,
+                //            home/homing_shift 10 列, pose witness 6 列 (尾部追加)
                 for (uint32_t j = 0; j < cnt; j++) {
                     sim_trace_record_t *r = &L->bufs[i][j];
                     fprintf(L->fp, "%" PRIu64 ",%d,%.3f",
@@ -245,6 +253,32 @@ void *sim_flush_thread_func(void *arg)
                             r->homing_shift_dump[0], r->homing_shift_dump[1],
                             r->homing_shift_dump[2], r->homing_shift_dump[3],
                             r->homing_shift_dump[4]);
+                    // ---- Cross-Semantics Pose 实验: 前向运动学 witness 6 列 ----
+                    // 输入 = 本行机械坐标 (r->pos, joint 域) + 旋转角; 与 parser
+                    // 逆解共用 g_kin_config 全局 → 构型一致。落盘线程 Non-RT,
+                    // sin/cos 允许。KIN_NONE/未支持构型输出直通值 (见 kinematics.c)。
+                    {
+                        int fx = g_axis_map['X' - 'A'];
+                        int fy = g_axis_map['Y' - 'A'];
+                        int fz = g_axis_map['Z' - 'A'];
+                        int fa = g_axis_map['A' - 'A'];
+                        int fb = g_axis_map['B' - 'A'];
+                        int fc = g_axis_map['C' - 'A'];
+                        double jxyz[3] = {
+                            (fx >= 0) ? r->pos[fx] : 0.0,
+                            (fy >= 0) ? r->pos[fy] : 0.0,
+                            (fz >= 0) ? r->pos[fz] : 0.0
+                        };
+                        double tip[3], utool[3];
+                        Kinematics_Forward(jxyz,
+                                           (fa >= 0) ? r->pos[fa] : 0.0,
+                                           (fb >= 0) ? r->pos[fb] : 0.0,
+                                           (fc >= 0) ? r->pos[fc] : 0.0,
+                                           tip, utool);
+                        fprintf(L->fp, ",%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                                tip[0], tip[1], tip[2],
+                                utool[0], utool[1], utool[2]);
+                    }
                     fprintf(L->fp, "\n");
                 }
                 L->file_record_count += cnt;

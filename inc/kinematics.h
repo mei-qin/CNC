@@ -33,6 +33,10 @@ void Mat4x4_Inverse(Mat4x4 res, const Mat4x4 in);
 // p_out = m * [p_in, 1]^T (齐次坐标 w=1, 支持 p_in==p_out 别名)
 void Mat4x4_ApplyPoint(const Mat4x4 m, const double p_in[3], double p_out[3]);
 
+// v_out = m * [v_in, 0]^T (方向矢量: 只取旋转块, 平移列不贡献; 支持 v_in==v_out 别名)
+// Cross-Semantics Pose 实验 (2026-09-30): 刀轴方向 u_tool 正解用
+void Mat4x4_ApplyDir(const Mat4x4 m, const double v_in[3], double v_out[3]);
+
 // ====================================================================
 // 通用五轴运动学引擎 — 支持 Head-Head / Table-Table / Mixed 三大构型
 //
@@ -88,6 +92,21 @@ extern KinConfig_t g_kin_config;
 
 // 通用逆运动学: 刀尖坐标 → 物理机床坐标
 void Kinematics_Inverse(double tip_xyz[3], double rot_a, double rot_b, double rot_c, double joint_xyz[3]);
+
+// ================== Cross-Semantics Pose 实验 (2026-09-30) ==================
+// 前向运动学: 物理机床坐标 + 旋转角 → 刀尖坐标 + 刀轴方向 (executed witness 正解)
+// @Context: Non-RealTime Background Thread (sim_engine 落盘线程调用)
+// @Safe: 纯数学 (sin/cos 可重入), 全程局部变量, 无静态状态。
+// 与 Kinematics_Inverse 互逆 (HEAD_HEAD):
+//   Inverse: joint = tip - (T_head(θ)·O - T_head(0)·O)
+//   Forward: tip   = joint + (T_head(θ)·O - T_head(0)·O)
+// u_tool = 旋转链作用于 (0,0,-1) (方向矢量 w=0, 平移列不贡献):
+//   chain 0: u = R1·R2·t;  chain 1: u = R2·R1·t
+// 构型边界: KIN_NONE/未配置 → 直通 (tip=joint, u=(0,0,-1)) 返回 0;
+//           TABLE_TABLE/MIXED → 直通返回 -1 (未实现, sim 验证域=HEAD_HEAD)。
+// 返回: 0=HEAD_HEAD/KIN_NONE 正解; -1=构型未支持 (输出为直通值)
+int Kinematics_Forward(const double joint_xyz[3], double rot_a, double rot_b, double rot_c,
+                       double tip_xyz[3], double u_tool[3]);
 
 // ================== P1 (2026-09-04): G43.5 刀轴矢量姿态解算 ==================
 typedef enum {
