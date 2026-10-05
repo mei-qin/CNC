@@ -1,0 +1,226 @@
+{
+ "condition": "LC-T0",
+ "runs": [
+  "LC-T0-R1",
+  "LC-T0-R2",
+  "LC-T0-R3"
+ ],
+ "per_run": [
+  {
+   "run": "LC-T0-R1",
+   "lib_sha12": "d3e4ecd46061",
+   "rows": 13211,
+   "p1_ok": true,
+   "p2_ok": true,
+   "p3_ok": true,
+   "p4_ok": true,
+   "p6_ok": true,
+   "windows_complete": true,
+   "witness_evaluated": true,
+   "qualification": "PASS",
+   "semantic": "PASS",
+   "failing_lines": [],
+   "blocks": [
+    {
+     "line": 13,
+     "fu_oracle": 240.0,
+     "fu_med": 240.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 14,
+     "fu_oracle": 300.0,
+     "fu_med": 300.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 15,
+     "fu_oracle": 600.0,
+     "fu_med": 600.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 16,
+     "fu_oracle": 600.0,
+     "fu_med": 600.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 17,
+     "fu_oracle": 424.2641,
+     "fu_med": 424.264069,
+     "ratio": 1.000000001,
+     "p1": "PASS",
+     "p2_ratio": 1.000000027
+    },
+    {
+     "line": 18,
+     "fu_oracle": 848.5281,
+     "fu_med": 848.528137,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.000000027
+    }
+   ]
+  },
+  {
+   "run": "LC-T0-R2",
+   "lib_sha12": "d3e4ecd46061",
+   "rows": 13214,
+   "p1_ok": true,
+   "p2_ok": true,
+   "p3_ok": true,
+   "p4_ok": true,
+   "p6_ok": true,
+   "windows_complete": true,
+   "witness_evaluated": true,
+   "qualification": "PASS",
+   "semantic": "PASS",
+   "failing_lines": [],
+   "blocks": [
+    {
+     "line": 13,
+     "fu_oracle": 240.0,
+     "fu_med": 240.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 14,
+     "fu_oracle": 300.0,
+     "fu_med": 300.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 15,
+     "fu_oracle": 600.0,
+     "fu_med": 600.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 16,
+     "fu_oracle": 600.0,
+     "fu_med": 600.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 17,
+     "fu_oracle": 424.2641,
+     "fu_med": 424.264069,
+     "ratio": 1.000000001,
+     "p1": "PASS",
+     "p2_ratio": 1.000000027
+    },
+    {
+     "line": 18,
+     "fu_oracle": 848.5281,
+     "fu_med": 848.528137,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.000000027
+    }
+   ]
+  },
+  {
+   "run": "LC-T0-R3",
+   "lib_sha12": "d3e4ecd46061",
+   "rows": 13215,
+   "p1_ok": true,
+   "p2_ok": true,
+   "p3_ok": true,
+   "p4_ok": true,
+   "p6_ok": true,
+   "windows_complete": true,
+   "witness_evaluated": true,
+   "qualification": "PASS",
+   "semantic": "PASS",
+   "failing_lines": [],
+   "blocks": [
+    {
+     "line": 13,
+     "fu_oracle": 240.0,
+     "fu_med": 240.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 14,
+     "fu_oracle": 300.0,
+     "fu_med": 300.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 15,
+     "fu_oracle": 600.0,
+     "fu_med": 600.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 16,
+     "fu_oracle": 600.0,
+     "fu_med": 600.0,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.0
+    },
+    {
+     "line": 17,
+     "fu_oracle": 424.2641,
+     "fu_med": 424.264069,
+     "ratio": 1.000000001,
+     "p1": "PASS",
+     "p2_ratio": 1.000000027
+    },
+    {
+     "line": 18,
+     "fu_oracle": 848.5281,
+     "fu_med": 848.528137,
+     "ratio": 1.0,
+     "p1": "PASS",
+     "p2_ratio": 1.000000027
+    }
+   ]
+  }
+ ],
+ "signature_deterministic": true,
+ "qualification": "PASS",
+ "semantic": "PASS",
+ "hb_pattern_confirmed": true,
+ "hb_pattern_notes": [],
+ "oracle": {
+  "file": "g93t_probe.ngc",
+  "fu_by_line": {
+   "13": 240.0,
+   "14": 300.0,
+   "15": 600.0,
+   "16": 600.0,
+   "17": 424.2641,
+   "18": 848.5281
+  }
+ },
+ "success_criterion": {
+  "qualification_pass": true,
+  "semantic_fail": false,
+  "note": "taskbook \u00a712.1: seed condition needs qualification=PASS and semantic=FAIL"
+ }
+}

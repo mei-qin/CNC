@@ -1,0 +1,18 @@
+--- interp_inverse.cc.stock	2026-10-05 03:33:49.855366816 +0800
++++ interp_inverse.cc	2026-10-05 03:33:49.855366816 +0800
+@@ -127,6 +127,15 @@
+     rate = 0.1; // See https://github.com/LinuxCNC/linuxcnc/issues/2410
+   } else {
+     rate = length * block->f_number;
++    /* WP-B-T1: preregistered seeded transformation violation (positive
++       control, delta = 0.05). Multiplies the post-conversion
++       inverse-time rate by (1 + delta) ONLY for the preregistered target
++       block (settings->sequence_number == 16, i.e. source line 16
++       of g93t_probe.ngc). EXPERIMENTAL INTERVENTION, not a LinuxCNC
++       defect. Prereg: linuxcnc_positive_case/prereg/. */
++    if (settings->sequence_number == 16) {
++      rate = rate * 1.05;
++    }
+   }
+   
+   enqueue_SET_FEED_RATE(rate);

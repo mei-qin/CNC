@@ -1,0 +1,8 @@
+LC-T2 (revert) runtime library identity
+sha256: d3e4ecd46061f07859325238bd7a8588e426453c573e606eee9767056111dc52
+artifact: the SAME byte-identical stock artifact as LC-T0 (binary-level revert;
+F-1 G5 precedent: runtime revert via library swap, no source re-edit)
+source-level revert patch: patches/seed_to_revert.patch; build-tree source state
+after the campaign = pristine stock (interp_inverse.cc c98db3d4…, verified)
+loaded-image verification: /proc/<milltask>/maps shows ~/libctl/librs274.so.0 in all 3 runs (oneshot HARD GATE)
+per-run lib sha sidecars: runs/libsha_LC-T2-R1.txt = R2 = R3 = d3e4ecd46061

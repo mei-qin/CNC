@@ -1,0 +1,32 @@
+WP-B source identity (LinuxCNC 2.9.4-2+deb13u1, Debian-L15)
+============================================================
+
+Base source provenance
+  Debian source package: linuxcnc 1:2.9.4-2+deb13u1
+    /home/l15/linuxcnc_2.9.4.orig.tar.gz
+    /home/l15/linuxcnc_2.9.4-2+deb13u1.dsc
+    /home/l15/linuxcnc_2.9.4-2+deb13u1.debian.tar.xz
+  Build tree: /home/l15/linuxcnc-2.9.4 (dpkg-buildpackage configured; WP-B
+  libraries built by in-tree incremental `make -j2` in src/, same path as F-1)
+
+Source files (all three conditions share interp_convert.cc = pristine stock)
+  interp_convert.cc  (stock, pristine = orig.tar.gz member)
+      f2e7cf41ec6bc4b1cd86bf6a5620c7d6028314f66a2980491ffab19156a506cb
+      (F-1 patch REMOVED for WP-B; tree restored from interp_convert.cc.stock)
+  interp_inverse.cc  stock (pristine = orig.tar.gz member, verified):
+      c98db3d43f28955090528651a0cd7c0b422c4d0e79de03f425ba3ecc72b2f9f0
+  interp_inverse.cc  seeded (WP-B-T1, patch: patches/stock_to_seed.patch):
+      b22bdaff0c66c172888e61effb6b646bfa307f956464d9472ed50217c66e9ddc
+
+Libraries (~/libctl/librs274.so.0 is the ONLY runtime-switched component)
+  LC-T0 / LC-T2  tree-rebuilt STOCK:   see stock_lib.txt / revert_lib.txt
+  LC-T1          tree-rebuilt SEEDED:   645579905c85317af91e50a11a15388d3e5de9789545b0a343495eadffd2ffc2
+      saved at /home/l15/wpb_libs/librs274.so.0.seeded
+  reference: Debian packaged stock (F-1 lineage, NOT used in WP-B formal runs):
+      3a8ce2318f7af9e54503ef932a50df3c3e4d5eccbc078f1ecfc39e4a73624300
+  preserved in-tree: F-1 patched library (not used by WP-B):
+      9972b40d8f216e7f28a35be4de69fd2a3371dcab4cf9c59cf403ccdc6fb3b4e6
+      saved at /home/l15/linuxcnc-2.9.4/lib/librs274.so.0.f1patched
+
+Loaded-image verification: every run aborts unless /proc/<milltask>/maps
+shows ~/libctl/librs274.so.0 (oneshot_wpb.sh HARD GATE, F-1 lineage).

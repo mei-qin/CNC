@@ -1,0 +1,8 @@
+LC-T1 (seeded) runtime library identity
+sha256: 645579905c85317af91e50a11a15388d3e5de9789545b0a343495eadffd2ffc2
+artifact: /home/l15/wpb_libs/librs274.so.0.seeded (= ~/libctl/librs274.so.0 during LC-T1-R1..R3)
+built from: interp_convert.cc f2e7cf41… (pristine stock, UNCHANGED) + interp_inverse.cc b22bdaff… (seeded)
+seed: patches/stock_to_seed.patch — guarded multiplication of the post-conversion
+inverse-time rate by 1.05 for settings->sequence_number == 16 only
+loaded-image verification: /proc/<milltask>/maps shows ~/libctl/librs274.so.0 in all 3 runs (oneshot HARD GATE)
+per-run lib sha sidecars: runs/libsha_LC-T1-R1.txt = R2 = R3 = 645579905c85

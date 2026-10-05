@@ -1,0 +1,144 @@
+{
+ "blcks": [
+  {
+   "line": 13,
+   "cmd": "G1",
+   "L": 10.0,
+   "F": 24.0,
+   "T": 2.5,
+   "v": 4.0,
+   "fu": 240.0,
+   "window": null,
+   "p1": null,
+   "p2": null,
+   "p3": null
+  },
+  {
+   "line": 14,
+   "cmd": "G1",
+   "L": 10.0,
+   "F": 30.0,
+   "T": 2.0,
+   "v": 5.0,
+   "fu": 300.0,
+   "window": null,
+   "p1": null,
+   "p2": null,
+   "p3": null
+  },
+  {
+   "line": 15,
+   "cmd": "G1",
+   "L": 10.0,
+   "F": 60.0,
+   "T": 1.0,
+   "v": 10.0,
+   "fu": 600.0,
+   "window": null,
+   "p1": null,
+   "p2": null,
+   "p3": null
+  },
+  {
+   "line": 16,
+   "cmd": "G1",
+   "L": 10.0,
+   "F": 60.0,
+   "T": 1.0,
+   "v": 10.0,
+   "fu": 600.0,
+   "window": null,
+   "p1": null,
+   "p2": null,
+   "p3": null
+  },
+  {
+   "line": 17,
+   "cmd": "G1",
+   "L": 14.142135623730951,
+   "F": 30.0,
+   "T": 2.0,
+   "v": 7.0710678118654755,
+   "fu": 424.26406871192853,
+   "window": null,
+   "p1": null,
+   "p2": null,
+   "p3": null
+  },
+  {
+   "line": 18,
+   "cmd": "G1",
+   "L": 14.142135623730951,
+   "F": 60.0,
+   "T": 1.0,
+   "v": 14.142135623730951,
+   "fu": 848.5281374238571,
+   "window": null,
+   "p1": null,
+   "p2": null,
+   "p3": null
+  }
+ ],
+ "preds": {
+  "P1": {
+   "desc": "feed_upm == L*F (正常态)",
+   "ok": false
+  },
+  "P2": {
+   "desc": "requested_vel == L*F/60, 不随 override 变",
+   "ok": false
+  },
+  "P3": {
+   "desc": "override 窗口: feed_upm 缩放 == ovr, requested_vel 不变",
+   "ok": false
+  },
+  "P4": {
+   "desc": "program-line 块身份 1:1/单调/连续",
+   "ok": false
+  },
+  "P5": {
+   "desc": "H2/H3 = UNOBSERVABLE (不重建证据)",
+   "ok": true
+  },
+  "P6": {
+   "desc": "feedhold 特征窗口存在 (fu==0 >=0.1s)",
+   "ok": false
+  }
+ },
+ "holds": [],
+ "h1": {
+  "X": {
+   "v_ref_max": 0.0,
+   "limit": 200.0,
+   "ok": true
+  },
+  "Y": {
+   "v_ref_max": 0.0,
+   "limit": 200.0,
+   "ok": true
+  },
+  "Z": {
+   "v_ref_max": 0.0,
+   "limit": 200.0,
+   "ok": true
+  }
+ },
+ "m_obs": {
+  "H1": "OBSERVABLE",
+  "H2": "UNOBSERVABLE",
+  "H3": "UNOBSERVABLE",
+  "H4": "PARTIAL",
+  "H5": "PARTIAL"
+ },
+ "windows": [],
+ "unmatched_lines": [
+  13,
+  14,
+  15,
+  16,
+  17,
+  18
+ ],
+ "ts_s": 0.001,
+ "n_rows": 65535
+}
