@@ -1,0 +1,19 @@
+; L1.5 stock LinuxCNC G93 探针程序
+; 预注册对照: docs/paper1_evidence_interface/M_PRED_linuxcnc_v1.md (P1-P6)
+; 设计约束: G61 精确路径(禁融合); G93 下每运动行带 F; 无零长度块(回避 P7 corner)
+; 单位 mm; 块预期见下表 (adapter_l15.py 用同一几何复算):
+;   B1 F60  G1 X10        L=10.0000  T=1.0s  v=10.000 mm/s  feed_upm=600.0
+;   B2 F30  G1 Y10        L=10.0000  T=2.0s  v= 5.000       300.0
+;   B3 F60  G1 X0         L=10.0000  T=1.0s  v=10.000       600.0
+;   B4 F120 G2 X10 Y0 I0 J-10  (四分之一圆 center(0,0) r=10) L=15.70796 T=0.5s v=31.416  1884.96
+;   B5 F30  G1 X0 Y10     L=14.14214 T=2.0s  v= 7.071       424.26
+;   B6 F60  G1 X0 Y0      L=10.0000  T=1.0s  v=10.000       600.0
+G21 G90 G61 G93
+M53 P1
+F60 G1 X10
+F30 G1 Y10
+F60 G1 X0
+F120 G2 X10 Y0 I0 J-10
+F30 G1 X0 Y10
+F60 G1 X0 Y0
+M2

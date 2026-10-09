@@ -1,0 +1,18 @@
+--- a/src/emc/rs274ngc/interp_inverse.cc
++++ b/src/emc/rs274ngc/interp_inverse.cc
+@@ -66,6 +66,15 @@
+     rate = 0.1; // See https://github.com/LinuxCNC/linuxcnc/issues/2410
+   } else {
+     rate = length * block->f_number;
++    /* F1-T1: preregistered seeded arc transformation violation (positive
++       control, delta = 0.05). Multiplies the post-conversion inverse-time
++       arc rate by (1 + delta) ONLY for the preregistered target block
++       (settings->sequence_number == 16, i.e. source line 16 of
++       g93_probe.ngc). EXPERIMENTAL INTERVENTION, not a LinuxCNC defect.
++       Prereg: linuxcnc_f1_protocol/. */
++    if (settings->sequence_number == 16) {
++      rate = rate * 1.05;
++    }
+   }
+   enqueue_SET_FEED_RATE(rate);
+   settings->feed_rate = rate;

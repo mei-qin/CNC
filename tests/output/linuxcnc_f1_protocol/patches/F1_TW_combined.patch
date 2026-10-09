@@ -1,0 +1,44 @@
+--- a/src/emc/rs274ngc/interp_inverse.cc
++++ b/src/emc/rs274ngc/interp_inverse.cc
+@@ -66,6 +66,15 @@
+     rate = 0.1; // See https://github.com/LinuxCNC/linuxcnc/issues/2410
+   } else {
+     rate = length * block->f_number;
++    /* F1-T1: preregistered seeded arc transformation violation (positive
++       control, delta = 0.05). Multiplies the post-conversion inverse-time
++       arc rate by (1 + delta) ONLY for the preregistered target block
++       (settings->sequence_number == 16, i.e. source line 16 of
++       g93_probe.ngc). EXPERIMENTAL INTERVENTION, not a LinuxCNC defect.
++       Prereg: linuxcnc_f1_protocol/. */
++    if (settings->sequence_number == 16) {
++      rate = rate * 1.05;
++    }
+   }
+   enqueue_SET_FEED_RATE(rate);
+   settings->feed_rate = rate;
+--- a/src/emc/rs274ngc/interp_convert.cc
++++ b/src/emc/rs274ngc/interp_convert.cc
+@@ -601,6 +601,7 @@
+   }
+   inverse_time_rate_arc(*current1, *current2, *current3, center1, center2,
+                         turn, end1, end2, end3, block, settings);
++  write_canon_state_tag(block, settings);
+ 
+   ARC_FEED(block->line_number, end1, end2, center1, center2, turn, end3,
+            AA_end, BB_end, CC_end, u, v, w);
+@@ -688,6 +689,7 @@
+ 
+     inverse_time_rate_arc(cx, cy, cz, center_x, center_y,
+                           turn, end_x, end_y, end_z, block, settings);
++    write_canon_state_tag(block, settings);
+ 
+ 
+     // the tool will end up in gamma direction from the programmed arc endpoint
+@@ -846,6 +848,7 @@
+ 
+     inverse_time_rate_arc(opx, opy, opz, centerx, centery,
+                           turn, end_x, end_y, end_z, block, settings);
++    write_canon_state_tag(block, settings);
+ 
+     side = settings->cutter_comp_side;
+     tool_radius = settings->cutter_comp_radius;   /* always is positive */
