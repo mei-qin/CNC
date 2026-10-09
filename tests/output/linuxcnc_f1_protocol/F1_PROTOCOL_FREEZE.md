@@ -1,8 +1,8 @@
 # F1 Prospective Microstudy Protocol — Freeze Proposal (NO EXPERIMENT AUTHORIZED)
 
-**Package:** `linuxcnc_f1_protocol` · **Date:** 2026-10-10
-**Line of authority:** S4-B Reframing Gate (B3 GO FOR F0 ONLY) → F0 (static feasibility, this project) → F0 Independent Review (CONDITIONAL PASS; F1 protocol design GO; execution HOLD) → **this document = the F1 review request. No build, run, scoring, or archive edit is authorized by this package.**
-**Taskbook:** F1_PROTOCOL_PREPARATION_TASKBOOK (all four Works).
+**Package:** `linuxcnc_f1_protocol` · **Date:** 2026-10-10 · **Revision:** v2 (F1.1 amended — see `F1_1_AMENDMENT.md`; amendment informed by historical-capture recomputation, disclosed, pre-execution; original `F1_PROTOCOL_PACKAGE_20261010.zip` preserved unmodified)
+**Line of authority:** S4-B Reframing Gate (B3 GO FOR F0 ONLY) → F0 (static feasibility, this project) → F0 Independent Review (CONDITIONAL PASS; F1 protocol design GO; execution HOLD) → F1 proposal → F1 Independent Review (HOLD; one F1.1 rework round authorized) → **this v2 = the F1.1 review request. No build, run, scoring, or archive edit is authorized by this package.**
+**Taskbooks:** F1_PROTOCOL_PREPARATION_TASKBOOK + F1_1_LIMITED_REWORK_TASKBOOK (Works A–D).
 
 ---
 
@@ -25,10 +25,10 @@ Variant composition and byte-grounded source identities: F1_GOLD_STANDARD §3. I
 | T1W1 | **2096776f…** | f2e7cf41… | build + record sha before runs |
 | T1W0 | 2096776f… | 6ab767c7… | build + record sha before runs |
 
-Build/load obligations (all four variants, no exceptions):
+Build/load obligations (all four variants, no exceptions; F1.1 item 2 strengthened):
 
 1. Build inside the frozen rip tree from the variant source pair; **echo and archive the exact compiler/build commands and environment**; record post-build source SHA256 + lib SHA256 in a per-variant `source_identity` receipt before any run.
-2. Runtime switch via `~/libctl/librs274.so.0` (single variable component); per run: libsha file + **hard gate abort unless `/proc/<milltask>/maps` shows the libctl library** + maps snapshot archived (`oneshot_wpb.sh` lineage, §3 of that script: read-verified this session).
+2. Runtime switch via `~/libctl/librs274.so.0` (single variable component); per run: libsha file + **hard gate abort unless `/proc/<milltask>/maps` shows the libctl library** + maps snapshot archived with **inode and library path**, plus **pre-run and post-run SHA256 of the exact libctl file and a hash of the mapped file read during execution** (F1.1 Work D.2) (`oneshot_wpb.sh` lineage, §3 of that script: read-verified this session).
 3. Historical manifest hashes are **precedent only**; they do not certify any new build. The single stock reference lib (d3e4ecd4) anchors stock equivalence and revert checks; deb lib 3a8ce231 is reference-only.
 4. Runner: `oneshot_wpb.sh` lineage adapted back to the arc probe (`g93_probe.ngc`, `l15_drive.py` timeline) **plus** the F1 capture-integrity accounting (overruns==0, non-data-line count, parse-fail abort — F1_CAPTURE_AND_WINDOW_SPEC §3).
 
@@ -55,10 +55,11 @@ Any STOP ⇒ return to the S4-4 manuscript unchanged; EAV-1 stays stopped.
 
 ```
 linuxcnc_f1_protocol/
-  F1_PROTOCOL_FREEZE.md                (this file)
+  F1_PROTOCOL_FREEZE.md                (this file; v2)
+  F1_1_AMENDMENT.md                    (F1.1 bounded correction: disclosure + Works A–D)
   F1_CAPTURE_AND_WINDOW_SPEC.md        (Work 1 — capture erratum + selector freeze)
-  F1_GOLD_STANDARD_AND_EXPECTATIONS.md (Work 2 — truth + predictions)
-  F1_COMPARATOR_FREEZE.md              (Work 3 — fairness + verdict rules + scoring)
+  F1_GOLD_STANDARD_AND_EXPECTATIONS.md (Work 2 — truth + predictions; F1.1 execution-truth separation)
+  F1_COMPARATOR_FREEZE.md              (Work 3 — fairness + verdict rules + scoring; F1.1 v2 arbitration + FULL-B tree + precedence)
   pristine/interp_inverse.cc           c98db3d4… (WSL byte copy, hash-verified)
   pristine/interp_convert.cc           f2e7cf41… (WSL byte copy, hash-verified)
   variants/T1W1_interp_inverse.cc      2096776f… (prospective seeded source)
@@ -70,7 +71,9 @@ linuxcnc_f1_protocol/
   receipts/adapter_l15.py              eb6a6690… (checker byte receipt, WSL copy verified)
   receipts/g93_probe.ngc               fdcc31b2…
   receipts/g93_probe.hal               660550b6…
+  receipts/F1_1_RETROSPECTIVE_RECEIPT.json (13 historical captures, NON-SCORED)
   tools/make_variants.py               (text-only reconstruction script)
+  tools/f11_retrospective_check.py     (read-only retrospective analysis script)
   SHA256SUMS
 ```
 
