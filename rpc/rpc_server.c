@@ -1137,9 +1137,14 @@ static int handle_client_request(int client_fd)
         /* V13.1 H3 (2026-09-22): planner 最终目标 (T_plan), 独立于 T_sem */
         res->block_plan_sum_ms         = g_bt.block_plan_sum_ms;
         res->plan_segments_loaded      = g_bt.plan_segments_loaded;
+        /* V13.1.1 (2026-09-24) 修复 A: 块级时钟配对量 (与 block_virtual_ms 同窗) */
+        res->block_override_eff_sum    = g_bt.block_override_eff_sum;
+        res->block_override_eff_cycles = g_bt.block_override_eff_cycles;
+        res->block_virtual_model_ms    = g_bt.block_virtual_model_ms;
         printf("[rpc] BlockTiming(op=%u): uid=%u line=%d elapsed=%llu cyc "
                "(gen=%u done=%u, cmd=%.3fms sum=%.3fms) | ctrl=%llu cyc, "
-               "virt=%.3fms, hold=%llu cyc, plan=%.3fms/%u\n",
+               "virt=%.3fms, hold=%llu cyc, plan=%.3fms/%u | blk_eff=%.1f/%llu "
+               "blk_vmodel=%.3fms\n",
                (unsigned)bt_op, res->block_uid, res->block_line_no,
                (unsigned long long)res->block_elapsed_cycles,
                res->segments_generated, res->segments_completed,
@@ -1147,7 +1152,10 @@ static int handle_client_request(int client_fd)
                (unsigned long long)res->controller_elapsed_cycles,
                res->virtual_elapsed_ms,
                (unsigned long long)res->hold_active_cycles,
-               res->block_plan_sum_ms, res->plan_segments_loaded);
+               res->block_plan_sum_ms, res->plan_segments_loaded,
+               res->block_override_eff_sum,
+               (unsigned long long)res->block_override_eff_cycles,
+               res->block_virtual_model_ms);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcBlockTimingRes);
         break;

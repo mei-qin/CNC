@@ -842,6 +842,15 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // just_loaded_seg 跨周期锁存: while 内置 1, trace 块消费清 0
             // 必须在 while 之前声明 (C 语法: 先声明后使用)
             static int just_loaded_seg = 0;
+            /* 修复 B (V13.1.1, 2026-09-24, 用户裁决): 逐周期采样完整性。
+             * 根因: 微段恰在周期边界结束时 (路径 B: ms_budget -= remaining_time 恰为 0),
+             *   while 退出且未加载下一段 ⇒ is_moving=0 ∧ just_loaded_seg=0 ⇒ 该边界周期
+             *   不落盘, `motion_span_cycles` 记 raw_sample_gap = n_blocks-1。
+             *   H1 依赖逐周期峰值, 缺口须 fail-closed (不得豁免/插值)。
+             * 修复: 本周期**有段完成**时也落盘 (末态位置 + 末态速度都是真实逐周期证据),
+             *   使分析窗口内每个 RT 周期都有一行。仅影响落盘闸门, 不触碰 ms_budget /
+             *   规划 / 轴输出 ⇒ 控制行为不变。 */
+            static int just_finished_seg = 0;
             #define RT_ITER_CAP 64  // 防御: 64 段/周期 已足够覆盖最密集微段场景
             // ---- P2-A: 实时倍率数学 ----
             // @Context: 1ms Hard-RT Thread (EtherCAT)
@@ -1204,6 +1213,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         ms_budget -= snap_time;
                         rt_bt_on_segment_done(cycle);   // 论文1 S10: 本周期即完成
                         just_loaded_seg = 1;  // 触发 trace 记录 Snap 落点
+                        just_finished_seg = 1;  // 修复 B: 完成周期必须落盘
                         // 不置 is_moving,继续 while 加载下一段
                         continue;
                     }
@@ -1232,6 +1242,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         g_interpolator.is_moving = 0;  // 标记本段结束,下次 while 加载新段
                         /* 论文1 S10: exclusive-end 刻度 (完成周期 + 1) */
                         rt_bt_on_segment_done(cycle);
+                        just_finished_seg = 1;  // 修复 B: 边界周期必须落盘 (见声明处)
                         // P2-A-3: 单段模式 re-arm (运动段完成时)
                         // 读 mode_flags 当前值, 允许 UI 中途 toggle off (下次完成时不再 re-arm).
                         // 设 ms_budget=0 强制 while 退出, 防止本 cycle 内连续吃多段.
@@ -1331,6 +1342,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             }
             prev_jog_active = cur_jog_active;
             int should_log_this_cycle = current_is_moving || just_loaded_seg
+                                     || just_finished_seg
                                      || force_log || in_mcode_wait
                                      // P0-3: 抬升期间插补器被冻结 (time_scale=0, is_moving=0),
                                      // 但 Z 经 current_cmd_pos 直接抬升且状态机在变
@@ -1358,14 +1370,19 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             // 探针速度基准: 物理瞬时速度 v_current
             int is_snap_segment = just_loaded_seg && (g_interpolator.T7 <= 0.5);
             double log_velocity = g_interpolator.v_current;
-            if (is_snap_segment || (!current_is_moving && !just_loaded_seg)) {
+            if (is_snap_segment || (!current_is_moving && !just_loaded_seg
+                                    && !just_finished_seg)) {
                 // Snap 微段或完全静止时, log_velocity 强制 0.0
+                // ⚠ 修复 B: 段完成周期不算"静止" —— 该周期 v_current 已被
+                //   rt_resolve_scurve_step 更新为末态速度 (真实逐周期证据),
+                //   若在此清零会把边界行伪造成 v=0, 污染峰值/均匀性分析。
                 log_velocity = 0.0;
             }
 
             // 消费跨周期锁存标志
             int was_loaded = just_loaded_seg;
             just_loaded_seg = 0;
+            just_finished_seg = 0;
 
             // ---- 真实硬件探针: 运动中每 5ms 降采样 + 加载立即记录 ----
             if (!g_sim_mode && should_log_this_cycle

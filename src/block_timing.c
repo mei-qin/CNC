@@ -81,6 +81,11 @@ void bt_rt_block_start(uint32_t uid, int32_t line_no, uint32_t gen,
     g_bt.block_budget_sum_ms       = sum_ms;
     g_bt.block_virtual_ms          = 0.0;
     g_bt.block_finish_cycle        = 0;
+    /* V13.1.1 (2026-09-24) 修复 A: 块级时钟配对量随 block 开始清零 (RT 单写者)。
+     * 与 block_virtual_ms 同窗口 —— 保证 observed(块级) 与 model(块级) 同域。 */
+    g_bt.block_override_eff_sum    = 0.0;
+    g_bt.block_override_eff_cycles = 0;
+    g_bt.block_virtual_model_ms    = 0.0;
     /* V13.1 H3: T_plan 累计器随 block 开始清零 (RT 单写者, 见 inc/block_timing.h) */
     g_bt.block_plan_sum_ms         = 0.0;
     g_bt.plan_segments_loaded      = 0;
@@ -166,6 +171,9 @@ void bt_rt_cycle(int cycle, double virtual_inc_ms, int hold_active,
     if (inflight && virtual_inc_ms > 0.0) {
         g_bt.override_eff_sum    += eff_scale;
         g_bt.override_eff_cycles += 1;
+        /* V13.1.1 (修复 A): 块级配对, 与上两行**同门控、同累加**, 独立字段 */
+        g_bt.block_override_eff_sum    += eff_scale;
+        g_bt.block_override_eff_cycles += 1;
     }
     /* ---- 声明式模型: feedhold 生效期虚拟时间恒不推进 ----
      * 只在"确实在消费时间预算"的周期累加 (is_moving 或本周期真有推进),
@@ -175,5 +183,7 @@ void bt_rt_cycle(int cycle, double virtual_inc_ms, int hold_active,
      * 模型/实测失去可比性 (2026-09-20 修)。 */
     if (inflight && !hold_active && (moving || virtual_inc_ms > 0.0)) {
         g_bt.virtual_model_ms += cycle_time_ms * eff_scale;
+        /* V13.1.1 (修复 A): 块级配对, 同上门控 */
+        g_bt.block_virtual_model_ms += cycle_time_ms * eff_scale;
     }
 }

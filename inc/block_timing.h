@@ -71,6 +71,22 @@ typedef struct {
      * 用 cur_active 门控, 程序尾部空转周期会被误计入 stall/virtual。 */
     uint64_t block_finish_cycle;
 
+    /* ---- V13.1.1 (2026-09-24) H5 块级时钟配对 (修复 A) ----
+     * 背景 (用户裁决 2026-09-24): 多块程序上 0x0089 只保留**末块**, 而
+     *   block_virtual_ms 每块清零 (块级) / override_eff_sum 从不按块复位 (程序级),
+     *   H5 双通道配对在多块分析单元上作用域错配, 诊断 11/11 确定性 FAIL/E5。
+     * 修复: 为当前 owner 提供**块级**累计量, 与 block_virtual_ms **共用同一 inflight
+     *   起止窗口** (含完成周期归属); 程序级字段 (override_eff_sum / virtual_model_ms)
+     *   语义**不变**, 其他消费者不受影响。
+     * ⚠ 三者各自独立累计 (eff_sum 由 eff_scale 累加, model 由 Ts·eff_scale 累加),
+     *   严禁由其中一个反推另一个。
+     * gate 与 block_virtual_ms 完全一致:
+     *   eff_sum/cycles : inflight && virtual_inc_ms > 0
+     *   model          : inflight && !hold_active && (moving || virtual_inc_ms > 0) */
+    double   block_override_eff_sum;     /* Σ eff_scale (本块) */
+    uint64_t block_override_eff_cycles;  /* 上述求和的周期数 (本块) */
+    double   block_virtual_model_ms;     /* Σ Ts·eff_scale (本块, hold 周期贡献 0) */
+
     /* ---- V13.1 H3 (2026-09-22): planner 最终目标 (T_plan) ----
      * block_plan_sum_ms    = 本 block 实际进入 RT 执行的微段 T_total 之和 (ms)。
      *                        在 RT 首次装载各微段时累计 —— 装载时刻的 T_total

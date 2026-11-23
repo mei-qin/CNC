@@ -634,9 +634,11 @@ typedef struct { int32_t ret_code; } SmcConfigG93TipBasisRes;
  *   controller_elapsed_cycles = T_ctrl 的周期数 (真实流逝, 含 feedhold)
  *   host_runtime_ms           = T_host  —— 不在本结构, 由宿主墙钟测
  *
- * Req pack(1) 下 1+3pad = 4B; Res pack(1) 下 = 196B (V13.1 前 184B, 尾部追加
- *        block_plan_sum_ms + plan_segments_loaded —— 旧宿主脚本需同步更新)
- * Python: struct.unpack("<IiIQQQIIIdddQQQddQdQdQdQQQdI", resp[:196])
+ * Req pack(1) 下 1+3pad = 4B; Res pack(1) 下 = 220B
+ *        (184B → V13.1 196B 追加 block_plan_sum_ms + plan_segments_loaded
+ *         → V13.1.1 220B 追加 block_override_eff_sum + block_override_eff_cycles
+ *                   + block_virtual_model_ms —— 旧宿主脚本需同步更新)
+ * Python: struct.unpack("<iIiQQQIIIdddQQQddQdQdQdQQQdIdQd", resp[:220])
  * ============================================================ */
 typedef struct {
     uint8_t  op;           /* 0=只读, 1=读前清零 (下一 run 从零累计) */
@@ -678,6 +680,14 @@ typedef struct {
     /* ---- V13.1 H3 (2026-09-22): planner 最终目标 (T_plan, 独立于 T_sem) ---- */
     double   block_plan_sum_ms;         /* 本 block 实际装载微段的 Σ T_total (ms), RT 装载时累计 */
     uint32_t plan_segments_loaded;      /* 实际装载微段数 (对照 segments_generated) */
+
+    /* ---- V13.1.1 (2026-09-24) H5 块级时钟配对 (修复 A, 尾部追加) ----
+     * 与 block_virtual_ms **同 inflight 窗口**的块级累计量; 程序级
+     * override_eff_sum / virtual_model_ms 语义不变 (多块程序上两者作用域不同)。
+     * 追加在尾部 ⇒ 既有字段偏移不变; 新宿主按 220B 解包。 */
+    double   block_override_eff_sum;    /* Σ eff_scale (本块) */
+    uint64_t block_override_eff_cycles; /* 上述求和的周期数 (本块) */
+    double   block_virtual_model_ms;    /* Σ Ts·eff_scale (本块, hold 周期贡献 0) */
 } SmcBlockTimingRes;
 
 /* ============================================================
