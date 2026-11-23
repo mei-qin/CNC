@@ -114,6 +114,10 @@ void sim_drive_init_all(void)
         for (int s = 0; s < MAX_SLAVES_PER_AXIS; s++) {
             g_sim_axis[i].motor[s].cia_state = SIM_CIA_SWITCH_ON_DISABLED;
             g_sim_axis[i].motor[s].last_cw   = 0x0000;
+            /* Phase 1 限位映射基线: 全站样本有效 + 输入字全零
+             * (T01 起始态: "六站样本有效、输入字全零") */
+            atomic_store_explicit(&g_sim_axis[i].motor[s].limit_input_packed,
+                                  (UINT64_C(1) << 32), memory_order_relaxed);
         }
     }
 }
@@ -249,4 +253,28 @@ int sim_drive_lookup_slave(int slave_id, int *axis_idx_out, int *subidx_out)
         }
     }
     return -1;
+}
+
+int sim_drive_inject_limit_input(int slave_id, int valid, uint32_t word)
+{
+    int axis_idx = -1, subidx = -1;
+    if (sim_drive_lookup_slave(slave_id, &axis_idx, &subidx) != 0)
+        return -1;
+    uint64_t packed = (uint64_t)word | (valid ? (UINT64_C(1) << 32) : 0);
+    atomic_store_explicit(&g_sim_axis[axis_idx].motor[subidx].limit_input_packed,
+                          packed, memory_order_relaxed);
+    return 0;
+}
+
+int sim_drive_get_limit_input(int slave_id, uint32_t *word, int *valid)
+{
+    int axis_idx = -1, subidx = -1;
+    if (sim_drive_lookup_slave(slave_id, &axis_idx, &subidx) != 0)
+        return -1;
+    uint64_t packed = atomic_load_explicit(
+        &g_sim_axis[axis_idx].motor[subidx].limit_input_packed,
+        memory_order_relaxed);
+    if (word)  *word  = (uint32_t)(packed & 0xFFFFFFFFu);
+    if (valid) *valid = (int)((packed >> 32) & 1);
+    return 0;
 }

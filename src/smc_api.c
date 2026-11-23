@@ -12,6 +12,7 @@
 #include "param_store.h"        /* P2 (2026-08-28): Config* 钩子 — 写入即存 + 审计 */
 #include "periph_ai.h"          /* P1.5-1: AI 通道 (G_AIx 数据源) */
 #include "plc_core.h"           /* P1.5-2: plc_core_force_var */
+#include "limit_map.h"          /* Phase 1: 限位映射共用逻辑 */
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -1186,6 +1187,59 @@ int SMC_InjectLaserDi(uint16_t pattern, uint16_t enable)
     printf("[SMC_API] DI %s: pattern=0x%04X enable=%d%s\n",
            g_sim_mode ? "注入(sim)" : "强制(实机)", pattern, enable ? 1 : 0,
            g_sim_mode ? "" : " [物理互锁被旁路!]");
+    return 0;
+}
+
+// Phase 1 (2026-11-23): 机械轴限位映射 sim 测试通道 (rpc_server → 本层 → sim_drive)
+// @Thread-Safety: limit_input_packed 单原子打包 (word+valid 同样本), 见 sim_drive.h。
+int SMC_InjectSimLimitInput(int slave_id, int valid, uint32_t word)
+{
+    if (!g_sim_mode)
+        return -2;   /* 任务书一.4: 不新增实机可用的强制输入接口 */
+    return sim_drive_inject_limit_input(slave_id, valid ? 1 : 0, word);
+}
+
+// Phase 1 (2026-11-23): 限位映射诊断查询 — 逐 轴×方向 走共用映射逻辑。
+// 样本来源: sim 从站 (站号 1..PS_ECAT_TOPO_MAX 逐个 lookup; 站不存在 →
+// valid=0 条目)。非 sim 模式 g_sim_axis 未初始化 → 样本恒无效 → 已配置
+// 方向 = UNKNOWN (真实 PDO 采样属后续阶段, 见交付验证边界)。
+// @Thread-Safety: runtime 配置表 init 后只读; 无 RT 参与。
+int SMC_QueryLimitDiag(SmcLimitDiagEntry_t *out_entries)
+{
+    if (!out_entries) return -1;
+
+    LimitSample_t samples[PS_ECAT_TOPO_MAX];
+    int n_slaves = 0;
+    for (int sid = 1; sid <= PS_ECAT_TOPO_MAX; sid++) {
+        uint32_t w = 0;
+        int v = 0;
+        if (sim_drive_get_limit_input(sid, &w, &v) == 0) {
+            samples[sid - 1].word  = w;
+            samples[sid - 1].valid = v;
+            if (sid > n_slaves) n_slaves = sid;
+        } else {
+            samples[sid - 1].word  = 0;
+            samples[sid - 1].valid = 0;   /* 站不在拓扑: 洞位样本无效 */
+        }
+    }
+
+    const LimitSrcCfg_t (*cfg)[AXIS_NUM][2] = limit_map_runtime();
+    memset(out_entries, 0, sizeof(SmcLimitDiagEntry_t) * AXIS_NUM * 2);
+    for (int i = 0; i < AXIS_NUM; i++) {
+        for (int d = 0; d < 2; d++) {
+            LimitDiag_t dg;
+            if (limit_map_eval(cfg, samples, n_slaves, i, d, &dg) != 0)
+                continue;   /* 非法表项不可能经档案路径出现; 防御留零 */
+            SmcLimitDiagEntry_t *e = &out_entries[i * 2 + d];
+            e->axis_letter = (uint8_t)g_axis[i].axis_name[0];
+            e->dir         = (uint8_t)d;
+            e->result      = (uint8_t)dg.result;
+            e->input       = (uint8_t)dg.input;
+            e->slave_id    = (uint16_t)dg.slave;
+            e->flags       = (uint16_t)(dg.sample_valid ? 0x1 : 0x0);
+            e->raw_word    = dg.raw_word;
+        }
+    }
     return 0;
 }
 

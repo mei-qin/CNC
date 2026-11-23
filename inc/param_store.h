@@ -144,6 +144,18 @@ typedef struct {
     int    ecat_topo_count;                          /* 0..PS_ECAT_TOPO_MAX */
     uint32_t ecat_topo_vendor[PS_ECAT_TOPO_MAX];     /* SII manufacturer, 0=通配 */
     uint32_t ecat_topo_product[PS_ECAT_TOPO_MAX];    /* SII product code, 0=通配 */
+    /* 机械轴限位输入来源 (Phase 1, 2026-11-23): [轴][dir], dir 0=正端 1=负端。
+     * 与轴自身驱动无绑定 — 允许跨从站取信号 (如 Y+ 取 X 驱动 5 号站 DI3)。
+     * cfg = 字段掩码 (bit0 slave / bit1 input / bit2 level): 解析期累见,
+     * 收尾强制 ∈ {0, 0x7} (半配置致命), 故对外语义 0=未配置 0x7=已配置。
+     * 未配置方向 = UNCONFIGURED (诊断口径, 非确认无开关)。值域:
+     *   slave 1..PS_ECAT_TOPO_MAX (运行期站不存在 → 诊断 UNKNOWN, 非配置错误)
+     *   input 1..6 = LimitInput_t (di1..di4/nl/pl)
+     *   level 1=高有效 0=低有效 (仅 DI 生效; NL/PL 功能位不反相) */
+    int    limit_src_slave[AXIS_NUM][2];
+    int    limit_src_input[AXIS_NUM][2];
+    int    limit_src_level[AXIS_NUM][2];
+    int    limit_src_cfg[AXIS_NUM][2];
 } MachineProfile_t;
 
 /* =====================================================================

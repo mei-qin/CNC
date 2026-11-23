@@ -351,6 +351,18 @@ int SMC_ConfigLaserInterlock(const LaserIlRule_t *rules, int count);
 // 返回: 0=成功
 int SMC_InjectLaserDi(uint16_t pattern, uint16_t enable);
 
+// Phase 1 (2026-11-23): 机械轴限位映射 sim 测试通道 (任务书: 不新增实机强制接口)
+//   按站注入 0x60FD 输入字 + 有效标志; word/valid 单原子打包, 诊断查询读同一样本
+//   slave_id: 目标站号 (跨轴拓扑寻址, 与轴字母无关); valid=0 时 word 保留作证据回显
+// 返回: 0=成功, -1=站号不在当前拓扑, -2=非 sim 模式
+int SMC_InjectSimLimitInput(int slave_id, int valid, uint32_t word);
+
+// Phase 1 (2026-11-23): 限位映射诊断查询 (纯 RPC 线程, 零 RT 参与)
+//   逐 轴×方向: runtime 配置表 (kernel_init_hw apply) + sim 从站样本 → limit_map_eval
+//   out_entries: AXIS_NUM*2 条目 (轴主序, + 在前 − 在后), 结构见 smc_protocol.h
+// 返回: 0=成功
+int SMC_QueryLimitDiag(SmcLimitDiagEntry_t *out_entries);
+
 // P1.5-2 (2026-09-15): PLC 用户变量强制 (输出强制语义, 周期末覆写)
 // name: 变量名 (大小写不敏感); name 空且 on=0 = 清除全部; 仅 RUNNING 有效
 // 返回: 0=成功, -1=变量不存在, -3=非 RUNNING

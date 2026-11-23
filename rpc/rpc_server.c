@@ -43,6 +43,7 @@
 #include "opcua_server.h"      /* 契约 P4: opcua_server_start (OPC UA 4840 对外通道) */
 #include "param_store.h"       /* P1+P2: 机床参数档案 (kernel_init_hw 数据源) */
 #include "ecat_core.h"         /* P0-4a: ecat_set_expected_topo (拓扑校验) */
+#include "limit_map.h"         /* Phase 1: 限位映射 runtime 表 (apply 11.8) */
 #include "plc_core.h"          /* P1 软 PLC: plc_core_download/get_state (0x0076/0x0079) */
 #include "periph_ai.h"         /* P1.5-1: AI 通道 (0x007C/0x007D + init) */
 #include "plc_trace.h"         /* P1.5-3: Trace (0x007F-0x0081) */
@@ -566,6 +567,27 @@ static int handle_client_request(int client_fd)
         res->ret_code = SMC_InjectLaserDi(req->pattern, req->enable);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcInjectLaserDiRes);
+        break;
+    }
+    case SMC_CMD_INJECT_SIM_LIMIT_INPUT: {
+        /* Phase 1 (2026-11-23): sim-only 按站注入 0x60FD 输入字+有效标志 */
+        if (req_hdr.data_len < sizeof(SmcInjectSimLimitInputReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcInjectSimLimitInputReq *req = (SmcInjectSimLimitInputReq *)payload;
+        SmcInjectSimLimitInputRes *res = (SmcInjectSimLimitInputRes *)resp_buf;
+        res->ret_code = SMC_InjectSimLimitInput(req->slave_id, req->valid, req->word);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcInjectSimLimitInputRes);
+        break;
+    }
+    case SMC_CMD_QUERY_LIMIT_DIAG: {
+        /* Phase 1 (2026-11-23): 限位映射诊断查询 (轴×方向 定长 10 条目) */
+        SmcQueryLimitDiagRes *res = (SmcQueryLimitDiagRes *)resp_buf;
+        memset(res, 0, sizeof(*res));
+        res->ret_code = SMC_QueryLimitDiag(res->entry);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcQueryLimitDiagRes);
         break;
     }
     case SMC_CMD_CONFIG_LASER_PDO_LAYOUT: {
@@ -1747,6 +1769,25 @@ static int kernel_init_hw(const char *iface)
             topo[i].product = hw->ecat_topo_product[i];
         }
         ecat_set_expected_topo(topo, n);
+    }
+
+    /* 11.8 Phase 1 (2026-11-23): 机械轴限位输入来源 ([limit_src] → runtime 表)
+     *     供 RPC 0x008C 诊断查询; 换站 = 改档案重启进程, 代码零改动。
+     *     本阶段诊断-only: 不接 RT/停机/报警, 真实 PDO 采样属后续阶段。
+     *     kernel_init (非 hw 路径) 不 apply → 表保持零初始化 = 全 UNCONFIGURED */
+    {
+        LimitSrcCfg_t lmt[AXIS_NUM][2];
+        memset(lmt, 0, sizeof(lmt));
+        for (int i = 0; i < hw->axis_count && i < AXIS_NUM; i++) {
+            for (int d = 0; d < 2; d++) {
+                if (!hw->limit_src_cfg[i][d]) continue;   /* 解析后 ∈ {0, 0x7} */
+                lmt[i][d].configured  = 1;
+                lmt[i][d].slave       = hw->limit_src_slave[i][d];
+                lmt[i][d].input       = hw->limit_src_input[i][d];
+                lmt[i][d].active_high = hw->limit_src_level[i][d];
+            }
+        }
+        limit_map_set_runtime((const LimitSrcCfg_t (*)[AXIS_NUM][2])lmt);
     }
 
     /* 12. 启动内核 (实机 = EtherCAT 组态 + CiA402 使能; sim = 软件驱动) */

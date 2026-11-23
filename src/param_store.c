@@ -18,6 +18,7 @@
 #include "param_store.h"
 #include "event_logger.h"
 #include "global_def.h"      /* g_sim_mode */
+#include "limit_map.h"       /* Phase 1: LMIN_* 纯类型枚举 (无 SMC_ 调用, 无环形 include) */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -191,6 +192,25 @@ static int ps_find_axis(const MachineProfile_t *p, char letter)
         if (toupper((unsigned char)p->axis_order[i][0]) == c) return i;
     }
     return -1;
+}
+
+/* Phase 1 (2026-11-23): [limit_src] input 字段解析 (大小写不敏感)。
+ * @return 0=成功写 *out (LimitInput_t 值); -1=非法 */
+static int ps_limit_input_parse(const char *val, int *out)
+{
+    char buf[8];
+    size_t n = strlen(val);
+    if (n == 0 || n >= sizeof(buf)) return -1;
+    for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)val[i]);
+    buf[n] = '\0';
+    if      (strcmp(buf, "di1") == 0) *out = LMIN_DI1;
+    else if (strcmp(buf, "di2") == 0) *out = LMIN_DI2;
+    else if (strcmp(buf, "di3") == 0) *out = LMIN_DI3;
+    else if (strcmp(buf, "di4") == 0) *out = LMIN_DI4;
+    else if (strcmp(buf, "nl")  == 0) *out = LMIN_NL;
+    else if (strcmp(buf, "pl")  == 0) *out = LMIN_PL;
+    else return -1;
+    return 0;
 }
 
 /* 单行工具: 去首尾空白; 返回修剪后指针 */
@@ -400,6 +420,78 @@ static int ps_parse_global_line(MachineProfile_t *p, const char *section,
                lineno, key);
         return 0;
     }
+    if (strcmp(section, "limit_src") == 0) {
+        /* Phase 1 (2026-11-23): 机械轴限位输入来源, 跨从站配置。
+         * 键 = <轴字母>_<pos|neg>_<slave|input|level>, 如 y_pos_slave=5。
+         * 轴字母内联 ps_find_axis (与 [axis.X] 同语义: [general] 须在前,
+         * 写出器保证顺序)。显式不合法的站号/通道/极性 → 行号致命;
+         * 三元组缺项由 ps_parse_file 收尾检查兜底。
+         * 站号解析期只验 1..PS_ECAT_TOPO_MAX — 运行期站不在拓扑 → 诊断
+         * UNKNOWN (T12 口径: 有效配置+来源缺失 = 未知, 非配置错误)。 */
+        if (strlen(key) < 7 || key[1] != '_') {
+            printf("[param_store] 行 %d: 非法 [limit_src] key '%s' "
+                   "(须 <轴>_<pos|neg>_<slave|input|level>)\n", lineno, key);
+            return -1;
+        }
+        int axis = ps_find_axis(p, key[0]);
+        if (axis < 0) {
+            printf("[param_store] 行 %d: 轴 '%c' 不在 axis_order 中\n",
+                   lineno, key[0]);
+            return -1;
+        }
+        const char *rest = key + 2;
+        int dir;
+        if      (strncmp(rest, "pos_", 4) == 0) { dir = 0; rest += 4; }
+        else if (strncmp(rest, "neg_", 4) == 0) { dir = 1; rest += 4; }
+        else {
+            printf("[param_store] 行 %d: 非法 [limit_src] key '%s' (方向须 pos/neg)\n",
+                   lineno, key);
+            return -1;
+        }
+        if (strcmp(rest, "slave") == 0) {
+            int v = (int)strtol(val, NULL, 10);
+            if (v < 1 || v > PS_ECAT_TOPO_MAX) {
+                printf("[param_store] 行 %d: %s=%d 越界 (1..%d)\n",
+                       lineno, key, v, PS_ECAT_TOPO_MAX);
+                return -1;
+            }
+            p->limit_src_slave[axis][dir] = v;
+            p->limit_src_cfg[axis][dir] |= 0x1;   /* bit0: slave 已见 */
+            return 0;
+        }
+        if (strcmp(rest, "input") == 0) {
+            int v;
+            if (ps_limit_input_parse(val, &v) != 0) {
+                printf("[param_store] 行 %d: %s='%s' 非法 (di1..di4/nl/pl)\n",
+                       lineno, key, val);
+                return -1;
+            }
+            p->limit_src_input[axis][dir] = v;
+            p->limit_src_cfg[axis][dir] |= 0x2;   /* bit1: input 已见 */
+            return 0;
+        }
+        if (strcmp(rest, "level") == 0) {
+            char buf[8];
+            size_t n = strlen(val);
+            if (n == 0 || n >= sizeof(buf)) {
+                printf("[param_store] 行 %d: %s='%s' 非法 (high/low)\n", lineno, key, val);
+                return -1;
+            }
+            for (size_t i = 0; i < n; i++) buf[i] = (char)tolower((unsigned char)val[i]);
+            buf[n] = '\0';
+            if      (strcmp(buf, "high") == 0) p->limit_src_level[axis][dir] = 1;
+            else if (strcmp(buf, "low")  == 0) p->limit_src_level[axis][dir] = 0;
+            else {
+                printf("[param_store] 行 %d: %s='%s' 非法 (high/low)\n", lineno, key, val);
+                return -1;
+            }
+            p->limit_src_cfg[axis][dir] |= 0x4;   /* bit2: level 已见 */
+            return 0;
+        }
+        printf("[param_store] 行 %d: 未知 [limit_src] key '%s' (忽略)\n",
+               lineno, key);
+        return 0;
+    }
     return -1;   /* 未知 section — 由调用方决定是否致命 */
 }
 
@@ -493,6 +585,22 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
     if (!order_ok) {
         printf("[param_store] 缺 axis_order, 拒绝加载\n");
         return -1;
+    }
+    /* Phase 1: [limit_src] 三元组完整性 — cfg 是字段掩码 (bit0 slave/bit1 input/
+     * bit2 level), 非 0x7 = 配了但不齐。半配置静默接受会把"低有效+缺 level"
+     * 误读成高有效, 必须致命并指明 轴×方向。 */
+    for (int i = 0; i < p->axis_count && i < AXIS_NUM; i++) {
+        for (int d = 0; d < 2; d++) {
+            int m = p->limit_src_cfg[i][d];
+            if (m != 0 && m != 0x7) {
+                printf("[param_store] [limit_src] %s_%s 配置不完整 (缺 %s%s%s), 拒绝加载\n",
+                       p->axis_order[i], d == 0 ? "pos" : "neg",
+                       (m & 0x1) ? "" : "slave ",
+                       (m & 0x2) ? "" : "input ",
+                       (m & 0x4) ? "" : "level");
+                return -1;
+            }
+        }
     }
     return 0;
 }
@@ -619,6 +727,22 @@ static int ps_save_locked(const MachineProfile_t *p)
     for (int i = 0; i < p->ecat_topo_count && i < PS_ECAT_TOPO_MAX; i++) {
         fprintf(fp, "vendor_%d=0x%08X\n",  i, (unsigned)p->ecat_topo_vendor[i]);
         fprintf(fp, "product_%d=0x%08X\n", i, (unsigned)p->ecat_topo_product[i]);
+    }
+
+    /* Phase 1 (2026-11-23): 机械轴限位输入来源 (cfg!=0 才写, 三元组必齐) */
+    fprintf(fp, "\n[limit_src]\n");
+    for (int i = 0; i < p->axis_count && i < AXIS_NUM; i++) {
+        for (int d = 0; d < 2; d++) {
+            if (!p->limit_src_cfg[i][d]) continue;
+            static const char *inp_names[] =
+                { "", "di1", "di2", "di3", "di4", "nl", "pl" };
+            fprintf(fp, "%s_%s_slave=%d\n", p->axis_order[i], d == 0 ? "pos" : "neg",
+                    p->limit_src_slave[i][d]);
+            fprintf(fp, "%s_%s_input=%s\n", p->axis_order[i], d == 0 ? "pos" : "neg",
+                    inp_names[p->limit_src_input[i][d]]);
+            fprintf(fp, "%s_%s_level=%s\n", p->axis_order[i], d == 0 ? "pos" : "neg",
+                    p->limit_src_level[i][d] ? "high" : "low");
+        }
     }
     fprintf(fp, "\n");
 

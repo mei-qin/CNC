@@ -230,6 +230,10 @@ typedef enum {
 
     /* --- V13.1 (2026-09-22): G93 语义变换事件 (geometry-policy / M1 因果态) --- */
     SMC_CMD_QUERY_G93_SEMANTIC_EVENTS = 0x008A, /* 事件环形缓冲分页查询 (op: 0=读, 1=复位后读) */
+
+    /* --- 跨从站限位映射 Phase 1 (2026-11-23): 0x008B ~ 0x008C --- */
+    SMC_CMD_INJECT_SIM_LIMIT_INPUT   = 0x008B, /* sim-only: 按站注入 0x60FD 输入字+有效标志 */
+    SMC_CMD_QUERY_LIMIT_DIAG         = 0x008C, /* 机械轴限位映射诊断查询 (轴×方向 定长 10 条目) */
 } SmcCmdType;
 
 /* ============================================================
@@ -920,6 +924,45 @@ typedef struct {
 typedef struct {
     int32_t ret_code;   /* 0=ok, -2=非 sim 模式 */
 } SmcInjectLaserDiRes;
+
+/* ============================================================
+ * SMC_CMD_INJECT_SIM_LIMIT_INPUT (0x008B, Phase 1 2026-11-23)
+ * + SMC_CMD_QUERY_LIMIT_DIAG (0x008C)
+ * 机械轴限位 → 输入来源映射 的 sim 测试通道 (任务书一.4):
+ * 按站注入完整 32 位 0x60FD 输入字 (bit0=NL, bit1=PL, bit16-19=DI1-DI4)
+ * 与有效标志 — 不提供 "Y+=true" 级别的语义注入, 站号→轴的归属由
+ * 映射逻辑经档案配置判定 (跨从站取信号的场景由此覆盖)。
+ * word+valid 由 sim 侧单原子打包, 诊断查询读到的必然是同一样本。
+ * ============================================================ */
+/* 0x008B Req pack(1) 下 = 8B; Res = 4B
+ * ret_code: 0=成功, -1=站号不在当前拓扑, -2=非 sim 模式 */
+typedef struct {
+    uint8_t  slave_id;    /* 目标站号 (跨轴拓扑寻址, 与轴字母无关) */
+    uint8_t  valid;       /* 1=样本有效 0=无效 (word 保留作证据回显) */
+    uint16_t reserved;    /* 必须 0 */
+    uint32_t word;        /* 完整 0x60FD 输入字 (已解码, 本阶段字节序不涉及) */
+} SmcInjectSimLimitInputReq;
+typedef struct { int32_t ret_code; } SmcInjectSimLimitInputRes;
+
+/* 0x008C Req pack(1) 下 = 4B (pad); Res = 8 + 12×AXIS_NUM*2 = 128B
+ * result: 0=未配置 1=未知 2=未触发 3=触发 (LimitResult_t)
+ * input : 0=未配置, 1..6 = LimitInput_t (di1..di4/nl/pl)
+ * flags : bit0 = sample_valid (证据回显: 来源站样本有效标志) */
+typedef struct { uint32_t reserved; } SmcQueryLimitDiagReq;
+typedef struct {
+    uint8_t axis_letter;  /* 轴字母 ASCII ('X'/'Y'/...; 索引=房间号序) */
+    uint8_t dir;          /* 0=正端 '+' 1=负端 '−' */
+    uint8_t result;       /* LimitResult_t */
+    uint8_t input;        /* LimitInput_t */
+    uint16_t slave_id;    /* 来源站 (未配置=0) */
+    uint16_t flags;        /* bit0=sample_valid */
+    uint32_t raw_word;    /* 来源站当前输入字原值 (证据) */
+} SmcLimitDiagEntry_t;    /* pack(1) 12B */
+typedef struct {
+    int32_t  ret_code;    /* 0=成功 */
+    uint32_t reserved;
+    SmcLimitDiagEntry_t entry[AXIS_NUM * 2];   /* 轴主序, 方向 + 在前 − 在后 */
+} SmcQueryLimitDiagRes;
 
 /* SMC_CONFIG_LASER_INTERLOCK (0x0074, P0-2 2026-09-09): 互锁链规则表
  * count: 0..LASER_IL_MAX (0 = 回退默认 6 路链, 等价不配置)

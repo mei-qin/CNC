@@ -44,6 +44,12 @@ typedef struct {
     int               fault_injected;      /* 外部 RPC 注入故障标志            */
     int               target_reach_latch;  /* 到达目标锁存 (驱动 SW bit10)     */
     uint64_t          last_advance_cycle;  /* motor 级去重 (防双驱一周期双推)  */
+    /* Phase 1 限位映射 (2026-11-23): 本从站 0x60FD 输入字 + 有效标志,
+     * 打包成单原子保证跨线程 (RPC 注入 ↔ RPC 诊断查询) 读到同一样本 —
+     * 拆成两个字段会出现 "word 新 / valid 旧" 的撕裂样本。
+     * 低 32 位 = word; bit32 = valid。RT 线程不触碰 (诊断-only)。
+     * 基线 (init_all): 全站 valid=1 word=0。 */
+    _Atomic uint64_t  limit_input_packed;
 } SimMotor_t;
 
 /* 单轴的 sim 状态 (双驱轴含 2 个独立 motor) */
@@ -129,5 +135,16 @@ int sim_drive_step_toward(int axis_idx, int slave_subidx, int32_t target, double
  * slave_id → (axis_idx, subidx) 线性查找。
  * 找到返回 0 并写 *axis_idx_out / *subidx_out; 未找到返回 -1 */
 int sim_drive_lookup_slave(int slave_id, int *axis_idx_out, int *subidx_out);
+
+/* @Context: Non-RealTime Background Thread (RPC 线程, Phase 1 限位映射)
+ * @Thread-Safety: limit_input_packed 单原子写 (word+valid 同样本)。
+ * 按站号寻址 (跨轴拓扑, 与轴字母无关)。valid=0 时 word 仅作证据回显。
+ * 返回 0=成功, -1=站号不在当前拓扑 */
+int sim_drive_inject_limit_input(int slave_id, int valid, uint32_t word);
+
+/* @Context: Non-RealTime Background Thread (RPC 诊断查询)
+ * @Thread-Safety: limit_input_packed 单原子读 (word+valid 同样本)。
+ * 返回 0=成功, -1=站号不在当前拓扑 */
+int sim_drive_get_limit_input(int slave_id, uint32_t *word, int *valid);
 
 #endif /* SIM_DRIVE_H */
