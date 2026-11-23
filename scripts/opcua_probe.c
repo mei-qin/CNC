@@ -987,6 +987,60 @@ int main(int argc, char *argv[])
         }
     }
 
+    /* ==================== §12 PLC watch 面 (2026-09-12, P1-5) ====================
+     * CNC.PLC 13 只读变量 + ReadVar 方法。probe 环境 plc_prog.st 不存在 →
+     * 槽 EMPTY (State=0 / NVars=0); ReadVar 任意名 → ret=-1。
+     * (有 autoload 的机器上 State 可能=2, 值域断言兼容两种。) */
+    {
+        printf("\n--- §12 PLC watch nodes & method ---\n");
+        int32_t vi = -1;
+
+        read_int(client, "CNC.PLC.State", &vi);
+        snprintf(buf, sizeof(buf), "State=%d", vi);
+        check(vi >= 0 && vi <= 3, "PLC.State in 0..3", buf);
+        read_int(client, "CNC.PLC.NVars", &vi);
+        snprintf(buf, sizeof(buf), "NVars=%d", vi);
+        check(vi >= 0, "PLC.NVars >= 0", buf);
+        read_int(client, "CNC.PLC.Heartbeat", &vi);
+        snprintf(buf, sizeof(buf), "Heartbeat=%d", vi);
+        check(vi >= 0, "PLC.Heartbeat >= 0", buf);
+        read_int(client, "CNC.PLC.ErrLine", &vi);
+        snprintf(buf, sizeof(buf), "ErrLine=%d", vi);
+        check(vi >= 0, "PLC.ErrLine >= 0", buf);
+        read_int(client, "CNC.PLC.GMcode", &vi);
+        snprintf(buf, sizeof(buf), "GMcode=%d", vi);
+        check(vi >= 0, "PLC.GMcode >= 0", buf);
+        read_int(client, "CNC.PLC.GMcodeStrobe", &vi);
+        snprintf(buf, sizeof(buf), "GMcodeStrobe=%d", vi);
+        check(vi == 0 || vi == 1, "PLC.GMcodeStrobe in {0,1}", buf);
+        {
+            char emsg[80];
+            int rok = read_string(client, "CNC.PLC.ErrMsg", emsg, sizeof(emsg));
+            snprintf(buf, sizeof(buf), "read=%d msg=%s", rok, emsg);
+            check(rok == 0, "PLC.ErrMsg String readable", buf);
+        }
+        /* ReadVar: 空槽 → ret=-1 (2 出参: Double value + Int32 ret) */
+        {
+            UA_Variant in[1];
+            UA_String nm = UA_STRING("cnt");
+            UA_Variant_setScalarCopy(&in[0], &nm, &UA_TYPES[UA_TYPES_STRING]);
+            UA_NodeId o = UA_NODEID_STRING(1, (char *)"CNC.PLC");
+            UA_NodeId m = UA_NODEID_STRING(1, (char *)"CNC.PLC.ReadVar");
+            size_t out_sz = 0;
+            UA_Variant *out = NULL;
+            UA_StatusCode sc = UA_Client_call(client, o, m, 1, in, &out_sz, &out);
+            int32_t ret = -99;
+            if (sc == UA_STATUSCODE_GOOD && out_sz == 2 &&
+                UA_Variant_hasScalarType(&out[0], &UA_TYPES[UA_TYPES_DOUBLE]) &&
+                UA_Variant_hasScalarType(&out[1], &UA_TYPES[UA_TYPES_INT32]))
+                ret = *(int32_t *)out[1].data;
+            if (out) UA_Array_delete(out, out_sz, &UA_TYPES[UA_TYPES_VARIANT]);
+            UA_Variant_clear(&in[0]);
+            snprintf(buf, sizeof(buf), "sc=0x%x ret=%d", sc, ret);
+            check(ret == -1, "PLC.ReadVar(empty) ret=-1", buf);
+        }
+    }
+
     UA_Client_disconnect(client);
     UA_Client_delete(client);
 
