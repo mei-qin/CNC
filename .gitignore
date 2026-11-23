@@ -85,3 +85,13 @@ tests/output/scenario_log/
 
 # ==== 2026-09-08: 红蓝对抗审计临时基线副本 (全量代码快照, 不入仓库) ====
 .baseline_head/
+
+# ==== 2026-11-23: 科研/论文产物 (系统运行不需要, 不入仓库) ====
+/research/
+/research.zip
+/V13_SOURCE_PACK/
+/V13_SOURCE_PACK.zip
+/experiments/
+/runs/
+/s1/
+/sei_artifact/
