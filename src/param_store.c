@@ -580,10 +580,13 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
                 for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
                     char *t = ps_trim(tok);
                     if (*t == '\0' || strlen(t) != 1 || n >= AXIS_NUM) { dup = 1; break; }
+                    /* 二审 P2: 先归一化大写, 再判重+存储 — 否则 "X,x" 判重时
+                     * 'x' 对不上已存的 'X', 双双入库成重复轴名 */
+                    char c = (char)toupper((unsigned char)*t);
                     for (int i = 0; i < n; i++)
-                        if (p->axis_order[i][0] == *t) { dup = 1; break; }
+                        if (p->axis_order[i][0] == c) { dup = 1; break; }
                     if (dup) break;
-                    p->axis_order[n][0] = (char)toupper((unsigned char)*t);
+                    p->axis_order[n][0] = c;
                     p->axis_order[n][1] = '\0';
                     n++;
                 }
@@ -613,6 +616,14 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
                 return -1;
             }
         }
+    }
+
+    /* 二审 P1 (2026-11-24): fgets 返回 NULL 除 EOF 外还有读错误 (ferror) —
+     * 残缺前缀不得当完整档案接受, 读错误沿致命路径拒绝加载。 */
+    if (ferror(fp)) {
+        printf("[param_store] 行 %d 后读取失败 (%s), 拒绝加载\n",
+               lineno, strerror(errno));
+        return -1;
     }
 
     if (!version_ok) {
