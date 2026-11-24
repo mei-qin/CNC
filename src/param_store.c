@@ -3,8 +3,9 @@
  *
  *  设计要点:
  *    1. 编译期默认档案 ps_default_profile() = 原 rpc_server.c g_hw_* 表
- *       的等价物 (前期实机开发测试值), 保证无文件/文件损坏时行为与
- *       改造前完全一致 (零回归风险)。
+ *       的等价物 (前期实机开发测试值), 保证无文件时行为与改造前完全一致
+ *       (零回归风险)。修复轮 P1-2 (2026-11-24) 起: 文件显式损坏/不可读
+ *       不再回退默认继续运行, load 返回 -1 由调用方拒绝启动。
  *    2. INI 解析为"默认值 + 文件覆盖"合并语义: 缺 key 保默认, 文件里
  *       显式 PS_TODO_* 哨兵维持 IBN 填空分级 (A 拒启动 / B 跳过警告)。
  *    3. notify 钩子按"影子旧值 vs 新值"判变化 — 相等则完全 no-op,
@@ -192,6 +193,19 @@ static int ps_find_axis(const MachineProfile_t *p, char letter)
         if (toupper((unsigned char)p->axis_order[i][0]) == c) return i;
     }
     return -1;
+}
+
+/* 整串严格十进制整数解析 (修复轮 P2, 2026-11-24): strtol 带 errno + endptr
+ * 全消费, 拒绝 "5abc"/"2.5"/空串/溢出。val 已过 ps_trim, 不容忍残余字符。
+ * @return 0=成功写 *out; -1=非法 */
+static int ps_parse_int_strict(const char *val, long *out)
+{
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(val, &end, 10);
+    if (end == val || errno == ERANGE || *end != '\0') return -1;
+    *out = v;
+    return 0;
 }
 
 /* Phase 1 (2026-11-23): [limit_src] input 字段解析 (大小写不敏感)。
@@ -423,9 +437,11 @@ static int ps_parse_global_line(MachineProfile_t *p, const char *section,
     if (strcmp(section, "limit_src") == 0) {
         /* Phase 1 (2026-11-23): 机械轴限位输入来源, 跨从站配置。
          * 键 = <轴字母>_<pos|neg>_<slave|input|level>, 如 y_pos_slave=5。
-         * 轴字母内联 ps_find_axis (与 [axis.X] 同语义: [general] 须在前,
-         * 写出器保证顺序)。显式不合法的站号/通道/极性 → 行号致命;
-         * 三元组缺项由 ps_parse_file 收尾检查兜底。
+         * 轴字母内联 ps_find_axis 按当前 axis_order 绑下标 — 本节必须出现在
+         * [general] axis_order 之后, 由 ps_parse_file 顺序守卫强制拒绝乱序
+         * (修复轮 P1-1: 否则后到重排会让已写配置挂错轴)。
+         * 显式不合法的站号/通道/极性 → 行号致命 (站号整串严格解析, 拒绝
+         * "5abc"/"2.5"); 三元组缺项由 ps_parse_file 收尾检查兜底。
          * 站号解析期只验 1..PS_ECAT_TOPO_MAX — 运行期站不在拓扑 → 诊断
          * UNKNOWN (T12 口径: 有效配置+来源缺失 = 未知, 非配置错误)。 */
         if (strlen(key) < 7 || key[1] != '_') {
@@ -449,13 +465,13 @@ static int ps_parse_global_line(MachineProfile_t *p, const char *section,
             return -1;
         }
         if (strcmp(rest, "slave") == 0) {
-            int v = (int)strtol(val, NULL, 10);
-            if (v < 1 || v > PS_ECAT_TOPO_MAX) {
-                printf("[param_store] 行 %d: %s=%d 越界 (1..%d)\n",
-                       lineno, key, v, PS_ECAT_TOPO_MAX);
+            long v;
+            if (ps_parse_int_strict(val, &v) != 0 || v < 1 || v > PS_ECAT_TOPO_MAX) {
+                printf("[param_store] 行 %d: %s='%s' 非法或越界 (须 1..%d 整数)\n",
+                       lineno, key, val, PS_ECAT_TOPO_MAX);
                 return -1;
             }
-            p->limit_src_slave[axis][dir] = v;
+            p->limit_src_slave[axis][dir] = (int)v;
             p->limit_src_cfg[axis][dir] |= 0x1;   /* bit0: slave 已见 */
             return 0;
         }
@@ -504,6 +520,7 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
     int  lineno = 0;
     int  version_ok = 0;
     int  order_ok = 0;
+    int  axis_dep_seen = 0;   /* 修复轮 P1-1: 已见 [axis.*]/[limit_src] (按下标写入) */
 
     while (fgets(line, sizeof(line), fp)) {
         lineno++;
@@ -524,6 +541,12 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
                     printf("[param_store] 行 %d: 轴 section 必须单字母 '%s'\n", lineno, section);
                     return -1;
                 }
+                if (!order_ok) {   /* P1-1: 乱序 → 按默认序绑下标, 后到重排挂错轴 */
+                    printf("[param_store] 行 %d: [axis.%c] 须在 [general] axis_order 之后 "
+                           "(节顺序有歧义, 拒绝加载)\n", lineno, cur_axis);
+                    return -1;
+                }
+                axis_dep_seen = 1;
                 if (ps_find_axis(p, cur_axis) < 0) {
                     printf("[param_store] 行 %d: 轴 '%c' 不在 axis_order 中\n", lineno, cur_axis);
                     return -1;
@@ -543,6 +566,12 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
             if (strcmp(key, "version") == 0) {
                 version_ok = ((int)strtol(val, NULL, 10) == PS_PROFILE_VERSION);
             } else if (strcmp(key, "axis_order") == 0) {
+                /* P1-1: 轴相关节已按下标写入后重排 → 已写配置挂错轴, 拒绝 */
+                if (axis_dep_seen) {
+                    printf("[param_store] 行 %d: axis_order 重排出现在 [axis.*]/[limit_src] 之后, "
+                           "已写入配置将挂错轴, 拒绝加载\n", lineno);
+                    return -1;
+                }
                 /* 解析逗号分隔轴序; 要求 1..AXIS_NUM 个不重复单字母 */
                 int n = 0, dup = 0;
                 char buf[64];
@@ -571,6 +600,14 @@ static int ps_parse_file(MachineProfile_t *p, FILE *fp)
         if (cur_axis != '\0') {
             if (ps_parse_axis_line(p, cur_axis, key, val, lineno) != 0) return -1;
         } else {
+            if (strcmp(section, "limit_src") == 0) {   /* P1-1: 同 [axis.*] 顺序守卫 */
+                if (!order_ok) {
+                    printf("[param_store] 行 %d: [limit_src] 须在 [general] axis_order 之后 "
+                           "(节顺序有歧义, 拒绝加载)\n", lineno);
+                    return -1;
+                }
+                axis_dep_seen = 1;
+            }
             if (ps_parse_global_line(p, section, key, val, lineno) != 0) {
                 printf("[param_store] 行 %d: 未知 section '%s'\n", lineno, section);
                 return -1;
@@ -780,7 +817,7 @@ const char *param_store_path(void)
     return "machine_profile.ini";
 }
 
-void param_store_load(void)
+int param_store_load(void)
 {
     pthread_mutex_lock(&g_ps_mutex);
     ps_default_profile(&g_profile);
@@ -788,26 +825,40 @@ void param_store_load(void)
     const char *path = param_store_path();
     FILE *fp = fopen(path, "r");
     if (!fp) {
+        if (errno != ENOENT) {   /* 存在但打不开 ≠ 首次上电, 同显式损坏拒启 */
+            g_profile.loaded = 1;
+            g_profile.dirty = 0;
+            pthread_mutex_unlock(&g_ps_mutex);
+            printf("[param_store] 档案无法打开 %s: %s, 拒绝启动\n", path, strerror(errno));
+            EventLogger_Push(SEVERITY_FATAL, SOURCE_CONFIG, PS_EV_LOAD_FALLBACK, 2,
+                             "profile unreadable, startup aborted");
+            return -1;
+        }
         g_profile.loaded = 1;
         g_profile.dirty = 0;
         pthread_mutex_unlock(&g_ps_mutex);
         printf("[param_store] 无档案文件 %s, 用编译期默认 (首次变更时自动生成)\n", path);
         EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_LOAD_FALLBACK, 0,
                          "profile file missing, factory defaults in use");
-        return;
+        return 0;
     }
 
-    /* axis_order 先复位为空, 由文件 [general] 提供 (解析器校验唯一性) */
+    /* 进入解析时 axis_order = 编译期默认序 (ps_default_profile), 由文件
+     * [general] 覆盖; 顺序守卫保证 [axis.*]/[limit_src] 只在 axis_order
+     * 之后按下标写入, 乱序/后到重排一律致命 (修复轮 P1-1)。 */
     if (ps_parse_file(&g_profile, fp) != 0) {
         fclose(fp);
-        ps_default_profile(&g_profile);   /* 损坏 → 完整回退默认 */
+        /* 修复轮 P1-2: 显式损坏不再回退默认继续启动 (防编译期默认静默上
+         * 实机), 返回 -1 由调用方在 SMC_InitAndStart 前中止。复位仅为
+         * 防御 (进程即将退出, 防半解析档案被 param_store_get 读走)。 */
+        ps_default_profile(&g_profile);
         g_profile.loaded = 1;
         g_profile.dirty = 0;
         pthread_mutex_unlock(&g_ps_mutex);
-        printf("[param_store] 档案解析失败, 回退编译期默认!\n");
-        EventLogger_Push(SEVERITY_WARN, SOURCE_CONFIG, PS_EV_LOAD_FALLBACK, 1,
-                         "profile parse failed, factory defaults in use");
-        return;
+        printf("[param_store] 档案解析失败, 拒绝启动 (防编译期默认静默上实机)!\n");
+        EventLogger_Push(SEVERITY_FATAL, SOURCE_CONFIG, PS_EV_LOAD_FALLBACK, 1,
+                         "profile parse failed, startup aborted");
+        return -1;
     }
     fclose(fp);
 
@@ -817,6 +868,7 @@ void param_store_load(void)
     printf("[param_store] 档案已加载: %s (%d 轴)\n", path, g_profile.axis_count);
     EventLogger_Push(SEVERITY_INFO, SOURCE_CONFIG, PS_EV_LOAD_OK,
                      g_profile.axis_count, "machine profile loaded from file");
+    return 0;
 }
 
 const MachineProfile_t *param_store_get(void)

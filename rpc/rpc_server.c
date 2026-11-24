@@ -1606,7 +1606,8 @@ static int kernel_init(const char *iface)
  *  参数来源 (原编译期 g_hw_* 表已由 param_store 取代, 默认值单一维护点
  *  在 param_store.c ps_default_profile — 与旧表逐值等价):
  *    环境变量 SMC_MACHINE_PROFILE → 默认 ./machine_profile.ini
- *    · 文件缺失/损坏 → 编译期默认 (WARN 事件 0x0002, 行为同改造前)
+ *    · 文件缺失 → 编译期默认 (WARN 事件 0x0002, 首次上电自举, 行为同改造前)
+ *    · 文件显式损坏/不可读 → 拒绝启动 (FATAL 0x0002, 修复轮 P1-2)
  *    · 文件含 PS_TODO_* 哨兵 → param_store_check A/B/C 分级
  *      (A 级未填拒绝启动, B 级跳过该项警告, 与原 IBN 填空语义一致)
  *    · 运行期经 OPC UA CNC.Config / 9527 RPC 修改的参数写入即存回此文件
@@ -1640,8 +1641,11 @@ static int kernel_init_hw(const char *iface)
     plc_core_init();        /* P1: 软 PLC 程序槽 + autoload */
     PreviewStreamer_Init();
 
-    /* 2. 档案加载 + A/B/C 哨兵校验 (A 级未填 → 拒绝启动, 防 sim 值上实机) */
-    param_store_load();
+    /* 2. 档案加载 + A/B/C 哨兵校验 (A 级未填 → 拒绝启动, 防 sim 值上实机)。
+     *    修复轮 P1-2 (2026-11-24): 显式损坏档案 → load 返回 -1 → 此处
+     *    拒绝启动, 不再回退编译期默认走到 SMC_InitAndStart。 */
+    if (param_store_load() != 0)
+        return -1;
     if (param_store_check() != 0)
         return -1;
     const MachineProfile_t *hw = param_store_get();

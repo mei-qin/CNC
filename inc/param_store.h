@@ -163,10 +163,13 @@ typedef struct {
  * ===================================================================== */
 
 /* @Context: Non-RealTime (kernel_init_hw, EventLogger_Init 之后调用)
- * @Safe: 文件 I/O + 解析。失败/损坏/版本不识别 → 影子=编译期默认 + WARN 0x0002。
- * 成功 → 影子=默认值被文件覆盖后的合并结果 + INFO 0x0001。
+ * @Safe: 文件 I/O + 解析。
+ * @return 0=加载成功 (含文件缺失 ENOENT → 编译期默认 + WARN 0x0002 首次
+ *         上电自举语义); -1=显式损坏 (解析失败/版本不识别/不可读) →
+ *         FATAL 0x0002, 调用方必须在 SMC_InitAndStart 前中止启动
+ *         (修复轮 P1-2: 防编译期默认静默上实机)。
  * 幂等: 重复调用重新加载。 */
-void param_store_load(void);
+int param_store_load(void);
 
 /* @Context: Non-RealTime (kernel_init_hw apply 循环)
  * @return 档案只读引用 (load 之前返回编译期默认) */
