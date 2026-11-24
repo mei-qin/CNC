@@ -1223,7 +1223,9 @@ int SMC_QueryLimitDiag(SmcLimitDiagEntry_t *out_entries)
         }
     }
 
-    const LimitSrcCfg_t (*cfg)[AXIS_NUM][2] = limit_map_runtime();
+    /* limit_map_eval 形参退化为行指针 (*)[2]; runtime 表返回 (*)[AXIS_NUM][2]
+     * 指向同一平铺块, 此处对齐类型 (gcc14 incompatible-pointer-types 严格化) */
+    const LimitSrcCfg_t (*cfg)[2] = (const LimitSrcCfg_t (*)[2])limit_map_runtime();
     memset(out_entries, 0, sizeof(SmcLimitDiagEntry_t) * AXIS_NUM * 2);
     for (int i = 0; i < AXIS_NUM; i++) {
         for (int d = 0; d < 2; d++) {

@@ -210,6 +210,12 @@ void laser_rt_sync_config(const TrajectorySegment_t *seg);
 // P1-4 (2026-09-03): 写入第 idx 级渐进穿孔台阶 (功率/频率), idx 越界静默跳过.
 void laser_rt_apply_pierce_stage(int idx);
 
+// @Context: 1ms Hard-RT Thread (ecat_thread_rt cycle 末, flush_pdos 之前)
+// @Danger:  NO BLOCKING, NO MATH.H (耦合表线性插值仅乘除), NO PRINTF, NO MALLOC.
+// B1 功率耦合: 按 v_current/v_target + 耦合表重算 g_laser_rt.power_w
+// (apply_aux 设 P_base 之后, flush_pdos 输出之前).
+void laser_rt_coupling_update(void);
+
 // @Context: 1ms Hard-RT Thread (ecat_thread_rt cycle 尾, ecx_send_processdata 前)
 // @Danger:   NO BLOCKING, NO PRINTF.
 // 把 g_laser_rt 状态写到 DO/AO PDO (sim 模式下仅写 trace, 不触 PDO).

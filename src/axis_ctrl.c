@@ -1674,7 +1674,7 @@ void axis_pdo_write(int slave_id, uint16 cw, int32 pos)
     uint8 *out = ctx.slavelist[slave_id].outputs;
     if (!out)
     {
-        printf("[PDO错误] %s PDO输出缓冲区为空！\n");
+        printf("[PDO错误] 从站 %d PDO输出缓冲区为空！\n", slave_id);
         return;
     }
 

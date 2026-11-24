@@ -9,6 +9,7 @@
 #include "periph_bus.h"    /* P0-1: PeriphBus_PublishG (软 PLC 地基) */
 #include "periph_ai.h"     /* P1.5-1: periph_ai_rt_poll (AI → G 区) */
 #include "plc_core.h"      /* P1-3: plc_rt_is_running/heartbeat (看门狗数据源) */
+#include "laser_ctrl.h"    /* B1: laser_rt_coupling_update (cycle 末功率耦合) */
 #include "event_logger.h"   /* P1-b: EventLogger_Push (RT 安全, 无锁无 malloc) */
 #include "block_timing.h"   /* 论文1 S10: block 级计时插桩 (bt_rt_*) */
 #include <stdio.h>
@@ -2040,7 +2041,7 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
         // ============================================================
         // (sim 模式无操作; real 模式不能在此 yield)
     }
-    return ;
+    return NULL;    /* osal_compat.h: OSAL_THREAD_FUNC_RT = void* (gcc14 须显式) */
 }
 
 /************************ 故障检查线程 ************************/
@@ -2135,7 +2136,7 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
             osal_usleep(10000);
         }
     }
-    return ;
+    return NULL;    /* osal_compat.h: OSAL_THREAD_FUNC = void* (gcc14 须显式) */
 }
 
 /************************ ECAT主站启动封装 ************************/
