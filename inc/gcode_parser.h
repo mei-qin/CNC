@@ -112,6 +112,9 @@ typedef struct{
     int is_running;
     int is_paused;
     int abort_request;
+    // 2026-11-25 程序 Stop 待办: SMC_StopProgram 置 1, parser 退出路径原子取走 (清 0) 并
+    // 据此向 RT 提交 stop_flush_request (刹停 + 丢弃残余段)。跨线程, 用 atomic 访问。
+    _Atomic int stop_flush_pending;
     // ---- P0-b v2: LoadProgram / RunLoadedProgram 模式 ----
     // program_mode = PROGRAM_MODE_RUN (0): 正常执行, parser 入队 motion queue, RT 消费
     // program_mode = PROGRAM_MODE_PREVIEW (1): LoadProgram 模式, parser 解析填 PreviewStreamer,

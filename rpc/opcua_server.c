@@ -920,15 +920,22 @@ opcua_method_cb(UA_Server *server, const UA_NodeId *sessionId, void *sessionCont
         break;
 
     case OM_PROGRAM_STOP:
-        SMC_AbortProcessing();
+        /* 2026-11-25: 程序 Stop = 刹停 + 丢弃残余段 + 关工艺输出, 不报警 (SMC_StopProgram)。
+         * 此前调 SMC_AbortProcessing 只停解析, 已入队段照常走完 → "按了停止还在走"。
+         * 异步不可拒: 刹停约 200ms, 期间 Status=PAUSE, 完成事件 0x0035 后回 IDLE;
+         * 完成前 Start 被拒 (-2, RunLoadedProgram 的 Stop 闸)。 */
+        SMC_StopProgram();
         ok = true;
         break;
 
     case OM_SYSTEM_RESET:
         /* 工业语义: 停 + 清报警。ClearAlarm 在 parser running 时拒绝 (-1),
-         * 故先 Abort 再等 parser 退出 (上限 OPCUA_RESET_WAIT_MS)。 */
+         * 故先停程序再等 parser 退出 (上限 OPCUA_RESET_WAIT_MS)。
+         * 2026-11-25: "停" 改用 SMC_StopProgram (刹停 + 清队列), 与 CNC.Program.Stop 同一
+         * 语义; 此前用 AbortProcessing 只停解析, 运行中复位要等残余段自然走完, 1s 内
+         * 走不完则 ClearAlarm 被拒。两请求同时挂起时由 RT 报警复位分支 (超集) 统一执行。 */
         if (SMC_IsParserRunning()) {
-            SMC_AbortProcessing();
+            SMC_StopProgram();
             for (int i = 0; i < OPCUA_RESET_WAIT_MS / 10; i++) {
                 if (!SMC_IsParserRunning()) break;
                 usleep(10000);

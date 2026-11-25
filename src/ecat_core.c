@@ -663,12 +663,81 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     }
                     api_sync_planner_cursor();
                     atomic_store_explicit(&g_sys_alarm_state, 0, memory_order_release);
+                    /* 2026-11-25: 报警复位是程序 Stop 的超集 (同样丢弃全队列), 顺手取走
+                     * 尚未执行的 Stop 请求, 防其悬挂到之后的运动上被延迟执行。
+                     * Stop 请求附带的 pause_request (刹停用) 必须一并解除, 否则清队列后
+                     * 下一周期 feedhold 状态机又进 HOLD_BRAKING → 复位后卡在暂停。 */
+                    if (atomic_exchange_explicit(&g_interpolator.stop_flush_request, 0,
+                                                 memory_order_acq_rel)) {
+                        g_interpolator.pause_request = 0;
+                    }
                     rt_log("[RT] 报警复位已执行，队列已清空，位置已同步");
                     /* P1-b: 通知 UI alarm 已清 (异步 ClearAlarm 的最终确认) */
                     EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0041, 0,
                                      "alarm cleared by RT (queue flushed, pos synced)");
                 }
                 }  /* close else (safe_lift_state != 2) */
+            }
+
+            /* === 程序 Stop 清队列安全点 (2026-11-25) ===
+             * 请求链: SMC_StopProgram → abort parser + pause_request=1 (立即开始减速)
+             *   → parser 退出路径置 stop_flush_request=1 → 本安全点执行。
+             * 安全条件与 alarm_reset 相同: 全轴 op_ready + 插补器停稳 (静止 或 HOLD_PAUSED)。
+             *   运动中先经 HOLD_BRAKING (time_scale 每 ms -0.005, 约 200ms) 刹停。
+             * 与 alarm_reset 的区别: 不清 g_sys_alarm_state、不解除激光急停锁存
+             *   (laser_rt_reset)、不动回零状态 ⇒ 不产生报警, 无需复位即可再次启动。
+             * 报警中不执行 (报警复位是本操作的超集, 会取走本请求)。
+             * @Context: 1ms Hard-RT Thread
+             * @Danger: 仅原子读写 + 赋值 + 常量串 EventLogger_Push + api_sync_planner_cursor
+             *   (纯赋值无锁), 无阻塞 / malloc / printf / math.h。 */
+            if (atomic_load_explicit(&g_interpolator.stop_flush_request, memory_order_acquire)
+                && atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire) == 0
+                && g_all_axis_op_ready
+                && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)) {
+                /* JOG: 与 alarm_reset 对齐 (清队列必停车), 防 jog_active_req 卡 1 锁死寸动 */
+                if (atomic_load_explicit(&g_interpolator.jog_active_req,
+                                         memory_order_acquire) != 0) {
+                    atomic_store_explicit(&g_interpolator.jog_active_req, 0,
+                                          memory_order_release);
+                    g_interpolator.jog_axis_idx = -1;
+                }
+                g_interpolator.is_moving = 0;
+                g_interpolator.is_waiting_mcode = 0;
+                g_interpolator.pause_request = 0;
+                g_interpolator.time_scale = 1.0;
+                g_interpolator.hold_state = HOLD_NORMAL;
+                /* 丢弃全部未消费段: RT 是 read_tail 唯一写者, release 写 (同 alarm_reset) */
+                {
+                    int cur_head = atomic_load_explicit(&g_cmd_queue.write_head,
+                                                        memory_order_acquire);
+                    atomic_store_explicit(&g_cmd_queue.read_tail, cur_head,
+                                          memory_order_release);
+                }
+                /* 规划游标回到停住的位置: 否则下次入队以"被丢弃段的终点"为起点链式推算 */
+                api_sync_planner_cursor();
+                /* 工艺输出关: 队列丢弃后不再有段调 laser_rt_apply_aux 刷新 RT 镜像,
+                 * 最后一段的出光/气阀快照会原样留下 (hold 一解除光闸即重开)。
+                 * RT 是 g_laser_rt 的写者, 此处直接关; 不置 emergency_kill (非互锁事件)。 */
+                g_laser_rt.enable           = 0;
+                g_laser_rt.shutter          = 0;
+                g_laser_rt.power_w          = 0.0;
+                g_laser_rt.freq_hz          = 0.0;
+                g_laser_rt.gas_select       = 0;
+                g_laser_rt.gas_pressure_bar = 0.0;
+                g_interpolator.spindle_mode_rt  = 0;
+                g_interpolator.spindle_rpm_rt   = 0.0;
+                g_interpolator.coolant_state_rt = 0;
+                g_interpolator.laser_enable_rt  = 0;
+                g_interpolator.laser_shutter_rt = 0;
+                g_interpolator.laser_power_w_rt = 0.0;
+                g_interpolator.laser_freq_hz_rt = 0.0;
+                g_interpolator.gas_select_rt    = 0;
+                atomic_store_explicit(&g_sim_force_log, 1, memory_order_release);
+                atomic_store_explicit(&g_interpolator.stop_flush_request, 0,
+                                      memory_order_release);
+                rt_log("[RT] 程序 Stop 已执行: 已刹停, 队列已清空, 工艺输出已关");
+                EventLogger_Push(SEVERITY_INFO, SOURCE_PARSER, 0x0035, 0,
+                                 "program stopped (braked, queue flushed)");
             }
 
             /* P0-3 SafeLift: PENDING → RUNNING 转换

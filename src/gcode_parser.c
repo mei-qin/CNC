@@ -719,6 +719,44 @@ static int dispatch_macro_call(int o_num, int l_repeat,
     return 0;
 }
 
+// 程序级模态复位 — M30/M2 (Step 3) 与程序中止收尾共用 (2026-11-25 抽出)。
+// 作用: 把"程序内建立、不应跨程序存活"的 G/M 模态回到安全默认值 (纯赋值, 无 I/O)。
+// 背景: 此前只有 M30 路径复位; 程序被中止 (Stop/急停/报警联动/RPC abort) 时直接退出,
+//   M3 出光、冷却液、刀补、G68.2 倾斜等模态残留 — 运动段的 aux 快照取自这些字段,
+//   下个程序的定位段会带着出光快照入队, 属实际安全隐患。
+// 注意: 不复位运动模态 (G90/G91、G94/G93、G17/G18/G19、坐标系), 与 M30 既有行为一致。
+static void gcode_reset_program_modals(void)
+{
+    // 历史 BUG: M30 仅清 spindle/coolant, 导致 modal_macro_active /
+    //   active_cycle / bspline_enabled 等模态字段泄漏到下个程序.
+    //   Phase A 顺便修复, 严格遵循 Fanuc M30=程序复位语义.
+    g_state.spindle_mode   = 0;
+    g_state.spindle_rpm    = 0.0;
+    g_state.coolant_state  = 0;
+    g_state.modal_macro_active = 0;          // G66 模态宏泄漏
+    g_state.modal_macro_O_num = 0;
+    g_state.active_cycle       = 0;          // G81/G82/G83 固定循环泄漏
+    g_state.cycle_retract_mode = 0;          // G98/G99
+    g_state.bspline_enabled    = 0;          // M50 P1
+    g_state.rtcp_enabled       = 0;          // G43.4
+    g_state.vector_mode        = 0;          // G43.5 (P1)
+    g_coord_mgr.tilt_active    = 0;          // G68.2/G68.3 (P1)
+    g_state.pending_comp_mode  = COMP_OFF;   // G41/G42
+    g_state.local_offset_active= 0;          // G52
+    g_state.modal_ext_wcs_p    = 0;          // G54.1 Pn
+    // P0-Laser: M30 强制关激光 (与 spindle 一同复位)
+    g_state.laser_shutter_pending = 0;
+    g_state.laser_power_pending   = 0.0;
+    g_state.laser_freq_pending    = 0.0;
+    g_state.gas_select            = 0;
+    g_state.laser_gas_pressure_pending = 0.0;   // P0-2
+    // Laser B4: 清段级工艺标记 modal (防跨程序泄漏)
+    g_state.laser_seg_flags       = 0;
+    // P1-5: 微连接系数回默认 1.0 (程序级 modal, 不跨程序泄漏)
+    atomic_store_explicit(&g_laser_cfg.mj_ratio, 1.0,
+                          memory_order_release);
+}
+
 int parse_gcode_line(const char *gcode_line)
 {
     // 宏赋值行首拦截：#N = <expr>
@@ -1396,34 +1434,8 @@ int parse_gcode_line(const char *gcode_line)
                     }
 
                     // Step 3: parser 模态复位 (spindle/coolant 全关 + 修复 P1 跨程序泄漏)
-                    // 历史 BUG: M30 仅清 spindle/coolant, 导致 modal_macro_active /
-                    //   active_cycle / bspline_enabled 等模态字段泄漏到下个程序.
-                    //   Phase A 顺便修复, 严格遵循 Fanuc M30=程序复位语义.
-                    g_state.spindle_mode   = 0;
-                    g_state.spindle_rpm    = 0.0;
-                    g_state.coolant_state  = 0;
-                    g_state.modal_macro_active = 0;          // G66 模态宏泄漏
-                    g_state.modal_macro_O_num = 0;
-                    g_state.active_cycle       = 0;          // G81/G82/G83 固定循环泄漏
-                    g_state.cycle_retract_mode = 0;          // G98/G99
-                    g_state.bspline_enabled    = 0;          // M50 P1
-                    g_state.rtcp_enabled       = 0;          // G43.4
-                    g_state.vector_mode        = 0;          // G43.5 (P1)
-                    g_coord_mgr.tilt_active    = 0;          // G68.2/G68.3 (P1)
-                    g_state.pending_comp_mode  = COMP_OFF;   // G41/G42
-                    g_state.local_offset_active= 0;          // G52
-                    g_state.modal_ext_wcs_p    = 0;          // G54.1 Pn
-                    // P0-Laser: M30 强制关激光 (与 spindle 一同复位)
-                    g_state.laser_shutter_pending = 0;
-                    g_state.laser_power_pending   = 0.0;
-                    g_state.laser_freq_pending    = 0.0;
-                    g_state.gas_select            = 0;
-                    g_state.laser_gas_pressure_pending = 0.0;   // P0-2
-                    // Laser B4: 清段级工艺标记 modal (防跨程序泄漏)
-                    g_state.laser_seg_flags       = 0;
-                    // P1-5: 微连接系数回默认 1.0 (程序级 modal, 不跨程序泄漏)
-                    atomic_store_explicit(&g_laser_cfg.mj_ratio, 1.0,
-                                          memory_order_release);
+                    // 2026-11-25: 复位体抽为 gcode_reset_program_modals(), 与程序中止收尾共用。
+                    gcode_reset_program_modals();
 
                     // P2-A: M30/M2 重置 override (默认行为, 除非 OVERRIDE_PERSIST 置位)
                     // 工业惯例: 每次新程序从 100% 开始, 防上次调机残留倍率影响下一件.
@@ -2869,6 +2881,10 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                     EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x003A, 0,
                                      "program load failed (no previous program)");
                 }
+                // Stop 落在加载失败分支: 不经退出路径, 就地取走待办 (无残余段可清, 仅撤刹停请求)
+                if (atomic_exchange_explicit(&g_parser_ctrl.stop_flush_pending, 0,
+                                             memory_order_acq_rel))
+                    g_interpolator.pause_request = 0;
                 g_parser_ctrl.is_running=0;
                 continue;
             }
@@ -3005,6 +3021,10 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 g_parser_ctrl.program_mode = PROGRAM_MODE_PREVIEW;
                 g_parser_ctrl.is_running = 0;
                 g_parser_ctrl.abort_request = 0;
+                // Stop 落在 SEARCH 模式: 不经退出路径, 就地取走待办 (SEARCH 不入队运动段)
+                if (atomic_exchange_explicit(&g_parser_ctrl.stop_flush_pending, 0,
+                                             memory_order_acq_rel))
+                    g_interpolator.pause_request = 0;
                 continue;   // 回 while(1) 主循环 (is_running=0 → 休眠)
             }
 
@@ -3015,6 +3035,29 @@ OSAL_THREAD_FUNC parser_thread_func(void *arg){
                 BSpline_Flush();
             }
             api_flush_planner();
+
+            // ---- 2026-11-25 程序 Stop 收尾: 此后 parser 不再入队 (运动段唯一生产者已停) ----
+            // 向 RT 提交 stop_flush_request: 运动中先经 HOLD_BRAKING 刹停 (约 200ms),
+            // 到 HOLD_PAUSED 或静止后由 RT 丢弃全部残余段并关工艺输出 (不进报警态)。
+            // 必须由 parser 在这里提交, 不能由 API 线程提前提交: 否则 RT 清完队列后
+            // parser 仍可能推入残余段 (Hazard 2 同类撕裂)。
+            const int stop_pending =
+                atomic_exchange_explicit(&g_parser_ctrl.stop_flush_pending, 0,
+                                         memory_order_acq_rel);
+            if (stop_pending) {
+                g_parser_ctrl.is_paused = 0;        // 解除 parser 侧暂停 (Stop 不再可"继续")
+                g_interpolator.pause_request = 1;   // 未停稳则刹停; RT 清队列时一并解除
+                atomic_store_explicit(&g_interpolator.stop_flush_request, 1,
+                                      memory_order_release);
+                printf("[Parser] 程序 Stop: 已提交 RT 清队列, 残余段将被丢弃\n");
+            }
+
+            // ---- 程序被中止 (Stop / 急停 / 报警联动 / RPC abort / 解析失败): 模态回安全默认 ----
+            // 此前中止路径跳过 M30, M3 出光/冷却液/刀补等模态残留到下个程序 (见
+            // gcode_reset_program_modals 注释)。队列里已入队的段带的是入队时快照, 不受影响。
+            if (abort_file) {
+                gcode_reset_program_modals();
+            }
 
             // 2026-08-27: Abort-while-paused 收尾 — 暂停中中止时 feedhold 仍挂着
             // (pause_request=1 / HOLD_PAUSED / time_scale=0), 无人恢复则 flush 过的

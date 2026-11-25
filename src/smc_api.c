@@ -640,8 +640,33 @@ void SMC_PauseProcessing(){
 }
 
 void SMC_ResumeProcessing(){
+    // 2026-11-25: 程序 Stop 清队列尚未执行完时不恢复 — 残余段即将被丢弃, "继续"无对象。
+    // (parser 侧 is_paused 仍清 0, Stop 语义下程序已不可继续。)
     g_parser_ctrl.is_paused = 0;
+    if (atomic_load_explicit(&g_interpolator.stop_flush_request, memory_order_acquire)) return;
     api_motion_resume();
+}
+
+// ================== P-Stop (2026-11-25): 程序 Stop = 刹停 + 丢弃残余段 ==================
+// 与 SMC_AbortProcessing 的区别: Abort 只停解析 (已入队段照常走完); Stop 是工业控制器
+// "程序停止/复位" 语义 — 减速停住、丢弃缓冲运动、关工艺输出、不产生报警、无需复位。
+// 原子序列 (顺序敏感):
+//   ① abort_request=1            parser 停止解析并退出 (最长约一个解析行/dwell 轮询)
+//   ② pause_request=1            RT 立即开始减速 (不等 parser 退出), ~200ms 到 HOLD_PAUSED
+//   ③ stop_flush_pending=1       parser 在退出路径取走并提交 RT stop_flush_request
+// RT 在安全点 (全轴 op_ready + 静止或 HOLD_PAUSED) 丢弃全队列、关激光/主轴/冷却液,
+// 推事件 0x0035; 期间 Machine.Status 为 PAUSE, 完成后回 IDLE。再次 Start 即从头重跑。
+// 异步且不可拒: 恒返回 0 (无程序在解析时无事可做, 同样返回 0)。
+int SMC_StopProgram(void)
+{
+    if (!g_parser_ctrl.is_running) return 0;
+    EventLogger_Push(SEVERITY_WARN, SOURCE_PARSER, 0x0034, 0,
+                     "program stop requested by UI (brake + flush queue)");
+    // 先置待办再置 abort: 防 parser 先看到 abort 退出、后看到待办而漏提交
+    atomic_store_explicit(&g_parser_ctrl.stop_flush_pending, 1, memory_order_release);
+    g_parser_ctrl.abort_request = 1;
+    g_interpolator.pause_request = 1;
+    return 0;
 }
 
 // ================== P0-b v2: LoadProgram / RunLoadedProgram ==================
@@ -732,10 +757,18 @@ static int rerun_file_unchanged(void)
 int SMC_RunLoadedProgram(void) {
     if (g_parser_ctrl.is_running) return -2;
 
-    // 残余段闸: SMC_AbortProcessing 只停 parser, 不清运动队列 (RT 无 abort 入口)。
-    // Stop 后已入队的段仍由 RT 走完; 此刻若启动, 新程序的段会接在残余段之后
-    // (cursor 按在途段链式基准), 表现为 "先走完旧的剩余部分, 再跑一遍新程序"。
-    // 两种启动状态统一拒绝, 待队列排空 (is_moving=0) 再启动。
+    // Stop 闸: 上次 Stop 的清队列尚未被 RT 执行完 (刹停中, 或驱动未就绪而悬挂) 时不得启动,
+    // 否则新程序的段会被迟到的清队列丢弃, 或接在残余段之后。
+    if (atomic_load_explicit(&g_interpolator.stop_flush_request, memory_order_acquire)) {
+        printf("[SMC_API] RunLoadedProgram: 上次 Stop 尚未执行完, 拒绝启动\n");
+        return -2;
+    }
+
+    // 残余段闸: SMC_AbortProcessing (RPC abort / 急停 ① / 报警联动) 只停 parser, 不清
+    // 运动队列 (RT 无 abort 入口)。此后已入队的段仍由 RT 走完; 此刻若启动, 新程序的段
+    // 会接在残余段之后 (cursor 按在途段链式基准), 表现为 "先走完旧的剩余部分, 再跑一遍
+    // 新程序"。两种启动状态统一拒绝, 待队列排空 (is_moving=0) 再启动。
+    // (程序 Stop 走 SMC_StopProgram, 其残余段由上一道 Stop 闸挡住。)
     if (!is_trajectory_finished()) {
         printf("[SMC_API] RunLoadedProgram: 上次运行/点动/回零的残余段仍在执行, 拒绝启动\n");
         return -2;
@@ -762,6 +795,12 @@ int SMC_RunLoadedProgram(void) {
     g_parser_ctrl.program_mode = PROGRAM_MODE_RUN;
     atomic_store_explicit(&g_program_load_done, 0, memory_order_release);
     g_parser_ctrl.abort_request = 0;
+    // 作废未被 parser 取走的 Stop 待办 (Stop 恰落在上一程序自然结束的同一瞬间才会残留),
+    // 连同它留下的刹停请求 — 否则新程序首个运动段会被冻结在 HOLD_PAUSED。
+    if (atomic_exchange_explicit(&g_parser_ctrl.stop_flush_pending, 0,
+                                 memory_order_acq_rel)) {
+        g_interpolator.pause_request = 0;
+    }
     g_parser_ctrl.is_paused = 0;
     g_parser_ctrl.is_running = 1;
     return 0;

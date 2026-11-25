@@ -144,12 +144,24 @@ void SMC_PauseProcessing(void);
 // 恢复加工 (Resume)
 void SMC_ResumeProcessing(void);
 
-// 中止程序解析 (程序级 Stop)。
+// 中止程序解析 (仅停解析, 不停车)。
 // 仅置 g_parser_ctrl.abort_request: parser 停止解析并退出 (is_running=0),
 // 但 **不清运动队列** — 已入队的段由 RT 继续走完 (队列 1024 段, 短程序在按 Stop 时
 // 往往已全部入队, 表现为 "按了停止还在走")。暂停中调用会同时解除暂停 (走完残余段)。
-// 需要立即停车并丢弃队列: 用 SMC_EmergencyStop (报警态) + SMC_ClearAlarm。
+// 程序被中止时 parser 退出路径复位程序级模态 (M3 出光/冷却液/刀补等回安全默认)。
+// 调用方: SMC_EmergencyStop ①、api_alarm_reset 联动、RPC abort 命令。
+// (OPC UA CNC.Program.Stop / System.Reset 的"停"走 SMC_StopProgram。)
+// 需要"停住并丢弃队列": 程序 Stop 用 SMC_StopProgram (不报警); 异常用 SMC_EmergencyStop
+// + SMC_ClearAlarm。
 void SMC_AbortProcessing(void);
+
+// 程序 Stop (2026-11-25): 刹停 + 丢弃残余段 + 关工艺输出, 不产生报警、无需复位。
+// 工业控制器 "程序停止/复位" 语义 — 与软急停的区别只有三点: 不进报警态、不抬 Z、不用复位。
+// 异步: 请求后 RT 立即减速 (~200ms 到 HOLD_PAUSED), 在安全点丢弃全队列并推事件 0x0035;
+//   期间 Machine.Status = PAUSE, 完成后回 IDLE, 再次 RunLoadedProgram 即从头重跑。
+// 轴停在按下时的位置附近, 坐标不回零; 中止的程序不可"继续" (要续切走断点续切)。
+// 返回: 恒 0 (不可拒; parser 未在解析时无事可做, 同样返回 0)
+int SMC_StopProgram(void);
 
 // =======================================================
 // P0-b v2: LoadProgram / RunLoadedProgram 分离 API
@@ -169,11 +181,12 @@ int SMC_LoadProgram(const char *filepath);
 //   (b) 加工完成态: 上次运行已结束 (M30/EOF 或被 Stop 中止) — 同一程序从头重跑,
 //       要求程序文件自加载后未被修改 (size + mtime 与加载时一致)
 // 内部重新解析同一 filepath, 这次进 motion queue, RT 实际执行
-// 注意: 不是断点续切 (续切走 SMC_ResumeSearch/ResumeStart); 中途 Stop 不复位 G/M 模态,
-//       被中止的程序若未显式给出 G90/G94/平面/坐标系, 重跑会沿用中止时的模态
+// 注意: 不是断点续切 (续切走 SMC_ResumeSearch/ResumeStart)。程序被 Stop/中止时 parser
+//       复位程序级模态 (出光/冷却液/刀补/G68.2 等, 同 M30), 但运动模态不复位 —
+//       被中止的程序若未显式给出 G90/G94/平面/坐标系, 重跑会沿用中止时的运动模态。
 // 返回: 0=已启动,
 //       -1=无已加载程序 (从未成功 LoadProgram),
-//       -2=parser 正在运行 / 运动队列有残余段 (含 Stop 后未走完的段) /
+//       -2=parser 正在运行 / 上次 Stop 尚未执行完 / 运动队列有残余段 /
 //          (已加载态下) filepath 为空,
 //       -3=加工完成态但程序文件自加载后已变更/不可访问 → 须重新 LoadProgram
 int SMC_RunLoadedProgram(void);

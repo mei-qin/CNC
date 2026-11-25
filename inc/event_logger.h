@@ -80,6 +80,7 @@ extern "C" {
  *                    I/J/K + 解算角 — pose 实验 declared witness, 2026-09-30)
  *            0x0030 LoadProgram start / 0x0031 LoadProgram done
  *            0x0032 RunLoadedProgram start / 0x0033 program done (M30) / 0x0034 abort
+ *            0x0035 程序 Stop 完成 (INFO, RT 刹停 + 清队列 + 关工艺输出, 不报警; 2026-11-25)
  *            0x003B 姿态偏差注入 ON/OFF (WARN/INFO, value=line_no; sim 实验装置
  *                    provenance 标记, 由 CNC_POSE_INJECT_* 环境变量门控, 2026-09-30)
  * MANUAL=6:  0x0040 ClearAlarm req / 0x0041 alarm cleared (RT confirmed)

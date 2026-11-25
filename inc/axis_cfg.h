@@ -307,6 +307,12 @@ typedef struct{
     FeedHoldState_t hold_state;
     int pause_request;
     _Atomic int alarm_reset_request;
+    /* 2026-11-25 程序 Stop 清队列请求。
+     * 写者: parser_thread 在退出路径置 1 (release) — parser 是运动段唯一生产者, 它退出后
+     *   队列只减不增, 不存在 "清完又推" 的撕裂窗口。
+     * 读者/清零: RT 在安全点 (全轴 op_ready + 静止或 HOLD_PAUSED) 丢弃全部残余段后清 0。
+     * 与 alarm_reset_request 正交: 不清报警、不解除激光急停锁存; 报警复位是本操作的超集。 */
+    _Atomic int stop_flush_request;
 
     double total_distance;
 
