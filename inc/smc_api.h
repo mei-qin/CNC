@@ -160,9 +160,17 @@ void SMC_AbortProcessing(void);
 // 异步失败 (读取中断等): keep-last-good 恢复上一成功程序 (事件 0x003A)
 int SMC_LoadProgram(const char *filepath);
 
-// 执行已加载的程序 (LoadProgram 必须先完成, g_program_load_done=1)
+// 执行已加载的程序 (两种可启动状态):
+//   (a) 已加载待运行: LoadProgram 已完成, g_program_load_done=1
+//   (b) 加工完成态: 上次运行已结束 (M30/EOF 或被 Stop 中止) — 同一程序从头重跑,
+//       要求程序文件自加载后未被修改 (size + mtime 与加载时一致)
 // 内部重新解析同一 filepath, 这次进 motion queue, RT 实际执行
-// 返回: 0=已启动, -1=LoadProgram 未完成或已 running, -2=filepath 为空
+// 注意: 不是断点续切 (续切走 SMC_ResumeSearch/ResumeStart); 中途 Stop 不复位 G/M 模态,
+//       被中止的程序若未显式给出 G90/G94/平面/坐标系, 重跑会沿用中止时的模态
+// 返回: 0=已启动,
+//       -1=无已加载程序 (从未成功 LoadProgram),
+//       -2=parser 正在运行 或 (已加载态下) filepath 为空,
+//       -3=加工完成态但程序文件自加载后已变更/不可访问 → 须重新 LoadProgram
 int SMC_RunLoadedProgram(void);
 
 // 查询当前程序结构元数据
@@ -472,20 +480,28 @@ int SMC_GetSafeLiftState(int *out_state, double *out_progress_mm);
 // 设计原则:
 //   - 5 状态机: IDLE → PENDING → RUNNING → DONE / FAULT
 //   - RT 仅维护状态字段 + 冻结 queue (不阻塞); Non-RT (parser_thread) 跑阻塞 axis_homing()
-//   - method 35 (软件法, v1) / method 1-19 (硬件, v2 预留)
+//   - method 35 (v1.5, 当前唯一可用): RT 运动块把轴走回零点, 不依赖 home switch,
+//               不做 SDO; 不重锚 homing_shift (零点恒为上电锚定点)
+//               目标: G53 下为机械零点; G54..G59 下为当前 WCS 零点的 G53 投影
+//   - method 1-19 (CiA402 硬件回零, 需 home switch): 非 sim 分支已有实现,
+//               但 SMC_ConfigHoming 配置层拒绝 (-3), 当前不可达
+//   - 默认 enabled=0: 未配置时 SMC_HomeAxis/HomeAll/HomeOrder 一律返回 -1。
+//     配置来源仅两条: (a) RPC 0x005B/0x005C; (b) 启动参数 "rpc_server <iface> hw"
+//     (kernel_init_hw 按机床参数档案逐轴配置)。无 "hw" 的 kernel_init 不配回零。
 //   - 串行顺序默认 Z → X → Y → B → C, 可配置
 //   - 部分成功 all-or-nothing: HomeAll 第 N 轴失败回滚前 N-1 轴
 //   - 与 SafeLift/JOG 三功能互斥 (cycle 头检测)
-//   - 配置时序: 必须在 SMC_InitAndStart 之前调
+//   - 配置时机: init 阶段 (SMC_InitAndStart 之前) 或 parser 空闲期 (RPC 运行期),
+//     parser 运行中或轨迹未结束时拒绝修改
 
-// 配置单轴回零参数 (init 阶段)
+// 配置单轴回零参数
 // axis_letter:   轴字母
-// method:        35 (v1 唯一支持), 1-19 v1 拒绝 (-3)
-// search_speed:  method 1-19 寻零速度 mm/s (v1 忽略)
-// creep_speed:   method 1-19 蠕动速度 mm/s (v1 忽略)
-// direction:     +1 / -1 (method 1-19 寻零方向)
-// timeout_ms:    超时 (默认 10000), 大行程轴可设 30000
-// 返回: 0=ok, -1=轴未配置/参数非法/运行中, -3=method 不支持
+// method:        35 (当前唯一支持), 1-19 拒绝 (-3)
+// search_speed:  method 35 回零速度 mm/s (>0 固定速度; 0 = RT 用轴 max_speed)
+// creep_speed:   >0 时记录, method 35 不使用; <=0 时存 1.0
+// direction:     +1 / -1 (必须显式给出; method 35 的运动方向由零点位置决定, 此值不参与)
+// timeout_ms:    超时 [1000, 60000], 大行程轴可设 30000
+// 返回: 0=ok, -1=轴未配置/参数非法/系统运行中, -3=method 不支持
 int SMC_ConfigHoming(char axis_letter, int method, double search_speed,
                      double creep_speed, int direction, int timeout_ms);
 

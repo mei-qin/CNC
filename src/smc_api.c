@@ -699,10 +699,54 @@ int SMC_LoadProgram(const char *filepath) {
     return 0;
 }
 
+// @Context: Non-RealTime Background Thread (RPC/OPC UA client thread, is_running=0 门控下)
+// @Safe: stat() 文件系统调用允许 (与 SMC_LoadProgram 同线程语义)。
+// 加工完成态下再启动前的文件一致性校验: 只比对文件本体 (size + mtime, 与
+// LoadProgram 记录的指纹同源), 不比对 WCS/G52 偏置 — 从头重跑本就按当前偏置执行,
+// 与 "续切" 要求加载时刻一致是两种语义。
+// 返回: 1=文件未变, 0=文件已变 / 不可访问 / 无指纹
+static int rerun_file_unchanged(void)
+{
+    struct stat st;
+    if (g_parser_ctrl.fp_file_size < 0) return 0;
+    if (stat(g_parser_ctrl.filepath, &st) != 0) return 0;
+    return ((long)st.st_size == g_parser_ctrl.fp_file_size &&
+            (long)st.st_mtime == g_parser_ctrl.fp_file_mtime);
+}
+
+// @Context: Non-RealTime Background Thread (RPC/OPC UA client thread)
+// @Safe: 无阻塞, 无 I/O (仅 rerun_file_unchanged 的一次 stat)。
+// 两种可启动状态:
+//   (a) 已加载待运行: g_program_load_done==1 (LoadProgram 完成后, 从未运行);
+//   (b) 加工完成态:   上次运行已结束 (M30/EOF 或被 Stop 中止), load_done==0。
+//       RunLoadedProgram 启动时会清 load_done 且运行结束不恢复, 此前该状态下
+//       再启动恒返回 -1, 操作员必须重新 LoadProgram 才能重复加工。
+//       现按 "同一文件、未被修改" 放行, 对应工业控制器 "循环结束后再次循环启动" 语义;
+//       仍是整程序从头重跑 (不是断点续切, 续切走 SMC_ResumeSearch/ResumeStart)。
+// 返回: 0=已启动,
+//       -1=无已加载程序 (从未成功 LoadProgram),
+//       -2=parser 正在运行 / 已加载态下 filepath 为空,
+//       -3=加工完成态但程序文件自加载后已变更 → 必须重新 LoadProgram
+//          (否则界面预览与实际执行内容不一致)
 int SMC_RunLoadedProgram(void) {
     if (g_parser_ctrl.is_running) return -2;
-    if (!atomic_load_explicit(&g_program_load_done, memory_order_acquire)) return -1;
-    if (g_parser_ctrl.filepath[0] == '\0') return -2;
+
+    if (!atomic_load_explicit(&g_program_load_done, memory_order_acquire)) {
+        // 未处于"已加载待运行"。保持原返回码优先级: 从未成功加载 → -1。
+        if (g_parser_ctrl.filepath[0] == '\0') return -1;
+        // 加工完成态判定与 SMC_GetProgramStructure 的 is_loaded==3 (done) 同源
+        if (PreviewStreamer_GetWriteSeq() == 0) return -1;
+        if (!rerun_file_unchanged()) {
+            // 仅 printf, 不发事件: 事件码表无对应码, 不借用 0x003A (加载失败) 语义
+            printf("[SMC_API] RunLoadedProgram: 程序文件自加载后已变更或不可访问, "
+                   "请重新加载 (%s)\n", g_parser_ctrl.filepath);
+            return -3;
+        }
+        printf("[SMC_API] RunLoadedProgram: 加工完成态, 同一程序从头重跑 (%s)\n",
+               g_parser_ctrl.filepath);
+    } else if (g_parser_ctrl.filepath[0] == '\0') {
+        return -2;
+    }
 
     // 切回 RUN 模式, 同 filepath 再跑一遍
     g_parser_ctrl.program_mode = PROGRAM_MODE_RUN;
