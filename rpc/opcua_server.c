@@ -357,6 +357,14 @@ static int build_alarm_list(void)
         int got = EventLogger_ReadSince(from, ev, EVENT_READ_MAX, &next);
         if (got <= 0) break;   /* 覆盖/异常, 停止扫描 */
         for (int i = 0; i < got; i++) {
+            /* 0x0041 = 报警已清除 (RT 确认, ecat_core.c:668 推送):
+             * 扫描为旧→新单向, 遇清除标记即清空已收集条目 — 更早的 ALARM
+             * 事件视为历史, 不再上 Alarm.List。否则复位后列表残留最近
+             * 256 条窗口内的旧报警, HMI 上表现为"报警永不消失"。 */
+            if (ev[i].source == SOURCE_MANUAL && ev[i].code == 0x0041) {
+                g_alarm_cache_n = 0;
+                continue;
+            }
             if (ev[i].severity < SEVERITY_ALARM) continue;
             if (g_alarm_cache_n == OPCUA_ALARM_MAX) {
                 /* 滚动: 丢最旧, 留最新 */
