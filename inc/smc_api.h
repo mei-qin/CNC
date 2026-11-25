@@ -144,7 +144,11 @@ void SMC_PauseProcessing(void);
 // 恢复加工 (Resume)
 void SMC_ResumeProcessing(void);
 
-// 紧急中止 (Abort)
+// 中止程序解析 (程序级 Stop)。
+// 仅置 g_parser_ctrl.abort_request: parser 停止解析并退出 (is_running=0),
+// 但 **不清运动队列** — 已入队的段由 RT 继续走完 (队列 1024 段, 短程序在按 Stop 时
+// 往往已全部入队, 表现为 "按了停止还在走")。暂停中调用会同时解除暂停 (走完残余段)。
+// 需要立即停车并丢弃队列: 用 SMC_EmergencyStop (报警态) + SMC_ClearAlarm。
 void SMC_AbortProcessing(void);
 
 // =======================================================
@@ -169,7 +173,8 @@ int SMC_LoadProgram(const char *filepath);
 //       被中止的程序若未显式给出 G90/G94/平面/坐标系, 重跑会沿用中止时的模态
 // 返回: 0=已启动,
 //       -1=无已加载程序 (从未成功 LoadProgram),
-//       -2=parser 正在运行 或 (已加载态下) filepath 为空,
+//       -2=parser 正在运行 / 运动队列有残余段 (含 Stop 后未走完的段) /
+//          (已加载态下) filepath 为空,
 //       -3=加工完成态但程序文件自加载后已变更/不可访问 → 须重新 LoadProgram
 int SMC_RunLoadedProgram(void);
 

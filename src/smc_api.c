@@ -725,11 +725,21 @@ static int rerun_file_unchanged(void)
 //       仍是整程序从头重跑 (不是断点续切, 续切走 SMC_ResumeSearch/ResumeStart)。
 // 返回: 0=已启动,
 //       -1=无已加载程序 (从未成功 LoadProgram),
-//       -2=parser 正在运行 / 已加载态下 filepath 为空,
+//       -2=parser 正在运行 / 运动队列有残余段 (含 Stop 后未走完的段) /
+//          已加载态下 filepath 为空,
 //       -3=加工完成态但程序文件自加载后已变更 → 必须重新 LoadProgram
 //          (否则界面预览与实际执行内容不一致)
 int SMC_RunLoadedProgram(void) {
     if (g_parser_ctrl.is_running) return -2;
+
+    // 残余段闸: SMC_AbortProcessing 只停 parser, 不清运动队列 (RT 无 abort 入口)。
+    // Stop 后已入队的段仍由 RT 走完; 此刻若启动, 新程序的段会接在残余段之后
+    // (cursor 按在途段链式基准), 表现为 "先走完旧的剩余部分, 再跑一遍新程序"。
+    // 两种启动状态统一拒绝, 待队列排空 (is_moving=0) 再启动。
+    if (!is_trajectory_finished()) {
+        printf("[SMC_API] RunLoadedProgram: 上次运行/点动/回零的残余段仍在执行, 拒绝启动\n");
+        return -2;
+    }
 
     if (!atomic_load_explicit(&g_program_load_done, memory_order_acquire)) {
         // 未处于"已加载待运行"。保持原返回码优先级: 从未成功加载 → -1。
