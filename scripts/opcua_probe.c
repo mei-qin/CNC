@@ -273,12 +273,14 @@ int main(int argc, char *argv[])
         read_int   (client, "CNC.Program.CurrentLine", &cur_line);
         read_int   (client, "CNC.Program.LineCount",   &line_cnt);
         read_int   (client, "CNC.Alarm.Count",         &alarm_cnt);
-        read_double(client, "CNC.ActualSpeed",         &speed);
-        read_double(client, "CNC.FeedOverride",        &fovr);
-        read_double(client, "CNC.RapidOverride",       &rovr);
-        read_double(client, "CNC.SpindleOverride",     &sovr);
+        /* 速度/倍率节点 2026-11-26 自 CNC 根迁入 CNC.Machine (契约 §13-1),
+         * 单位改 mm/min 与 % (契约 §13-2, 与上位机 ICncAxis 同单位) */
+        read_double(client, "CNC.Machine.ActualSpeed",    &speed);
+        read_double(client, "CNC.Machine.FeedOverride",   &fovr);
+        read_double(client, "CNC.Machine.RapidOverride",  &rovr);
+        read_double(client, "CNC.Machine.SpindleOverride",&sovr);
 
-        printf("        Status=%d Mode=%d FeedOvr=%.2f RapidOvr=%.2f SpindleOvr=%.2f\n",
+        printf("        Status=%d Mode=%d FeedOvr=%.1f%% RapidOvr=%.1f%% SpindleOvr=%.1f%%\n",
                status, mode, fovr, rovr, sovr);
         printf("        DateTime=%s PowerOn=%s Program=%s Line=%d/%d Alarm=%d\n",
                dt, span, name, cur_line, line_cnt, alarm_cnt);
@@ -287,9 +289,19 @@ int main(int argc, char *argv[])
         check(mode == 0 || mode == 1,      "Read CNC.Machine.Mode (0/1)", NULL);
         check(dt[0] == '2',                "Read CNC.Machine.DateTime (ISO8601)", dt);
         check(strchr(span, 'h') != NULL,   "Read CNC.Machine.PowerOnSpan (NhNm)", span);
-        check(fovr >= 0.0 && fovr <= 1.5,  "Read CNC.FeedOverride (0~1.5)", NULL);
-        check(speed >= 0.0,                "Read CNC.ActualSpeed (m/s)", NULL);
-        check(alarm_cnt >= 0,              "Read CNC.Alarm.Count", NULL);
+        check(fovr >= 0.0 && fovr <= 100.0, "Read CNC.Machine.FeedOverride (%, 0~100)", NULL);
+        check(rovr >= 0.0 && rovr <= 100.0, "Read CNC.Machine.RapidOverride (%, 0~100)", NULL);
+        check(sovr >= 0.0 && sovr <= 120.0, "Read CNC.Machine.SpindleOverride (%, 0~120)", NULL);
+        check(speed >= 0.0,                 "Read CNC.Machine.ActualSpeed (mm/min)", NULL);
+        check(alarm_cnt >= 0,               "Read CNC.Alarm.Count", NULL);
+
+        /* 旧路径 (CNC 根下) 必须不存在, 防止回退成与服务端、客户端不一致的双路径 */
+        UA_Variant vold;
+        UA_Variant_init(&vold);
+        UA_StatusCode sco = read_variant(client, "CNC.FeedOverride", &vold);
+        UA_Variant_clear(&vold);
+        check(sco == UA_STATUSCODE_BADNODEIDUNKNOWN,
+              "Old path CNC.FeedOverride removed", UA_StatusCode_name(sco));
     }
 
     /* ---- 3b. 轴节点读 (首轴 + 硬编码 X 验证) ---- */
@@ -344,25 +356,25 @@ int main(int argc, char *argv[])
         check(ok, "Read CNC.Alarm.List (String[])", NULL);
     }
 
-    /* ---- 4. Write FeedOverride (0.80) + 回读 ---- */
+    /* ---- 4. Write FeedOverride (80%) + 回读 (契约单位 %) ---- */
     {
         UA_Variant w;
-        UA_Double val = 0.80;
+        UA_Double val = 80.0;
         UA_Variant_setScalarCopy(&w, &val, &UA_TYPES[UA_TYPES_DOUBLE]);
-        UA_NodeId n = UA_NODEID_STRING(1, (char *)"CNC.FeedOverride");
+        UA_NodeId n = UA_NODEID_STRING(1, (char *)"CNC.Machine.FeedOverride");
         UA_StatusCode sc3 = UA_Client_writeValueAttribute(client, n, &w);
         UA_Variant_clear(&w);
 
         double back = -1.0;
         /* 写生效需穿越 RT 周期 + snapshot 重发, 留足时间再回读 */
-        for (int i = 0; i < 10 && (back < 0.7 || back > 0.9); i++) {
+        for (int i = 0; i < 10 && (back < 79.0 || back > 81.0); i++) {
             usleep(100000);
-            read_double(client, "CNC.FeedOverride", &back);
+            read_double(client, "CNC.Machine.FeedOverride", &back);
         }
-        snprintf(buf, sizeof(buf), "write=%s readback=%.2f",
+        snprintf(buf, sizeof(buf), "write=%s readback=%.1f%%",
                  UA_StatusCode_name(sc3), back);
-        check(sc3 == UA_STATUSCODE_GOOD && back > 0.7 && back < 0.9,
-              "Write CNC.FeedOverride + readback", buf);
+        check(sc3 == UA_STATUSCODE_GOOD && back > 79.0 && back < 81.0,
+              "Write CNC.Machine.FeedOverride(80%) + readback", buf);
     }
 
     /* ---- 5. 方法链路: Load → Start → Pause → Resume → Stop ---- */
@@ -427,7 +439,25 @@ int main(int argc, char *argv[])
 
         check(call_bool_method(client, "CNC.Program", "CNC.Program.Start")  == 0,
               "Call CNC.Program.Start -> bool", NULL);
-        usleep(300000);
+        /* 运行期单位检查 (契约 §13-2): 程序为 G0 X5 → G1 X10 F600, 倍率 80%
+         * ⇒ G1 进给 ≈ 480 mm/min, G0 快移至 X 轴最大速度。采样约 300ms 取最大值:
+         * mm/min 应 ≥ 300; 若节点仍输出 mm/s 或 m/s 则 ≤ 60。上界取 X 轴
+         * 最大速度 (mm/s) × 60 的 1.1 倍, 与具体机型无关。 */
+        {
+            double spd_max = 0.0, x_max = 0.0;
+            read_double(client, "CNC.Config.Axis.X.MaxSpeed", &x_max);
+            for (int i = 0; i < 150; i++) {
+                double s = 0.0;
+                if (read_double(client, "CNC.Machine.ActualSpeed", &s) == 0 && s > spd_max)
+                    spd_max = s;
+                usleep(2000);
+            }
+            double upper = (x_max > 0.0) ? x_max * 60.0 * 1.1 : 1e9;
+            snprintf(buf, sizeof(buf), "max=%.1f mm/min (X.MaxSpeed=%.1f mm/s)",
+                     spd_max, x_max);
+            check(spd_max >= 300.0 && spd_max <= upper,
+                  "ActualSpeed unit mm/min during run", buf);
+        }
         check(call_bool_method(client, "CNC.Program", "CNC.Program.Pause")  == 0,
               "Call CNC.Program.Pause -> bool", NULL);
         usleep(200000);

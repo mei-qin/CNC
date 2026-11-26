@@ -1,9 +1,9 @@
 /* =====================================================================
  *  opcua_server.c  ——  OPC UA Server (契约 P4: 对外标准通道)
  *
- *  实现 movecontrol/doc/CNC_OPCUA_地址空间契约.md 定义的地址空间:
- *    ns=1;s=CNC.Machine.Status / CNC.Program.* / CNC.Alarm.* /
- *         CNC.ActualSpeed / CNC.{Feed,Rapid,Spindle}Override /
+ *  实现 movecontrol (linux-port-cnc 分支) doc/CNC_OPCUA_地址空间契约.md 定义的地址空间:
+ *    ns=1;s=CNC.Machine.Status / CNC.Machine.{ActualSpeed,*Override} /
+ *         CNC.Program.* / CNC.Alarm.* /
  *         CNC.Axis.<axis>.<attr> (轴对象 Browse 动态发现)
  *  方法: CNC.Program.Load/Start/Pause/Resume/Stop, CNC.System.Reset,
  *        CNC.Jog.Move — 回调直接调既有 SMC_* API (零运动逻辑重写)。
@@ -13,7 +13,8 @@
  *    - 变量节点全部 DataSource 回调: 读现拉 SnapshotHub (seqlock) /
  *      g_axis / g_parser_ctrl / EventLogger, 无缓存一致性问题
  *    - 写回调仅 3 个 override 节点, 钳制后调 SMC_SetOverride (-1=不改语义)
- *    - 契约单位换算: ActualSpeed mm/s→m/s, Override pct→0~1.5 比率
+ *    - 契约单位 (§1): ActualSpeed = mm/min (快照 mm/s × 60), Override = % (快照 pct 原值);
+ *      与上位机接口 ICncAxis 同单位, 适配器不再换算
  *    - SecurityPolicy None + 匿名 (与 movecontrol P2 客户端现状匹配,
  *      生产环境再启用 UA TLS, 见契约 §8)
  *
@@ -617,23 +618,23 @@ opcua_ds_read(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
     }
 
     case OV_ACTUAL_SPEED: {
-        /* 契约单位 m/s = snapshot mm/s ÷ 1000 */
-        UA_Double v = snap.v_current_mm_s / 1000.0;
+        /* 契约单位 mm/min = snapshot mm/s × 60 */
+        UA_Double v = snap.v_current_mm_s * 60.0;
         sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
         break;
     }
     case OV_FEED_OVERRIDE: {
-        UA_Double v = snap.feed_override_pct / 100.0;   /* pct → 0~1.5 比率 */
+        UA_Double v = (UA_Double)snap.feed_override_pct;   /* 契约单位 % */
         sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
         break;
     }
     case OV_RAPID_OVERRIDE: {
-        UA_Double v = snap.rapid_override_pct / 100.0;
+        UA_Double v = (UA_Double)snap.rapid_override_pct;
         sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
         break;
     }
     case OV_SPINDLE_OVERRIDE: {
-        UA_Double v = snap.spindle_override_pct / 100.0;
+        UA_Double v = (UA_Double)snap.spindle_override_pct;
         sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_DOUBLE]);
         break;
     }
@@ -824,10 +825,12 @@ opcua_ds_write(UA_Server *server, const UA_NodeId *sessionId, void *sessionConte
     case OV_SPINDLE_OVERRIDE: {
         if (!UA_Variant_hasScalarType(&value->value, &UA_TYPES[UA_TYPES_DOUBLE]))
             return UA_STATUSCODE_BADTYPEMISMATCH;
-        UA_Double ratio = *(UA_Double *)value->value.data;
-        int pct = (int)(ratio * 100.0);   /* 契约比率 → pct */
+        UA_Double pct_d = *(UA_Double *)value->value.data;   /* 契约单位 % */
+        /* 负值与 NaN 一律按 0 处理 (NaN 参与比较恒假); 超上限由 SMC_SetOverride 钳制 */
+        if (!(pct_d >= 0.0)) pct_d = 0.0;
+        int pct = (int)(pct_d + 0.5);
         if (ctx->kind == OV_FEED_OVERRIDE) {
-            printf("[opcua] write FeedOverride %.3f -> SMC_SetOverride(%d)\n", ratio, pct);
+            printf("[opcua] write FeedOverride %.1f%% -> SMC_SetOverride(%d)\n", pct_d, pct);
             SMC_SetOverride(pct, -1, -1, 0, 0, NULL, NULL, NULL, NULL);
         } else if (ctx->kind == OV_RAPID_OVERRIDE) {
             SMC_SetOverride(-1, pct, -1, 0, 0, NULL, NULL, NULL, NULL);
@@ -1956,6 +1959,12 @@ static void build_address_space(UA_Server *s)
     add_var(s, "Machine.Mode",        ns_machine, "Mode",        &UA_TYPES[UA_TYPES_INT32].typeId,   OV_MACHINE_MODE,      -1, false, -1);
     add_var(s, "Machine.PowerOnSpan", ns_machine, "PowerOnSpan", &UA_TYPES[UA_TYPES_STRING].typeId,  OV_MACHINE_POWERON,   -1, false, -1);
     add_var(s, "Machine.DateTime",    ns_machine, "DateTime",    &UA_TYPES[UA_TYPES_STRING].typeId,  OV_MACHINE_DATETIME,  -1, false, -1);
+    /* 速度/倍率归 CNC.Machine (契约 §1; 2026-11-26 自 CNC 根迁入 — 原路径与契约、
+     * 客户端 CncNodeMap.h 不一致, 客户端读到 BadNodeIdUnknown 被静默吞成 0) */
+    add_var(s, "Machine.ActualSpeed",    ns_machine, "ActualSpeed",    &UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_ACTUAL_SPEED,    -1, false, -1);
+    add_var(s, "Machine.FeedOverride",   ns_machine, "FeedOverride",   &UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_FEED_OVERRIDE,   -1, true,  -1);
+    add_var(s, "Machine.RapidOverride",  ns_machine, "RapidOverride",  &UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_RAPID_OVERRIDE,  -1, true,  -1);
+    add_var(s, "Machine.SpindleOverride",ns_machine, "SpindleOverride",&UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_SPINDLE_OVERRIDE,-1, true,  -1);
 
     /* ---- Program 对象 (变量 + 5 方法) ---- */
     UA_NodeId ns_program = add_obj(s, "CNC.Program", ns_cnc,
@@ -2043,12 +2052,6 @@ static void build_address_space(UA_Server *s)
         add_method(s, "Jog.MoveInc", ns_jog, "MoveInc", "incremental JOG move",
                    OM_JOG_MOVE_INC, in, 4);
     }
-
-    /* ---- 速度/倍率 (直挂 CNC 下) ---- */
-    add_var(s, "ActualSpeed",    ns_cnc, "ActualSpeed",    &UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_ACTUAL_SPEED,    -1, false, -1);
-    add_var(s, "FeedOverride",   ns_cnc, "FeedOverride",   &UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_FEED_OVERRIDE,   -1, true,  -1);
-    add_var(s, "RapidOverride",  ns_cnc, "RapidOverride",  &UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_RAPID_OVERRIDE,  -1, true,  -1);
-    add_var(s, "SpindleOverride",ns_cnc, "SpindleOverride",&UA_TYPES[UA_TYPES_DOUBLE].typeId, OV_SPINDLE_OVERRIDE,-1, true,  -1);
 
     /* ---- 轴对象 (按 kernel_init 配置的拓扑动态创建) ---- */
     UA_NodeId ns_axis = add_obj(s, "CNC.Axis", ns_cnc,
