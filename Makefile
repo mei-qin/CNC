@@ -15,6 +15,13 @@ RPC_PATH  = ./rpc
 BIN_PATH  = ./
 
 CC = gcc
+
+# 头文件依赖 (2026-11-27): -MMD 在每个 .o 旁生成 .d 依赖清单, -MP 为头文件加空目标
+# (头文件被删后 make 不报错)。此前没有依赖跟踪: 头文件改了而 .c 没改的目标文件不会重编,
+# 增量构建会把新旧结构布局的目标文件混链。2026-11-26 实测: ParserControl_t 插入字段后
+# 旧的 axis_ctrl.o 读错 program_mode, 只调预览加载轴就执行了整个程序。
+DEPFLAGS = -MMD -MP
+
 CFLAGS = -Wall -O2 \
 -I$(INC_PATH) \
 -I$(RPC_PATH) \
@@ -24,7 +31,7 @@ CFLAGS = -Wall -O2 \
 -I$(SOEM_PATH)/osal/linux \
 -I$(SOEM_PATH)/oshw/linux \
 -DLINUX -D_GNU_SOURCE \
--pthread
+-pthread $(DEPFLAGS)
 
 LDFLAGS = -lpthread -lrt -lm
 
@@ -82,7 +89,7 @@ $(RPC_PATH)/%.o: $(RPC_PATH)/%.c
 
 # open62541 amalgamation 单文件编译 (仅需 pthread, 无外部依赖)
 $(OPCUA_PATH)/%.o: $(OPCUA_PATH)/%.c
-	$(CC) -c $< -o $@ -O2 -pthread
+	$(CC) -c $< -o $@ -O2 -pthread $(DEPFLAGS)
 	@echo "编译: $< -> $@"
 
 # SOEM 源内编译 (vendored 子集, 复用上方 CFLAGS 的 soem 头路径)
@@ -101,9 +108,14 @@ $(PROBE_TARGET): scripts/opcua_probe.c $(OPCUA_OBJ)
 	@echo -e "\033[32m编译成功！可执行文件：$@\033[0m"
 	@echo "  前置: sudo ./rpc_server sim 已在跑"
 
+# ---- 头文件依赖清单 (.d 由 DEPFLAGS 随编译生成; 首次构建或 clean 后尚不存在, 用 -include 忽略) ----
+DEPS = $(KERNEL_OBJ:.o=.d) $(TEST_OBJ:.o=.d) $(RPC_OBJ:.o=.d) $(OPCUA_OBJ:.o=.d) $(SOEM_OBJ:.o=.d)
+
+-include $(DEPS)
+
 clean:
 	rm -f $(KERNEL_OBJ) $(SRC_PATH)/main.o $(RPC_PATH)/*.o $(RPC_TARGET) $(TEST_TARGET) $(OPCUA_OBJ) $(PROBE_TARGET) \
-	      $(SOEM_PATH)/src/*.o $(SOEM_PATH)/osal/linux/*.o $(SOEM_PATH)/oshw/linux/*.o
+	      $(SOEM_PATH)/src/*.o $(SOEM_PATH)/osal/linux/*.o $(SOEM_PATH)/oshw/linux/*.o $(DEPS)
 	@echo -e "\033[32m清理完成！\033[0m"
 
 run:

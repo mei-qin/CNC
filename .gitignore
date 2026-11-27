@@ -18,6 +18,7 @@
 
 # ==== 构建产物 (Build Artifacts) ====
 *.o
+*.d
 *.obj
 *.a
 *.so
