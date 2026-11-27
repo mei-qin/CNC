@@ -96,3 +96,16 @@ tests/output/scenario_log/
 /runs/
 /s1/
 /sei_artifact/
+
+# ==== 2026-11-27: 仓库只保留下位机运行与测试必需的文件 ====
+# 以下内容在忽略规则生效前已入库, 已于本次取消跟踪 (本地文件保留); 此处防止再次入库
+# 测试输出与证据包 (tests/gcode 测试 G 代码与测试管线继续跟踪)
+/tests/output/
+# 编辑器配置
+/.vscode/
+# 根目录历史遗留文件
+/.audit_payload.txt
+/REVIEW_PROMPT.md
+/DEVELOPMENT_SUMMARY.txt
+/crc_acceptance_report.md
+/test.txt

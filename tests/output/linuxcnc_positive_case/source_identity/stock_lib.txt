@@ -1,7 +1,0 @@
-LC-T0 (stock) runtime library identity
-sha256: d3e4ecd46061f07859325238bd7a8588e426453c573e606eee9767056111dc52
-artifact: /home/l15/wpb_libs/librs274.so.0.stocktree (= ~/libctl/librs274.so.0 during LC-T0-R1..R3)
-built from: interp_convert.cc f2e7cf41… (pristine stock) + interp_inverse.cc c98db3d4… (pristine stock)
-build reproducibility: rebuilding from restored stock source reproduced this hash byte-identically
-loaded-image verification: /proc/<milltask>/maps shows ~/libctl/librs274.so.0 in all 3 runs (oneshot HARD GATE)
-per-run lib sha sidecars: runs/libsha_LC-T0-R1.txt = R2 = R3 = d3e4ecd46061
