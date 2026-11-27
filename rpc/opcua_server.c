@@ -50,6 +50,7 @@
 #include "periph_bus.h"        /* P1-5: F/G 区镜像 (atomic/seqlock 读) */
 #include "kinematics.h"        /* P3: g_kin_config / KIN_HEAD_HEAD */
 #include "param_store.h"       /* P3: CNC.Config 配置面 (写入即存 + WriteProtect) */
+#include "ecat_core.h"         /* 2026-11-27: ecat_servo_err_code (Axis.DriveAlarmCode) */
 
 /* ---- 配置常量 ---- */
 #define OPCUA_PORT              4840
@@ -150,6 +151,10 @@ typedef enum {
     OV_PLC_F_MCODE_FIN,      /* Int32 */
     OV_PLC_G_MCODE,          /* Int32: G 区镜像 (M 码握手调试) */
     OV_PLC_G_MCODE_STROBE,   /* Int32 */
+    /* ---- 伺服状态 (2026-11-27, 契约 §24/§25) ---- */
+    OV_AXIS_STATUS_WORD,     /* 每轴 UInt16: 主驱 CiA402 状态字原始值 */
+    OV_AXIS_DRIVE_ALARM,     /* 每轴 Int32: 驱动器故障码 (0x603F), 诊断线程缓存 */
+    OV_SAFETY_SERVO_OK,      /* Boolean: 全部已配置轴 Operation enabled 且总线无故障 */
     OV_KIND_COUNT
 } OpcVarKind;
 
@@ -204,10 +209,12 @@ typedef struct {
 } OpcNodeCtx;
 
 /* 静态上下文池: 注册期线性分配。
- * P3 扩容: config 面 +53 变量 (9×5 轴 + 8 全局) + 6 方法 → var 192 / mtd 32 */
-static OpcNodeCtx g_var_ctx_pool[192];
+ * P3 扩容: config 面 +53 变量 (9×5 轴 + 8 全局) + 6 方法 → var 192 / mtd 32
+ * 2026-11-27 扩容: var 256 / mtd 64 — 契约 §28.1: 池满时节点被静默丢弃, 加节点前必须先扩
+ * (此前 192 格约用 142; 本次加 Safety.ServoOk + 每轴 StatusWord/DriveAlarmCode 共 11 格) */
+static OpcNodeCtx g_var_ctx_pool[256];
 static int        g_var_ctx_n;
-static OpcNodeCtx g_mtd_ctx_pool[32];
+static OpcNodeCtx g_mtd_ctx_pool[64];
 static int        g_mtd_ctx_n;
 
 static OpcNodeCtx *var_ctx_new(uint8_t kind, int axis_idx)
@@ -663,8 +670,31 @@ opcua_ds_read(UA_Server *server, const UA_NodeId *sessionId, void *sessionContex
         break;
     }
     case OV_AXIS_ACTIVE: {
+        /* 2026-11-27: 改读快照 v5 的就绪掩码 (RT 逐轴状态机汇总)。
+         * 此前读 g_axis[].is_enabled, 而该字段从未被写入 → 本节点恒 false。 */
         UA_Boolean v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
-                       ? (g_axis[ctx->axis_idx].is_enabled != 0) : false;
+                       ? (UA_Boolean)((snap.servo_ready_mask >> ctx->axis_idx) & 1u)
+                       : false;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_BOOLEAN]);
+        break;
+    }
+    case OV_AXIS_STATUS_WORD: {
+        UA_UInt16 v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                      ? snap.axis_status_word[ctx->axis_idx] : 0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_UINT16]);
+        break;
+    }
+    case OV_AXIS_DRIVE_ALARM: {
+        /* 诊断线程缓存的 0x603F: 0=无故障, >0=故障码, -1=读取失败, -2=使能超时 */
+        UA_Int32 v = (ctx->axis_idx >= 0 && ctx->axis_idx < AXIS_NUM)
+                     ? ecat_servo_err_code(ctx->axis_idx, 0) : 0;
+        sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_INT32]);
+        break;
+    }
+    case OV_SAFETY_SERVO_OK: {
+        UA_Boolean v = (snap.servo_config_mask != 0
+                        && snap.servo_ready_mask == snap.servo_config_mask
+                        && snap.bus_fault == 0);
         sc = UA_Variant_setScalarCopy(&value->value, &v, &UA_TYPES[UA_TYPES_BOOLEAN]);
         break;
     }
@@ -1668,13 +1698,17 @@ add_obj(UA_Server *s, const char *nodeid_full, const UA_NodeId parent,
  * browseName 即轴名 — 与本函数创建结构一致。 */
 static void build_axis_nodes(UA_Server *s, const UA_NodeId axis_parent)
 {
-    static const struct { const char *attr; uint8_t kind; } attrs[] = {
-        { "ActualPosition",   OV_AXIS_ACTUAL_POS  },
-        { "CommandPosition",  OV_AXIS_CMD_POS     },
-        { "MechanicalPosition", OV_AXIS_MECH_POS  },
-        { "ProgramPosition",  OV_AXIS_PROG_POS    },
-        { "RemainingDistance", OV_AXIS_REMAIN_DIST },
-        { "Active",           OV_AXIS_ACTIVE      },
+    /* type = UA_TYPES 下标; kind = 读回调分支 */
+    static const struct { const char *attr; uint8_t kind; UA_UInt32 type; } attrs[] = {
+        { "ActualPosition",   OV_AXIS_ACTUAL_POS,   UA_TYPES_DOUBLE  },
+        { "CommandPosition",  OV_AXIS_CMD_POS,      UA_TYPES_DOUBLE  },
+        { "MechanicalPosition", OV_AXIS_MECH_POS,   UA_TYPES_DOUBLE  },
+        { "ProgramPosition",  OV_AXIS_PROG_POS,     UA_TYPES_DOUBLE  },
+        { "RemainingDistance", OV_AXIS_REMAIN_DIST, UA_TYPES_DOUBLE  },
+        { "Active",           OV_AXIS_ACTIVE,       UA_TYPES_BOOLEAN },
+        /* 契约 §25 (2026-11-27 落地): 伺服状态字 + 驱动器故障码 */
+        { "StatusWord",       OV_AXIS_STATUS_WORD,  UA_TYPES_UINT16  },
+        { "DriveAlarmCode",   OV_AXIS_DRIVE_ALARM,  UA_TYPES_INT32   },
     };
 
     for (int letter = 0; letter < 26; letter++) {
@@ -1691,10 +1725,7 @@ static void build_axis_nodes(UA_Server *s, const UA_NodeId axis_parent)
                                      axis_name);
 
         for (size_t k = 0; k < sizeof(attrs) / sizeof(attrs[0]); k++) {
-            const UA_NodeId *dt =
-                (attrs[k].kind == OV_AXIS_ACTIVE)
-                    ? &UA_TYPES[UA_TYPES_BOOLEAN].typeId
-                    : &UA_TYPES[UA_TYPES_DOUBLE].typeId;
+            const UA_NodeId *dt = &UA_TYPES[attrs[k].type].typeId;
             char leaf[64];
             snprintf(leaf, sizeof(leaf), "Axis.%s.%s", axis_name, attrs[k].attr);
             UA_StatusCode sc = add_var(s, leaf, axis_obj, attrs[k].attr,
@@ -2064,6 +2095,16 @@ static void build_address_space(UA_Server *s)
     /* ---- Laser: CNC.Laser 激光面 (契约 §11, 2026-09-03) ---- */
     build_laser_nodes(s, ns_cnc);
     build_plc_nodes(s, ns_cnc);      /* P1-5: CNC.PLC watch 面 */
+
+    /* ---- Safety 对象 (契约 §24): 本次只落地 ServoOk, 其余安全信号随 §24 后续步骤 ----
+     * ServoOk = 全部已配置轴 Operation enabled 且总线无故障 (快照 v5 掩码)。
+     * 有轴故障锁存时为 false — 与 Alarm.List 里的伺服故障文字、Axis.<X>.Active 互补。 */
+    {
+        UA_NodeId ns_safety = add_obj(s, "CNC.Safety", ns_cnc,
+                UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT), "Safety");
+        add_var(s, "Safety.ServoOk", ns_safety, "ServoOk",
+                &UA_TYPES[UA_TYPES_BOOLEAN].typeId, OV_SAFETY_SERVO_OK, -1, false, -1);
+    }
 }
 
 /* =====================================================================

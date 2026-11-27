@@ -2827,9 +2827,9 @@ int parse_gcode_line(const char *gcode_line)
 OSAL_THREAD_FUNC parser_thread_func(void *arg){
     while(1){
         if(g_parser_ctrl.is_running==1){
-            while(!g_all_axis_op_ready){
-                osal_usleep(100000); // 等待所有轴准备就绪
-            }
+            /* 2026-11-27: 此处曾 while(!g_all_axis_op_ready) 等全轴就绪 — 与逐轴使能冲突
+             * (任一轴故障锁存即永久挂起 parser 线程)。程序启动已由 SMC_RunLoadedProgram
+             * 要求全轴就绪; 运行中掉轴由报警路径处理, 入队门控按段拒绝。 */
 
             printf("[Parser] Processing file: %s (mode=%s)\n", g_parser_ctrl.filepath,
                    g_parser_ctrl.program_mode == PROGRAM_MODE_PREVIEW ? "PREVIEW" :

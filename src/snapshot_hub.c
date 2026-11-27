@@ -154,6 +154,16 @@ void SnapshotHub_Publish(uint32_t cycle)
     /* P2-A-4: 精准停段镜像 (复用原 _tail_pad 位) */
     p->current_seg_is_exact_stop = g_interpolator.current_seg_is_exact_stop_rt;
 
+    /* v5: 逐轴伺服状态 (RT 单写者字段 + RT 发布的掩码; 掩码是上一周期轴循环的汇总) */
+    for (int i = 0; i < AXIS_NUM; i++) {
+        p->axis_servo_state[i] = (uint8_t)g_axis[i].servo_state;
+        p->axis_status_word[i] = g_axis[i].status_word[0];
+    }
+    p->bus_fault         = (uint8_t)(atomic_load_explicit(&g_servo_bus_fault, memory_order_relaxed) != 0);
+    p->servo_ready_mask  = atomic_load_explicit(&g_servo_ready_mask, memory_order_relaxed);
+    p->servo_latched_mask = atomic_load_explicit(&g_servo_latched_mask, memory_order_relaxed);
+    p->servo_config_mask = atomic_load_explicit(&g_servo_config_mask, memory_order_relaxed);
+
     /* flags 位图聚合 (SDK 端做 RUN/HOLD/ALARM 语义聚合更方便) */
     uint32_t fl = 0;
     if (p->sys_alarm_state)                  fl |= SMC_SNAP_FLAG_ALARM;
@@ -166,6 +176,8 @@ void SnapshotHub_Publish(uint32_t cycle)
     if (atomic_load_explicit(&g_program_resume_ready, memory_order_relaxed)) {
         fl |= SMC_SNAP_FLAG_RESUME_READY;
     }
+    /* v5: 有轴故障锁存或总线故障锁存 (不等于系统报警: 上电期轴故障不置 g_sys_alarm_state) */
+    if (p->servo_latched_mask != 0 || p->bus_fault) fl |= SMC_SNAP_FLAG_SERVO_FAULT;
     p->flags = fl;
 
     /* payload 内 snapshot_seq = 写完成后的稳定 seq (s+2) */

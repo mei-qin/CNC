@@ -234,6 +234,10 @@ typedef enum {
     /* --- 跨从站限位映射 Phase 1 (2026-11-23): 0x008B ~ 0x008C --- */
     SMC_CMD_INJECT_SIM_LIMIT_INPUT   = 0x008B, /* sim-only: 按站注入 0x60FD 输入字+有效标志 */
     SMC_CMD_QUERY_LIMIT_DIAG         = 0x008C, /* 机械轴限位映射诊断查询 (轴×方向 定长 10 条目) */
+
+    /* ---- 逐轴伺服使能 (2026-11-27) ---- */
+    SMC_CMD_GET_AXIS_STATUS          = 0x008D, /* 逐轴伺服状态查询 (就绪/锁存掩码 + 状态字 + 故障码) */
+    SMC_CMD_SERVO_TEST_HOOK          = 0x008E, /* sim-only: 轴故障置/清、模拟 wkc 丢失/恢复 */
 } SmcCmdType;
 
 /* ============================================================
@@ -1308,6 +1312,46 @@ typedef struct {
 typedef struct {
     int32_t ret_code;          /* 0=ok, -1=非双驱/参数越界, -2=非 sim 模式 */
 } SmcInjectGantryOffsetRes;
+
+/* ============================================================
+ * SMC_CMD_GET_AXIS_STATUS (0x008D) + SMC_CMD_SERVO_TEST_HOOK (0x008E), 2026-11-27
+ * 逐轴伺服使能状态查询 (契约 §25 / §28.2 的 SMC_GetAxisStatus) + sim 测试钩子。
+ * 轴下标 = 房间号 (轴配置顺序), 与快照 v5 的掩码位一致。
+ * ============================================================ */
+/* state (ServoState_t, axis_cfg.h):
+ *   0=IDLE 未开始握手  1=ENABLING 握手中  2=OP_ENABLED 使能就绪
+ *   3=FAULT_PROBE 故障取证中 (整轴已撤销使能)  4=FAULT_LATCHED 故障锁存, 等 System.Reset
+ *   5=BUS_FAULT EtherCAT wkc 故障锁存 (状态字为残留值) */
+typedef struct {
+    uint8_t  state;        /* ServoState_t */
+    uint8_t  fault_stage;  /* 0=上电握手 1=运行期 2=使能超时 */
+    int8_t   fault_slave;  /* 检出故障的从站子下标, -1=无 */
+    uint8_t  _pad;
+    uint16_t status_word;  /* 主驱 CiA402 状态字原始值 */
+    uint16_t err_code;     /* 0x603F: 0=无故障, >0=故障码, 0xFFFE=使能超时, 0xFFFF=SDO 读取失败 */
+    int32_t  retry_count;  /* 本轮已用掉的自动复位次数 */
+} SmcAxisStatusEntry_t;    /* pack(1) 12B */
+typedef struct { uint32_t reserved; } SmcGetAxisStatusReq;
+typedef struct {
+    int32_t  ret_code;     /* 0=成功 */
+    uint32_t config_mask;  /* bit i = 轴 i 已配置从站 */
+    uint32_t ready_mask;   /* bit i = 轴 i Operation enabled */
+    uint32_t latched_mask; /* bit i = 轴 i 故障锁存 */
+    uint8_t  bus_fault;    /* 1 = EtherCAT wkc 故障锁存 */
+    uint8_t  _pad[3];
+    SmcAxisStatusEntry_t axis[AXIS_NUM];   /* pack(1) 20 + 12×5 = 80B */
+} SmcGetAxisStatusRes;
+
+/* op: 1=置轴故障 2=清除该注入 (电机停在 Fault, 等故障复位上升沿)
+ *     3=模拟 wkc 丢失 (总线故障) 4=wkc 恢复
+ * ret_code: 0=成功, -1=轴字母未知/op 非法, -2=非 sim 模式 */
+typedef struct {
+    int32_t op;
+    uint8_t axis_letter;   /* op 1/2 使用的轴字母 */
+    uint8_t slave_sub;     /* op 1/2 使用的从站子下标 */
+    uint16_t reserved;     /* 必须 0 */
+} SmcServoTestHookReq;     /* pack(1) 8B */
+typedef struct { int32_t ret_code; } SmcServoTestHookRes;
 
 #pragma pack(pop)
 

@@ -37,6 +37,16 @@ int dowkccheck = 0, currentgroup = 0;
 int g_all_axis_enabled = 0;
 int g_sim_mode = 0;
 
+/* ---- 逐轴伺服状态汇总 (2026-11-27): RT 单写者, Non-RT 只读 ---- */
+_Atomic uint32_t g_servo_ready_mask    = 0;   /* bit i = 轴 i Operation enabled */
+_Atomic uint32_t g_servo_latched_mask  = 0;   /* bit i = 轴 i 故障锁存 (等 System.Reset) */
+_Atomic uint32_t g_servo_config_mask   = 0;   /* bit i = 轴 i 已配置从站 */
+_Atomic int      g_servo_bus_fault     = 0;   /* 1 = EtherCAT wkc 故障锁存 (RT 置, Non-RT 解除) */
+_Atomic uint32_t g_servo_bus_fault_seq = 0;   /* 总线故障锁存次数 (+1/次), 诊断线程据此取证 */
+_Atomic int      g_servo_sim_bus_inject = 0;  /* sim-only: 1 = 模拟 wkc 丢失 (测试钩子写) */
+_Atomic int      g_rt_exit            = 0;    /* 1 = RT 线程退出主循环 (SMC_Close 在 ecx_close 后置) */
+static _Atomic int g_wkc_bad_ms        = 0;    /* wkc != expectedWKC 的连续周期数 (仅实机) */
+
 /* ---- P0-4a (2026-09-10): 期望拓扑表 (kernel_init_hw 注入, bring-up 校验) ---- */
 static EcatTopoExpect_t g_topo_expect[ECAT_TOPO_MAX];
 static int g_topo_count = 0;
@@ -298,7 +308,7 @@ static inline void rt_resolve_scurve_step(double eff_scale)
  *
  * @Context: 1ms Hard-RT Thread
  * @Danger: 仅 atomic store + 常量串 EventLogger_Push (无锁 ring 写), 无阻塞。 */
-static void rt_jog_abort_on_alarm(void)
+static void rt_jog_abort(const char *why)
 {
     if (atomic_load_explicit(&g_interpolator.jog_active_req,
                              memory_order_acquire) == 0)
@@ -309,8 +319,113 @@ static void rt_jog_abort_on_alarm(void)
     g_interpolator.jog_cur_step_mm = 0.0;
     g_interpolator.time_scale      = 1.0;
     /* JOG 激活期必有 is_moving=0 (Start/段互斥), 无 HOLD_BRAKING 冲突 */
-    EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x000B, j,
-                     "jog aborted by system alarm");
+    EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x000B, j, why);
+}
+
+static void rt_jog_abort_on_alarm(void)
+{
+    rt_jog_abort("jog aborted by system alarm");
+}
+
+/* ====================================================================
+ * 逐轴伺服状态机辅助 (2026-11-27) — RT 内联
+ * @Context: 1ms Hard-RT Thread (EtherCAT)
+ * @Danger: 仅整数运算 + 字段赋值 + 常量串 EventLogger_Push。
+ *          NO BLOCKING / NO MATH.H / NO PRINTF / NO MALLOC。
+ * ==================================================================== */
+
+/* 轴内全部从站的 CiA402 状态 (掩码后) 是否都等于 state */
+static inline int rt_axis_all_sw(const AxisCtrl_t *ax, uint16_t state)
+{
+    for (int s = 0; s < ax->slave_count; s++) {
+        if ((ax->status_word[s] & SW_MASK) != state) return 0;
+    }
+    return ax->slave_count > 0;
+}
+
+/* 把指令位锚定到主驱实际位置 (与各握手步入口的锚定同式, 保证 PDO 输出连续) */
+static inline void rt_axis_anchor_cmd(AxisCtrl_t *ax)
+{
+    int32_t raw = axis_pdo_read_pos(ax->slave_ids[0]) - ax->home_offset[0] - ax->homing_shift[0];
+    double ppu = ax->pulse_per_unit;
+    ax->current_cmd_pos = (ppu > 1e-6) ? (double)raw / ppu : 0.0;
+}
+
+/* 握手停留计时: 输出生效 (全局 OP / sim) 后每周期 +1, 超过 SERVO_ENABLE_TIMEOUT_MS 返回 1 */
+static inline int rt_servo_enable_timed_out(AxisCtrl_t *ax)
+{
+    if (!(g_sim_mode || inOP)) return 0;
+    if (ax->enable_wait_ms < 0x7FFFFFFF) ax->enable_wait_ms++;
+    return ax->enable_wait_ms > SERVO_ENABLE_TIMEOUT_MS;
+}
+
+/* 故障检出入口: 记录阶段/步骤/从站/状态字, 转 case 4 取证并通知诊断线程读故障码。
+ * 系统报警由调用方决定 (运行期故障置, 上电握手故障不置: 否则健康轴也被锁死)。 */
+static void rt_servo_fault_enter(int i, int stage, int sub)
+{
+    AxisCtrl_t *ax = &g_axis[i];
+    ax->fault_step  = (uint8_t)ax->cia_step;
+    ax->fault_stage = (uint8_t)stage;
+    ax->fault_slave = (int8_t)sub;
+    ax->fault_sw    = (sub >= 0 && sub < MAX_SLAVES_PER_AXIS) ? ax->status_word[sub]
+                                                              : ax->status_word[0];
+    ax->servo_state = SERVO_FAULT_PROBE;
+    ax->fault_seen  = 1;
+    atomic_store_explicit(&ax->fault_probe_done, 0, memory_order_release);
+    atomic_fetch_add_explicit(&ax->fault_seq, 1, memory_order_release);
+    EventLogger_Push(SEVERITY_WARN, SOURCE_DRIVE, 0x0002, i,
+                     (stage == SERVO_FAULT_STAGE_RUN) ? "drive fault detected (runtime)"
+                                                       : "drive fault detected (enable handshake)");
+    ax->cia_step          = 4;
+    ax->cia_step_delay    = 0;
+    ax->_follow_err_timer = 0;
+}
+
+/* 握手停留超时: 驱动器未到位且无故障位, 锁存为"使能超时"故障, 等 System.Reset */
+static void rt_servo_timeout_latch(int i)
+{
+    AxisCtrl_t *ax = &g_axis[i];
+    ax->fault_step  = (uint8_t)ax->cia_step;
+    ax->servo_state = SERVO_FAULT_LATCHED;
+    ax->fault_stage = SERVO_FAULT_STAGE_TIMEOUT;
+    ax->fault_slave = -1;
+    ax->fault_sw    = ax->status_word[0];
+    atomic_fetch_add_explicit(&ax->fault_seq, 1, memory_order_release);
+    EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x000E,
+                     ((int)ax->fault_step << 8) | i, "servo enable timeout, Reset required");
+    ax->cia_step       = 5;
+    ax->cia_step_delay = 0;
+}
+
+/* 每轴都已到终态 (就绪或锁存) 且总线无故障: 报警复位可执行的门 */
+static inline int rt_servo_settled(void)
+{
+    uint32_t cfg = atomic_load_explicit(&g_servo_config_mask, memory_order_relaxed);
+    uint32_t rdy = atomic_load_explicit(&g_servo_ready_mask, memory_order_relaxed);
+    uint32_t lt  = atomic_load_explicit(&g_servo_latched_mask, memory_order_relaxed);
+    return cfg != 0 && ((rdy | lt) == cfg)
+        && atomic_load_explicit(&g_servo_bus_fault, memory_order_relaxed) == 0;
+}
+
+/* idx 轴是否 Operation enabled (idx 越界或未指定 = -1 时要求全轴就绪) */
+static inline int rt_servo_axis_ready(int idx)
+{
+    if (idx < 0 || idx >= AXIS_NUM) return g_all_axis_op_ready;
+    return (int)((atomic_load_explicit(&g_servo_ready_mask, memory_order_relaxed) >> idx) & 1u);
+}
+
+/* 总线故障锁存: wkc 连续 SERVO_WKC_FAULT_MS 周期不符, 各站状态字不可信 */
+static void rt_servo_bus_fault_latch(void)
+{
+    int wk = wkc;
+    atomic_store_explicit(&g_servo_bus_fault, 1, memory_order_release);
+    atomic_fetch_add_explicit(&g_servo_bus_fault_seq, 1, memory_order_release);
+    atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
+    rt_jog_abort("jog aborted: EtherCAT bus fault");
+    /* value = (期望 wkc << 16) | 实际 wkc; 实际为 0xFFFF 表示本周期没有帧返回 */
+    EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0050,
+                     ((expectedWKC & 0xFFFF) << 16) | (wk & 0xFFFF),
+                     "EtherCAT wkc lost, outputs held, Reset required");
 }
 
 /************************ 实时控制线程（核心！1ms周期，五轴同周期控制） ************************/
@@ -359,6 +474,9 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
 
     while (1)
     {
+        /* SMC_Close 已关网卡: 退出主循环 (此前线程会继续对已关闭的 ctx 发过程数据帧) */
+        if (atomic_load_explicit(&g_rt_exit, memory_order_acquire)) break;
+
         // ================================================================
         // 仿真模式节流 (避免 tight loop 饿死 I/O 线程):
         //   默认 500us = 节流到 wall-clock ≈ 0.5× 实时 (5000 cycles ≈ 2.5s/5mm G01)
@@ -403,6 +521,20 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 // 跳过 ec_sync (无物理 DC 时钟)
             } else {
                 wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+            }
+
+            /* ---- EtherCAT 工作计数监控 (2026-11-27) ----
+             * expectedWKC 此前只计算不比较: 丢帧或从站掉 OP 时 RT 读到的是残留输入,
+             * 状态机照跑且无报警。这里累计 wkc 不符的连续周期数, 全局 OP 后连续
+             * SERVO_WKC_FAULT_MS 周期不符即在下方轴循环前锁存总线故障。
+             * @Danger: 1 次整数比较 + relaxed atomic store。 */
+            if (!g_sim_mode) {
+                if (inOP && wkc != expectedWKC) {
+                    int b = atomic_load_explicit(&g_wkc_bad_ms, memory_order_relaxed);
+                    if (b < 0x7FFF) atomic_store_explicit(&g_wkc_bad_ms, b + 1, memory_order_relaxed);
+                } else {
+                    atomic_store_explicit(&g_wkc_bad_ms, 0, memory_order_relaxed);
+                }
             }
 
             static int is_first_run=1;
@@ -625,7 +757,8 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                                               memory_order_release);
                         g_interpolator.jog_axis_idx = -1;
                     }
-                if(g_all_axis_op_ready && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)){
+                /* 门 = 每轴都已到终态 (就绪或故障锁存) 且总线无故障: 锁存轴不再永久挡住复位 */
+                if(rt_servo_settled() && (!g_interpolator.is_moving || g_interpolator.hold_state == HOLD_PAUSED)){
                     /* P0-1 Homing: 残留状态清理 (仅复位真正执行时回打):
                      * DONE(3) / FAULT(4) / 迟到 PENDING(1) → IDLE;
                      * RUNNING(2) 拒绝清 (axis_homing 在 Non-RT 跑, 不能中断)。 */
@@ -798,9 +931,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
              * 进入 RUNNING 后, RT 仅冻结 queue + 跳过该轴 CSP PDO 写;
              * 实际 SDO/轮询由 Non-RT (parser_thread/SMC_HomeAxis 异步路径) 的 axis_homing() 完成.
              * Non-RT axis_homing 入口会再次设 state==2 (idempotent). */
+            /* 门控改逐轴 (2026-11-27): 回零轴已使能就绪即可 (回零轴未指定 = -1 时要求全轴) */
             if (g_interpolator.homing_state == 1
                 && g_homing_cfg.enabled
-                && g_all_axis_op_ready) {
+                && rt_servo_axis_ready(g_interpolator.homing_axis_idx)) {
                 int safe_now = (!g_interpolator.is_moving)
                             || (g_interpolator.hold_state == HOLD_PAUSED);
                 if (safe_now) {
@@ -1061,7 +1195,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     rt_jog_abort_on_alarm();
                 } else {
                 int j = g_interpolator.jog_axis_idx;
-                if (j >= 0 && j < AXIS_NUM) {
+                if (j >= 0 && j < AXIS_NUM && !rt_servo_axis_ready(j)) {
+                    /* 该轴不在 Operation enabled (握手/故障/总线恢复中): 指令位不推进, 中止 */
+                    rt_jog_abort("jog aborted: axis servo not ready");
+                } else if (j >= 0 && j < AXIS_NUM) {
                     /* JOG 加速斜坡 (2026-08-27 实机首测修复): 原实现第 1 周期即以
                      * jog_step_mm 全速推进 → 指令速度 0→v 阶跃, 伺服跟不上, 0x60F4
                      * 跟随误差冲高 (警告阈值 3000p 持续 200ms) → 报警 + SafeLiftZ
@@ -1559,8 +1696,10 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             periph_ai_rt_poll();
             PeriphBus_PublishG((uint32_t)cycle);
 
-            if(g_all_axis_op_ready){
+            {
+                uint32_t rdy_now = atomic_load_explicit(&g_servo_ready_mask, memory_order_relaxed);
                 for(int i=0;i<AXIS_NUM;i++){
+                    if(!(rdy_now & (1u << i))) continue;   /* 未就绪轴不检测; 他轴故障不屏蔽本轴 */
                     if(g_axis[i].slave_count>=2&&g_axis[i].enable_sync_alarm){
                         int slave_1=g_axis[i].slave_ids[0];
                         int slave_2=g_axis[i].slave_ids[1];
@@ -1710,9 +1849,16 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
             //   旋转轴 B/C 仍线性减法; 未激活时走原语句 (字节等价)。
             // @Context: 1ms Hard-RT Thread
             // @Danger: 仅数组读 + 乘加赋值, 无 malloc/阻塞/math.h/printf
-            if(g_all_axis_op_ready){
+            {
+                /* 逐轴更新 (2026-11-27): 就绪轴跟随插补器, 锁存轴取锚定指令位 (物理位置),
+                 * 握手/总线故障中的轴保持上次值 — 他轴故障不再冻结整机坐标显示 */
+                uint32_t rdy_now = atomic_load_explicit(&g_servo_ready_mask, memory_order_relaxed);
+                uint32_t lt_now  = atomic_load_explicit(&g_servo_latched_mask, memory_order_relaxed);
                 for(int j=0;j<AXIS_NUM;j++){
-                    g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
+                    if(rdy_now & (1u << j))
+                        g_coord_mgr.current_g53_pos[j]=g_interpolator.current_pos[j];
+                    else if(lt_now & (1u << j))
+                        g_coord_mgr.current_g53_pos[j]=g_axis[j].current_cmd_pos;
                 }
                 if(!g_coord_mgr.active_tilt){
                     for(int j=0;j<AXIS_NUM;j++){
@@ -1739,125 +1885,190 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 }
             }
 
-            int all_ready_flag=1;
+            /* 总线故障锁存判定 (在逐轴状态机之前):
+             * 实机 = wkc 连续 SERVO_WKC_FAULT_MS 周期不符; sim = 测试钩子注入 */
+            if (atomic_load_explicit(&g_servo_bus_fault, memory_order_acquire) == 0) {
+                int wkc_bad = g_sim_mode
+                    ? (atomic_load_explicit(&g_servo_sim_bus_inject, memory_order_acquire) != 0)
+                    : (inOP && atomic_load_explicit(&g_wkc_bad_ms, memory_order_relaxed)
+                                >= SERVO_WKC_FAULT_MS);
+                if (wkc_bad) rt_servo_bus_fault_latch();
+            }
+            int bus_fault_now = (atomic_load_explicit(&g_servo_bus_fault, memory_order_acquire) != 0);
+
+            /* ================================================================
+             * 逐轴 CiA402 伺服状态机 (RT 单写者; 2026-11-27 改为逐轴独立)
+             *   cia_step: 0 Shutdown / 1 Switch on / 2 Enable op / 3 运行 /
+             *             4 故障取证 (整轴撤销使能, 等诊断线程读回 0x603F) /
+             *             5 锁存 (等 System.Reset) / 6 故障复位等待
+             *   - 晋升与故障判定看轴内全部从站 (双驱轴从驱故障同样检出)
+             *   - 每轴独立走到终态 (3 就绪 / 5 锁存), 他轴故障不阻塞本轴使能
+             *   - 未配置从站的轴不参与 (配置轴数 < AXIS_NUM 时其余轴跳过)
+             *   汇总: g_servo_ready_mask / g_servo_latched_mask / g_servo_config_mask,
+             *         g_all_axis_op_ready = 就绪掩码覆盖全部已配置轴
+             * @Context: 1ms Hard-RT Thread (EtherCAT)
+             * @Danger: 仅整数运算 + 常量串 EventLogger_Push, NO BLOCKING / MATH.H / PRINTF / MALLOC
+             * ================================================================ */
+            uint32_t ready_mask=0, latched_mask=0, config_mask=0;
 
             for(int i=0;i<AXIS_NUM;i++){
-                int primary_slave=g_axis[i].slave_ids[0];
-                uint16_t sw=axis_pdo_read_sw(primary_slave);
+                int nsl=g_axis[i].slave_count;
+                if(nsl<1||nsl>MAX_SLAVES_PER_AXIS||g_axis[i].slave_ids[0]<=0){
+                    g_axis[i].servo_state=SERVO_IDLE;
+                    g_axis[i].is_enabled=0;
+                    continue;
+                }
+                config_mask|=(1u<<i);
+
+                /* 主驱实际位置缓存 (诊断用: 指令位 vs 实际位; 总线故障期间为残留值) */
+                g_axis[i].actual_pos = axis_pdo_read_pos(g_axis[i].slave_ids[0]);
+
+                /* 轴内各从站状态字快照; 任一从站故障位置位即判该轴故障 */
+                int err_sub=-1;
+                int disabled_sub=-1;
+                for(int s=0;s<nsl;s++){
+                    uint16_t sws=axis_pdo_read_sw(g_axis[i].slave_ids[s]);
+                    g_axis[i].status_word[s]=sws;
+                    if(disabled_sub<0 && (sws & SW_MASK)!=SW_OP_ENABLED) disabled_sub=s;
+                    if(err_sub<0&&(sws&SW_ERROR)) err_sub=s;
+                }
+                int has_err=(err_sub>=0);
+
+                if(bus_fault_now){
+                    /* 总线故障锁存: 状态字是上一帧残留, 不可信。状态机停推进,
+                     * PDO 输出保持上一周期写入值 (本周期不写) */
+                    g_axis[i].servo_state=SERVO_BUS_FAULT;
+                    g_axis[i].is_enabled=0;
+                    continue;
+                }
+                if(g_axis[i].servo_state==SERVO_BUS_FAULT){
+                    /* 总线故障刚解除: 从 Shutdown 重新握手 */
+                    g_axis[i].cia_step=0;
+                    g_axis[i].cia_step_delay=0;
+                    g_axis[i].enable_wait_ms=0;
+                    g_axis[i].servo_state=SERVO_IDLE;
+                }
+
+                /* 人工复位 (System.Reset): 清重试计数; 锁存轴回 case 0, 握手中的轴重新计时 */
+                if(atomic_load_explicit(&g_axis[i].fault_reset_req,memory_order_acquire)){
+                    atomic_store_explicit(&g_axis[i].fault_reset_req,0,memory_order_release);
+                    g_axis[i].retry_count=0;
+                    if(g_axis[i].cia_step==5){
+                        g_axis[i].cia_step=0;
+                        g_axis[i].cia_step_delay=0;
+                        rt_log("[CiA402] %s 人工复位, 重新使能",g_axis[i].axis_name);
+                    }
+                    g_axis[i].enable_wait_ms=0;
+                }
+
                 g_axis[i].cia_step_delay++;
 
                 int32_t output_cw=CW_ENABLE_OP;
 
                 switch(g_axis[i].cia_step){
                     case 0:
-                    /* F8 (2026-09-01): 使能握手期故障路由 — case 0/1/2 原先无 SW_ERROR
-                     * 检测: 驱动器带锁存故障重启 (Z 关机序列坠轴/抱闸类锁存故障) 时,
-                     * CiA402 Fault 态下 CW_SHUTDOWN(0x06) 无效, case 0 永远等不到
-                     * SW_SHUTDOWN_RDY, g_all_axis_op_ready 悬置, 现场只能驱动器断电
-                     * 清除 RAM 故障 (商业控制器如新代均为故障复位→重新使能, 无需断电)。
-                     * 统一路由到 case 4 复位环: FAULT_RESET 至故障位清除后回 case 0 全握手。
-                     * @Danger: 整数比较 + 既有 EventLogger ring 写, 无 malloc/printf/math。 */
-                    if(sw & SW_ERROR){
-                        g_axis[i].cia_step = 4;
-                        g_axis[i].cia_step_delay = 0;
-                        g_axis[i]._follow_err_timer = 0;
-                        all_ready_flag = 0;
-                        output_cw = CW_FAULT_RESET;
-                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
-                                         "drive fault at enable handshake, FAULT_RESET sent");
+                    /* 逐轴使能 (2026-11-27): 握手期故障 (含驱动器带锁存故障重启, 原 F8 场景)
+                     * 路由到 case 4 取证 → 自动复位 (上限 SERVO_FAULT_RETRY_MAX 次) →
+                     * 回 case 0 全握手; 超限锁存等 System.Reset。判定看轴内全部从站。 */
+                    if(has_err){
+                        rt_servo_fault_enter(i, SERVO_FAULT_STAGE_INIT, err_sub);
+                        output_cw = CW_SHUTDOWN;
                         break;
                     }
                     output_cw=CW_SHUTDOWN;
                     if(g_axis[i].cia_step_delay==1){
-                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
-                        double ppu=g_axis[i].pulse_per_unit;
-                        g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
+                        rt_axis_anchor_cmd(&g_axis[i]);
+                        g_axis[i].servo_state = SERVO_ENABLING;
                     }
-                    if(g_axis[i].cia_step_delay>50&&((sw&SW_MASK)==SW_SHUTDOWN_RDY)){
+                    if(rt_servo_enable_timed_out(&g_axis[i])){
+                        rt_servo_timeout_latch(i);
+                        output_cw = CW_SHUTDOWN;
+                        break;
+                    }
+                    if(g_axis[i].cia_step_delay>50&&rt_axis_all_sw(&g_axis[i], SW_SHUTDOWN_RDY)){
                         g_axis[i].cia_step++;
                         g_axis[i].cia_step_delay=0;
                     }
-                    all_ready_flag=0;
                     break;
 
                     case 1:
-                    /* F8: 同 case 0 — 握手中途锁存故障路由到 case 4 复位环 */
-                    if(sw & SW_ERROR){
-                        g_axis[i].cia_step = 4;
-                        g_axis[i].cia_step_delay = 0;
-                        g_axis[i]._follow_err_timer = 0;
-                        all_ready_flag = 0;
-                        output_cw = CW_FAULT_RESET;
-                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
-                                         "drive fault at enable handshake, FAULT_RESET sent");
+                    /* 握手期故障: 同 case 0 (取证 → 自动复位 → 超限锁存) */
+                    if(has_err){
+                        rt_servo_fault_enter(i, SERVO_FAULT_STAGE_INIT, err_sub);
+                        output_cw = CW_SHUTDOWN;
                         break;
                     }
                     output_cw=CW_SWITCH_ON;
                     if(g_axis[i].cia_step_delay==1){
-                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
-                        double ppu=g_axis[i].pulse_per_unit;
-                        g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
+                        rt_axis_anchor_cmd(&g_axis[i]);
+                        g_axis[i].servo_state = SERVO_ENABLING;
                     }
-                    if(g_axis[i].cia_step_delay>50&&((sw&SW_MASK)==SW_SWITCHED_ON)){
+                    if(rt_servo_enable_timed_out(&g_axis[i])){
+                        rt_servo_timeout_latch(i);
+                        output_cw = CW_SHUTDOWN;
+                        break;
+                    }
+                    if(g_axis[i].cia_step_delay>50&&rt_axis_all_sw(&g_axis[i], SW_SWITCHED_ON)){
                         if(llabs(timeerror)<80000){
                             g_axis[i].cia_step++;
                             g_axis[i].cia_step_delay=0;
                         }
                     }
-                    all_ready_flag=0;
                     break;
 
                     case 2:
-                    /* F8: 同 case 0 — 握手中途锁存故障路由到 case 4 复位环 */
-                    if(sw & SW_ERROR){
-                        g_axis[i].cia_step = 4;
-                        g_axis[i].cia_step_delay = 0;
-                        g_axis[i]._follow_err_timer = 0;
-                        all_ready_flag = 0;
-                        output_cw = CW_FAULT_RESET;
-                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
-                                         "drive fault at enable handshake, FAULT_RESET sent");
+                    /* 握手期故障: 同 case 0 (取证 → 自动复位 → 超限锁存) */
+                    if(has_err){
+                        rt_servo_fault_enter(i, SERVO_FAULT_STAGE_INIT, err_sub);
+                        output_cw = CW_SHUTDOWN;
                         break;
                     }
                     output_cw=CW_ENABLE_OP;
                     if(g_axis[i].cia_step_delay==1){
-                        int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
-                        double ppu=g_axis[i].pulse_per_unit;
-                        g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
+                        rt_axis_anchor_cmd(&g_axis[i]);
+                        g_axis[i].servo_state = SERVO_ENABLING;
                     }
-                    if((sw&SW_MASK)==SW_OP_ENABLED){
+                    if(rt_servo_enable_timed_out(&g_axis[i])){
+                        rt_servo_timeout_latch(i);
+                        output_cw = CW_SHUTDOWN;
+                        break;
+                    }
+                    if(rt_axis_all_sw(&g_axis[i], SW_OP_ENABLED)){
                         g_axis[i].cia_step_delay++;
                         if(g_axis[i].cia_step_delay>50){
                             g_axis[i].cia_step_delay=0;
-                            g_axis[i].cia_step++;
+                            g_axis[i].cia_step=3;
 
-                            int32_t raw_pulse=axis_pdo_read_pos(primary_slave)-g_axis[i].home_offset[0]-g_axis[i].homing_shift[0];
-                            double ppu=g_axis[i].pulse_per_unit;
-                            g_axis[i].current_cmd_pos=(ppu>1e-6)?((double)raw_pulse/ppu):0.0;
+                            rt_axis_anchor_cmd(&g_axis[i]);
                             api_sync_planner_cursor();
+                            g_axis[i].op_stable_ms=0;
+                            g_axis[i].hold_fixed = g_axis[i].fault_seen && g_interpolator.is_moving;
+                            if(g_axis[i].fault_seen){
+                                g_axis[i].fault_seen=0;
+                                EventLogger_Push(SEVERITY_INFO, SOURCE_DRIVE, 0x0054, i,
+                                                 "servo re-enabled after fault reset");
+                            }
                         }
                     }
-                    all_ready_flag=0;
                     break;
 
                     case 3:
                     output_cw=CW_ENABLE_OP;
 
-                    // 驱动器故障检测：必须在跟随误差监控之前
-                    // 当驱动器内部触发故障(如 AL009)时，状态字 bit3(SW_ERROR) 置位，
-                    // 需进入 case 4 执行 CW_FAULT_RESET 并重新走使能流程。
+                    // 驱动器故障检测：必须在跟随误差监控之前。轴内任一从站故障位置位
+                    // (如 AL009) 即转 case 4 取证 (整轴撤销使能) → 自动复位 → 重新使能。
                     // 绝对禁止在此处置 is_moving=0！仅触发报警，让虚拟时间轴平滑刹车。
-                    if(sw & SW_ERROR){
-                        g_axis[i].cia_step = 4;
-                        g_axis[i].cia_step_delay = 0;
-                        g_axis[i]._follow_err_timer = 0;
-                        all_ready_flag = 0;
-                        output_cw = CW_FAULT_RESET;
+                    if(has_err || disabled_sub>=0){
+                        rt_servo_fault_enter(i, SERVO_FAULT_STAGE_RUN, has_err ? err_sub : disabled_sub);
                         atomic_store_explicit(&g_sys_alarm_state, 1, memory_order_release);
-                        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0002, i,
-                                         "drive SW_ERROR detected, FAULT_RESET sent");
                         rt_jog_abort_on_alarm();   /* F2: 报警同步中止 JOG */
+                        output_cw = CW_SHUTDOWN;
                         break;
+                    }
+                    // 稳定运行满 SERVO_STABLE_MS: 本轮自动复位次数清零 (间歇故障各算一轮)
+                    if(g_axis[i].op_stable_ms < SERVO_STABLE_MS
+                       && ++g_axis[i].op_stable_ms == SERVO_STABLE_MS){
+                        g_axis[i].retry_count = 0;
                     }
 
                     if(g_axis[i].cia_step_delay==1){
@@ -1871,6 +2082,14 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                         // 否则插补器下一周期会用 start_pos + dir_vec*ratio 覆盖回来，产生位置阶跃。
                         if(!g_interpolator.is_moving) {
                             g_interpolator.current_pos[i] = g_axis[i].current_cmd_pos;
+                        }
+                        /* 故障后重新使能且插补器刹停在段中: 撤销使能期间轴可能已被外力挪动,
+                         * 此时追随插补器冻结位 = 上电瞬间跳回。指令位固定在重锚定值,
+                         * 直到运动恢复 (报警复位会先把两侧位置重新同步)。 */
+                    }else if(g_axis[i].hold_fixed){
+                        if(g_interpolator.hold_state == HOLD_NORMAL
+                           && atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire) == 0){
+                            g_axis[i].hold_fixed = 0;   // 运动已恢复, 回到追随插补器
                         }
                     }else{
                         // 无论是否报警，只要轴在 case 3（健康运行），就必须追随插补器！
@@ -1916,23 +2135,64 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                     break;
 
                     case 4:
-                    // 驱动器故障恢复：发送 CW_FAULT_RESET，等待故障位清除后重新使能
-                    all_ready_flag = 0;
-                    if(sw & SW_ERROR){
-                        output_cw = CW_FAULT_RESET;
-                        // 故障期间：命令位置死咬实际位置，防止恢复瞬间飞车追位
-                        if(g_axis[i].slave_count >= 1 && g_axis[i].slave_ids[0] > 0){
-                            int32_t raw_pulse = axis_pdo_read_pos(g_axis[i].slave_ids[0]) - g_axis[i].home_offset[0] - g_axis[i].homing_shift[0];
-                            double ppu = g_axis[i].pulse_per_unit;
-                            g_axis[i].current_cmd_pos = (ppu > 1e-6) ? (double)raw_pulse / ppu : 0.0;
+                    /* 故障取证 (2026-11-27): 整轴撤销使能, 等诊断线程读回 0x603F 故障码
+                     * (上限 SERVO_FAULT_PROBE_MS) 再复位 — 故障码是排障线索, 复位即被驱动器清除。
+                     * 自动复位次数未超限 → case 6 发 FAULT_RESET; 超限 → case 5 锁存等人工复位。 */
+                    output_cw = CW_SHUTDOWN;
+                    rt_axis_anchor_cmd(&g_axis[i]);   // 命令位置咬住实际位置, 防恢复瞬间飞车追位
+                    if(atomic_load_explicit(&g_axis[i].fault_probe_done,memory_order_acquire)
+                       || g_axis[i].cia_step_delay >= SERVO_FAULT_PROBE_MS){
+                        if(g_axis[i].retry_count < SERVO_FAULT_RETRY_MAX){
+                            g_axis[i].retry_count++;
+                            g_axis[i].cia_step=6;
+                            g_axis[i].cia_step_delay=0;
+                        }else{
+                            g_axis[i].cia_step=5;
+                            g_axis[i].cia_step_delay=0;
+                            g_axis[i].servo_state=SERVO_FAULT_LATCHED;
+                            EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x000F, i,
+                                             "servo fault latched: auto reset exhausted, Reset required");
+                            /* 再触发一次诊断: 诊断线程据此补一条带故障码的锁存报警文字 */
+                            atomic_fetch_add_explicit(&g_axis[i].fault_seq, 1, memory_order_release);
                         }
-                    } else {
-                        // 故障已清除，回到 case 0 重新走完整使能流程
-                        g_axis[i].cia_step = 0;
-                        g_axis[i].cia_step_delay = 0;
-                        rt_log("[CiA402] %s 故障已清除，重新使能", g_axis[i].axis_name);
                     }
                     break;
+
+                    case 6:
+                    /* 故障复位等待: 故障位清除 → 回 case 0 全握手;
+                     * SERVO_FAULT_RESET_WAIT_MS 内未清除 = 复位无效, 回 case 4 重试 (次数在彼处用尽) */
+                    output_cw = CW_FAULT_RESET;
+                    if(!has_err){
+                        g_axis[i].cia_step=0;
+                        g_axis[i].cia_step_delay=0;
+                        g_axis[i].enable_wait_ms=0;
+                        rt_log("[CiA402] %s 故障已清除，重新使能", g_axis[i].axis_name);
+                    }else if(g_axis[i].cia_step_delay >= SERVO_FAULT_RESET_WAIT_MS){
+                        g_axis[i].cia_step=4;
+                        g_axis[i].cia_step_delay=SERVO_FAULT_PROBE_MS;   // 故障码未变, 不必再取证
+                    }
+                    break;
+
+                    case 5:
+                    /* 锁存: 不再自动复位, 等 System.Reset (fault_reset_req 在 switch 之前处理) */
+                    output_cw = 0x0000;
+                    rt_axis_anchor_cmd(&g_axis[i]);
+                    break;
+
+                    default:
+                    g_axis[i].cia_step=0;
+                    g_axis[i].cia_step_delay=0;
+                    break;
+                }
+
+                /* 就绪 / 锁存掩码汇总 */
+                if(g_axis[i].cia_step!=3){
+                    g_axis[i].is_enabled=0;
+                    if(g_axis[i].cia_step==5) latched_mask|=(1u<<i);
+                }else{
+                    ready_mask|=(1u<<i);
+                    g_axis[i].is_enabled=1;
+                    g_axis[i].servo_state=SERVO_OP_ENABLED;
                 }
 
                 /* P0-1 Homing: 该轴 RUNNING 时跳过 CSP PDO 写入 — 仅限驱动器侧接管
@@ -1962,7 +2222,12 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
                 }
             }
 
-            g_all_axis_op_ready=all_ready_flag;
+            /* 全轴就绪 = 就绪掩码覆盖全部已配置轴; 三张掩码发布给 Non-RT 门控与快照 v5 */
+            g_all_axis_enabled=(config_mask!=0&&ready_mask==config_mask);
+            g_all_axis_op_ready=g_all_axis_enabled;
+            atomic_store_explicit(&g_servo_config_mask,config_mask,memory_order_relaxed);
+            atomic_store_explicit(&g_servo_ready_mask,ready_mask,memory_order_release);
+            atomic_store_explicit(&g_servo_latched_mask,latched_mask,memory_order_release);
 
             // ---- P0-Laser Phase B1: 功率-速度耦合 (在 flush_pdos 前重算 power_w) ----
             // 读 g_interpolator.v_current + 耦合表, 重算 g_laser_rt.power_w.
@@ -2113,10 +2378,180 @@ OSAL_THREAD_FUNC_RT ecat_thread_rt(void *arg)
     return NULL;    /* osal_compat.h: OSAL_THREAD_FUNC_RT = void* (gcc14 须显式) */
 }
 
-/************************ 故障检查线程 ************************/
+/* ====================================================================
+ * 从站角色表 + 伺服诊断 + 总线恢复 (Non-RT, 2026-11-27)
+ *   bring-up 枚举后建一次角色表: 属于某轴从站表的是驱动器 (轴名 [+ sub]),
+ *   其余是非伺服 I/O 站 — I/O 站不走 CiA402 握手, 只做 OP 状态监控与恢复。
+ * ==================================================================== */
+static char g_slave_role[ECAT_TOPO_MAX + 1][12];
+
+static void ecat_build_slave_roles(void)
+{
+    for (int s = 0; s <= ECAT_TOPO_MAX; s++) g_slave_role[s][0] = '\0';
+    for (int s = 1; s <= ctx.slavecount && s <= ECAT_TOPO_MAX; s++)
+        snprintf(g_slave_role[s], sizeof(g_slave_role[s]), "IO");
+    for (int i = 0; i < AXIS_NUM; i++) {
+        const char *nm = g_axis[i].axis_name[0] ? g_axis[i].axis_name : "drv";
+        for (int k = 0; k < g_axis[i].slave_count && k < MAX_SLAVES_PER_AXIS; k++) {
+            int s = g_axis[i].slave_ids[k];
+            if (s < 1 || s > ECAT_TOPO_MAX) continue;
+            snprintf(g_slave_role[s], sizeof(g_slave_role[s]), "%s%s",
+                     nm, k == 0 ? "" : " sub");
+        }
+    }
+    for (int s = 1; s <= ctx.slavecount && s <= ECAT_TOPO_MAX; s++)
+        printf("[ECAT] 站 %d: vendor=0x%08X product=0x%08X → %s\n", s,
+               ctx.slavelist[s].eep_man, ctx.slavelist[s].eep_id, g_slave_role[s]);
+}
+
+const char *ecat_slave_role_name(int slave)
+{
+    if (slave < 1 || slave > ECAT_TOPO_MAX || g_slave_role[slave][0] == '\0') return "?";
+    return g_slave_role[slave];
+}
+
+/* ---- 故障码缓存: 诊断线程单写者, OPC UA / SMC_GetAxisStatus 读 ----
+ * 0 = 未检出故障, >0 = 0x603F 读回值, -1 = SDO 读取失败, -2 = 使能超时 (无驱动器故障) */
+static int32_t  g_servo_err[AXIS_NUM][MAX_SLAVES_PER_AXIS];
+static uint32_t g_servo_diag_seq[AXIS_NUM];
+static uint32_t g_bus_diag_seq = 0;
+
+int ecat_servo_err_code(int axis_idx, int sub)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM || sub < 0 || sub >= MAX_SLAVES_PER_AXIS) return 0;
+    return g_servo_err[axis_idx][sub];
+}
+
+/* @Context: Non-RealTime Background Thread (诊断线程, 10ms)
+ * @Safe: SDO 阻塞读 + printf + 事件推送。
+ * RT 在 case 4 等 fault_probe_done (上限 SERVO_FAULT_PROBE_MS) 才发故障复位,
+ * 所以这里读到的 0x603F 是本次故障的现行故障码。 */
+static void ecat_diag_servo_faults(void)
+{
+    for (int i = 0; i < AXIS_NUM; i++) {
+        AxisCtrl_t *ax = &g_axis[i];
+        uint32_t seq = atomic_load_explicit(&ax->fault_seq, memory_order_acquire);
+        if (seq == g_servo_diag_seq[i]) {
+            /* 轴已重新使能: 故障码缓存回 0 (DriveAlarmCode 表示"当前有无故障", 不是历史记录)。
+             * 缓存由本线程单写, 这里清零安全。 */
+            if (ax->servo_state == SERVO_OP_ENABLED && g_servo_err[i][0] != 0) {
+                for (int s = 0; s < MAX_SLAVES_PER_AXIS; s++) g_servo_err[i][s] = 0;
+            }
+            continue;
+        }
+        g_servo_diag_seq[i] = seq;
+
+        int timeout_fault = (ax->fault_stage == SERVO_FAULT_STAGE_TIMEOUT);
+        for (int s = 0; s < MAX_SLAVES_PER_AXIS; s++) {
+            g_servo_err[i][s] = 0;
+            if (s >= ax->slave_count) continue;
+            if (g_sim_mode) continue;
+            if (timeout_fault) { g_servo_err[i][s] = -2; continue; }
+            int slave = ax->slave_ids[s];
+            uint16_t v = 0;
+            int sz = sizeof(v);
+            int wkc = (slave > 0 && slave <= ctx.slavecount)
+                      ? ecx_SDOread(&ctx, slave, 0x603F, 0x00, FALSE, &sz, &v, EC_TIMEOUTRXM) : 0;
+            g_servo_err[i][s] = (wkc > 0 && sz == 2) ? (int32_t)v : -1;
+        }
+
+        int sub = (ax->fault_slave >= 0 && ax->fault_slave < MAX_SLAVES_PER_AXIS) ? ax->fault_slave : 0;
+        int32_t err = g_servo_err[i][sub];
+        int slave = (sub < ax->slave_count) ? ax->slave_ids[sub] : 0;
+        char name = ax->axis_name[0] ? ax->axis_name[0] : (char)('A' + i);
+        char msg[SMC_EVENT_MSG_LEN];
+        if (timeout_fault) {
+            snprintf(msg, sizeof(msg), "%c enable timeout: step%u sw=0x%04X s%d",
+                     name, (unsigned)ax->fault_step, ax->fault_sw, slave);
+        } else {
+            const char *stage = (ax->fault_stage == SERVO_FAULT_STAGE_RUN) ? "run" : "init";
+            snprintf(msg, sizeof(msg), "%c servo fault: err=0x%04X sw=0x%04X %s s%d",
+                     name, (unsigned)(err >= 0 ? err : 0), ax->fault_sw, stage, slave);
+        }
+        int latched = (ax->servo_state == SERVO_FAULT_LATCHED);
+        EventLogger_Push(latched ? SEVERITY_ALARM : SEVERITY_WARN, SOURCE_DRIVE, 0x0053, i, msg);
+        printf("[servo] %s (axis=%d retry=%d/%d)\n", msg, i,
+               ax->retry_count, SERVO_FAULT_RETRY_MAX);
+        atomic_store_explicit(&ax->fault_probe_done, 1, memory_order_release);
+    }
+}
+
+/* @Context: Non-RealTime Background Thread (诊断线程)
+ * @Safe: ecx_readstate 阻塞 (SOEM 多线程标准用法, 与 RT 周期收发并行)。
+ * RT 锁存总线故障后逐站读 AL 状态, 把非 OP 的站 (含非伺服 I/O 站) 报进报警流。 */
+static void ecat_diag_bus_fault(void)
+{
+    uint32_t seq = atomic_load_explicit(&g_servo_bus_fault_seq, memory_order_acquire);
+    if (seq == g_bus_diag_seq) return;
+    g_bus_diag_seq = seq;
+
+    int wk = wkc, exp = expectedWKC;
+    if (g_sim_mode) {
+        printf("[servo] 总线故障 (sim 注入): wkc=%d expected=%d\n", wk, exp);
+        return;
+    }
+    (void)ecx_readstate(&ctx);
+    printf("[servo] 总线故障: wkc=%d expected=%d, 逐站状态:\n", wk, exp);
+    for (int s = 1; s <= ctx.slavecount; s++) {
+        ec_slavet *sl = &ctx.slavelist[s];
+        printf("        站 %d (%s): state=0x%02X ALstatuscode=0x%08X\n",
+               s, ecat_slave_role_name(s), sl->state, sl->ALstatuscode);
+        if (sl->state == EC_STATE_OPERATIONAL) continue;
+        char msg[SMC_EVENT_MSG_LEN];
+        snprintf(msg, sizeof(msg), "slave %d (%s) state=0x%02X AL=0x%08X",
+                 s, ecat_slave_role_name(s), sl->state, sl->ALstatuscode);
+        EventLogger_Push(SEVERITY_ALARM, SOURCE_DRIVE, 0x0051, s, msg);
+    }
+}
+
+/* @Context: Non-RealTime (System.Reset / SMC_ClearAlarm 调用线程)
+ * @Safe: EtherCAT 状态读写, 可阻塞 (秒级)。
+ * 总线故障恢复: wkc 已恢复且各站都回到 OP 才解除锁存 — 总线故障不自愈, 必须操作员复位。
+ * 非 OP 的站: 处于 SAFE_OP 的直接请求回 OP; 更低状态的交给 SOEM ecx_reconfig_slave
+ * 重配 (回 SAFE_OP, DC 站重启 sync0) 再请求 OP。任一站回不到 OP 返回 -2, 锁存保持。
+ * sim: 测试钩子注入撤销即可解除。
+ * @return 0=已解除, -1=wkc 仍不符, -2=有从站回不到 OP */
+int ecat_bus_recover(void)
+{
+    if (g_sim_mode) {
+        if (atomic_load_explicit(&g_servo_sim_bus_inject, memory_order_acquire)) return -1;
+    } else {
+        if (atomic_load_explicit(&g_wkc_bad_ms, memory_order_acquire) != 0) return -1;
+    }
+
+    int bad = 0;
+    if (!g_sim_mode) {
+        (void)ecx_readstate(&ctx);
+        for (int s = 1; s <= ctx.slavecount; s++) {
+            ec_slavet *sl = &ctx.slavelist[s];
+            if (sl->state == EC_STATE_OPERATIONAL) continue;
+            printf("[servo] 站 %d (%s) 状态 0x%02X, 尝试恢复\n",
+                   s, ecat_slave_role_name(s), sl->state);
+            if ((sl->state & 0x0f) != EC_STATE_SAFE_OP) {
+                int st = ecx_reconfig_slave(&ctx, s, EC_TIMEOUTRET3);
+                if (st != EC_STATE_SAFE_OP) { bad++; continue; }
+                if (sl->hasdc) ecx_dcsync0(&ctx, s, TRUE, (uint32_t)cycletime, 0);
+            }
+            sl->state = EC_STATE_OPERATIONAL;
+            ecx_writestate(&ctx, s);
+            if (ecx_statecheck(&ctx, s, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE)
+                != EC_STATE_OPERATIONAL) {
+                bad++;
+            }
+        }
+    }
+    if (bad) return -2;
+
+    atomic_store_explicit(&g_servo_bus_fault, 0, memory_order_release);
+    EventLogger_Push(SEVERITY_INFO, SOURCE_DRIVE, 0x0052, 0, "EtherCAT bus recovered");
+    printf("[servo] 总线故障已解除\n");
+    return 0;
+}
+
+/************************ 诊断线程 (10ms, Non-RT) ************************/
 OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
 {
-    int slaveix;
+    (void)arg;
     // 饥饿看门狗状态
     static volatile int last_queue_head = -1;
     static int starvation_counter = 0;
@@ -2129,26 +2564,11 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
 
     while (1)
     {
-        if (inOP && ((dowkccheck > 2) || ctx.grouplist[currentgroup].docheckstate))
-        {
-            ctx.grouplist[currentgroup].docheckstate = FALSE;
-            ecx_readstate(&ctx);
+        /* ---- 伺服故障取证 (RT 在 case 4 等本次读回才发故障复位) ---- */
+        ecat_diag_servo_faults();
 
-            for (int i = 0; i < AXIS_NUM; i++)
-            {
-                for(int s=0;s<g_axis[i].slave_count;s++){
-                    slaveix = g_axis[i].slave_ids[s];
-                    ec_slavet *slave = &ctx.slavelist[slaveix];
-                    if (slave->state != EC_STATE_OPERATIONAL)
-                    {
-                       ctx.grouplist[currentgroup].docheckstate = TRUE;
-                       g_axis[i].is_error = 1;
-                       printf("[故障检测] %s 非OP状态！当前状态码：%d\n", g_axis[i].axis_name, slave->state);
-                    }
-                }
-            }
-            dowkccheck = 0;
-        }
+        /* ---- 总线故障取证 (逐站 AL 状态, 含非伺服 I/O 站) ---- */
+        ecat_diag_bus_fault();
 
         // ---- 队列饥饿看门狗 ----
         // 路径 A：解析器已停止 → 队列中任意数量的未释放段均需强制释放
@@ -2208,6 +2628,30 @@ OSAL_THREAD_FUNC ecat_thread_chk(void *arg)
     return NULL;    /* osal_compat.h: OSAL_THREAD_FUNC = void* (gcc14 须显式) */
 }
 
+/* SDO 写入并回读校验 (Non-RT, bring-up)。
+ * verify_idx = 0: 回读同一对象; 非 0: 回读指定对象 (如 0x60C2 类成对参数无需, 0x6060→0x6061
+ * 在 axis_sdo_config_mode 内单独处理)。任一步失败打印"站号 + 角色 + 对象 + 期望/实际"。
+ * @return 0 = 写入成功且回读一致, -1 = 失败 (调用方拒绝进 OP) */
+static int ecat_sdo_write_verify(uint16_t slave, uint16_t idx, uint8_t sub,
+                                 const void *val, int sz)
+{
+    uint8_t buf[4] = {0, 0, 0, 0};
+    int vsz = sz;
+    int wkc_w = ecx_SDOwrite(&ctx, slave, idx, sub, FALSE, sz, val, EC_TIMEOUTRXM);
+    int wkc_r = (wkc_w > 0) ? ecx_SDOread(&ctx, slave, idx, sub, FALSE, &vsz, buf, EC_TIMEOUTRXM) : 0;
+    if (wkc_w > 0 && wkc_r > 0 && vsz == sz && memcmp(buf, val, (size_t)sz) == 0) return 0;
+
+    unsigned exp = 0, got = 0;
+    for (int k = 0; k < sz && k < 4; k++) {
+        exp |= (unsigned)((const uint8_t *)val)[k] << (8 * k);
+        got |= (unsigned)buf[k] << (8 * k);
+    }
+    printf("[ECAT错误] 站 %d (%s) 对象 0x%04X:%u 写入/回读校验失败: "
+           "write wkc=%d read wkc=%d, 期望=0x%X 实际=0x%X — 拒绝进 OP\n",
+           slave, ecat_slave_role_name(slave), idx, (unsigned)sub, wkc_w, wkc_r, exp, got);
+    return -1;
+}
+
 /************************ ECAT主站启动封装 ************************/
 void ecat_bringup(char *ifname)
 {
@@ -2233,54 +2677,71 @@ void ecat_bringup(char *ifname)
         exit(-1);
     }
 
+    /* 从站角色表 (2026-11-27): 属于某轴从站表的是驱动器, 其余是非伺服 I/O 站。
+     * 驱动器专属步骤 (PDO 重映射 / 0x1C32 / 0x60C2 / 0x6060) 只对轴从站执行。 */
+    ecat_build_slave_roles();
+    int sdo_fail = 0;
+
     // TxPDO 重映射：添加 0x60F4 跟随误差到 PDO 输入（必须在 config_map_group 之前）
     for(int i=0;i<AXIS_NUM;i++){
         for(int s=0;s<g_axis[i].slave_count;s++){
             uint16_t slave=g_axis[i].slave_ids[s];
             if(slave==0) continue;
+            int slave_fail0 = sdo_fail;
 
             // 切到 PRE-OP 才能改 PDO 映射
             ctx.slavelist[slave].state=EC_STATE_PRE_OP;
             ecx_writestate(&ctx,slave);
             ecx_statecheck(&ctx,slave,EC_STATE_PRE_OP,EC_TIMEOUTSTATE);
 
+            /* 每步写入后回读校验 (2026-11-27): 此前全部不看返回值。映射错误 = 读到错位的
+             * 状态字/位置, 属安全问题; SAFE_OP 检查只能给出"进不了 SAFE_OP", 这里给出
+             * "哪一站哪个对象失败"。 */
             // 禁用 TxPDO 分配
             uint8_t zero=0;
-            ecx_SDOwrite(&ctx,slave,0x1C13,0x00,FALSE,1,&zero,EC_TIMEOUTRXM);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1C13,0x00,&zero,1);
 
             // 清空映射对象 0x1A00
-            ecx_SDOwrite(&ctx,slave,0x1A00,0x00,FALSE,1,&zero,EC_TIMEOUTRXM);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1A00,0x00,&zero,1);
 
             // 写入三条映射：状态字(16bit) + 实际位置(32bit) + 跟随误差(32bit)
             uint32_t map_sw   =0x60410010;
             uint32_t map_pos  =0x60640020;
             uint32_t map_ferr =0x60F40020;
-            ecx_SDOwrite(&ctx,slave,0x1A00,0x01,FALSE,4,&map_sw,EC_TIMEOUTRXM);
-            ecx_SDOwrite(&ctx,slave,0x1A00,0x02,FALSE,4,&map_pos,EC_TIMEOUTRXM);
-            ecx_SDOwrite(&ctx,slave,0x1A00,0x03,FALSE,4,&map_ferr,EC_TIMEOUTRXM);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1A00,0x01,&map_sw,4);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1A00,0x02,&map_pos,4);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1A00,0x03,&map_ferr,4);
 
             // 设置映射条目数
             uint8_t map_cnt=3;
-            ecx_SDOwrite(&ctx,slave,0x1A00,0x00,FALSE,1,&map_cnt,EC_TIMEOUTRXM);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1A00,0x00,&map_cnt,1);
 
             // 绑定到 TxPDO 分配
             uint16_t pdo_idx=0x1A00;
-            ecx_SDOwrite(&ctx,slave,0x1C13,0x01,FALSE,2,&pdo_idx,EC_TIMEOUTRXM);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1C13,0x01,&pdo_idx,2);
 
             // 启用 TxPDO 分配
             uint8_t one=1;
-            ecx_SDOwrite(&ctx,slave,0x1C13,0x00,FALSE,1,&one,EC_TIMEOUTRXM);
+            sdo_fail |= ecat_sdo_write_verify(slave,0x1C13,0x00,&one,1);
 
-            printf("[PDO] 从站%d TxPDO: 0x6041+0x6064+0x60F4\n", slave);
+            printf("[PDO] 从站%d TxPDO: 0x6041+0x6064+0x60F4 (%s)\n", slave,
+                   (sdo_fail != slave_fail0) ? "校验失败" : "校验通过");
         }
+    }
+    if (sdo_fail) {
+        printf("[ECAT错误] TxPDO 重映射校验失败, 拒绝启动\n");
+        ecx_close(&ctx);
+        exit(-1);
     }
 
     // SOEM 读取更新后的 PDO 映射，自动分配 IOmap 偏移
     ecx_config_map_group(&ctx, IOmap, 0);
     ecx_configdc(&ctx);
 
+    /* DC sync0 只对支持 DC 的站激活: vendored ecx_dcsync0 不判 hasdc (ec_dc.c),
+     * 对无 DC 能力的 I/O 站也会写 DC 寄存器 */
     for(int i=1;i<=ctx.slavecount;i++){
-        ecx_dcsync0(&ctx,i,TRUE,cycletime,0);
+        if (ctx.slavelist[i].hasdc) ecx_dcsync0(&ctx,i,TRUE,cycletime,0);
     }
 
     printf("[ECAT] trun to PRE_OP!\n");
@@ -2294,14 +2755,12 @@ void ecat_bringup(char *ifname)
           ecx_statecheck(&ctx,slave,EC_STATE_PRE_OP,EC_TIMEOUTSTATE);
 
           uint16_t sync_mode=2;
-          int sz=sizeof(sync_mode);
-          int r1=ecx_SDOwrite(&ctx,slave,0x1C32,0x01,FALSE,sz,&sync_mode,EC_TIMEOUTRXM);
-          int r2=ecx_SDOwrite(&ctx,slave,0x1C33,0x01,FALSE,sz,&sync_mode,EC_TIMEOUTRXM);
-          if(r1>0&&r2>0){
-              printf("success to 0x1C32=2\n",g_axis[i].axis_name);
-          }else{
-              printf("fail to 0x1C32=2\n",g_axis[i].axis_name);
+          int r1=ecat_sdo_write_verify(slave,0x1C32,0x01,&sync_mode,2);
+          int r2=ecat_sdo_write_verify(slave,0x1C33,0x01,&sync_mode,2);
+          if(r1==0&&r2==0){
+              printf("[ECAT] 站 %d: 0x1C32/0x1C33 = 2 (DC sync0) 校验通过\n", slave);
           }
+          sdo_fail |= r1 | r2;
           ctx.slavelist[slave].state=EC_STATE_SAFE_OP;
           ecx_writestate(&ctx,slave);
           ecx_statecheck(&ctx,slave,EC_STATE_SAFE_OP,EC_TIMEOUTSTATE);
@@ -2315,15 +2774,20 @@ void ecat_bringup(char *ifname)
 
           uint8_t time_value=1;
           int8_t time_index=-3;
-          int r1=ecx_SDOwrite(&ctx,slave,0x60C2,0x01,FALSE,1,&time_value,EC_TIMEOUTRXM);
-          int r2=ecx_SDOwrite(&ctx,slave,0x60C2,0x02,FALSE,1,&time_index,EC_TIMEOUTRXM);
+          int r1=ecat_sdo_write_verify(slave,0x60C2,0x01,&time_value,1);
+          int r2=ecat_sdo_write_verify(slave,0x60C2,0x02,&time_index,1);
+          sdo_fail |= r1 | r2;
 
-          if(r1>0&&r2>0){
-              printf("success 0x60C2\n",g_axis[i].axis_name);
-          }else{
-              printf("fail to 0x60C2\n",g_axis[i].axis_name);
+          if(r1==0&&r2==0){
+              printf("[ECAT] 站 %d: 0x60C2 插补周期 = 1 x 10^-3 s 校验通过\n", slave);
           }
         }
+    }
+
+    if (sdo_fail) {
+        printf("[ECAT错误] 同步模式 (0x1C32/0x1C33) / 插补周期 (0x60C2) SDO 校验失败, 拒绝启动\n");
+        ecx_close(&ctx);
+        exit(-1);
     }
 
     expectedWKC = ctx.grouplist[0].outputsWKC * 2 + ctx.grouplist[0].inputsWKC;
@@ -2347,12 +2811,28 @@ void ecat_bringup(char *ifname)
 
     for (int i = 0; i < AXIS_NUM; i++)
     {
-        axis_sdo_config_pp(i);
+        if (axis_sdo_config_pp(i) != 0) sdo_fail = 1;
+    }
+    if (sdo_fail) {
+        printf("[ECAT错误] CSP 模式 (0x6060/0x6061) 校验失败, 拒绝进 OP\n");
+        ecx_close(&ctx);
+        exit(-1);
     }
 
     mappingdone = 1;
     dorun = 1;
     osal_usleep(1000000);
+
+    /* 上电位置读数 (2026-11-27): 各轴从站的编码器位置 (0x6064)。判别编码器位置是否断电保持:
+     * 两次上电之间不动机床, 两次读数相同 = 绝对式保持 (G53 可做成绝对机床坐标), 不同 = 增量式。 */
+    for (int i = 0; i < AXIS_NUM; i++) {
+        for (int s = 0; s < g_axis[i].slave_count; s++) {
+            int slave = g_axis[i].slave_ids[s];
+            if (slave <= 0) continue;
+            printf("[ECAT] 上电位置读数: 站 %d (%s) = %d\n", slave,
+                   ecat_slave_role_name(slave), axis_pdo_read_pos(slave));
+        }
+    }
 
     ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
     ecx_writestate(&ctx, 0);

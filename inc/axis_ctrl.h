@@ -7,9 +7,10 @@
 // 1. 五轴系统初始化：配置每个轴的从站ID、轴名、目标位置（核心配置）
 void axis_sys_init(void);
 
-// 2. 单轴SDO配置：给指定轴配置CiA402 PP模式（0x6060=1）
-void axis_sdo_config_pp(int axis_idx);
-void axis_sdo_config_mode(int axis_idx, uint8_t mode);
+// 2. 单轴SDO配置：给指定轴配置CiA402 CSP模式（0x6060=8, 回读 0x6061 校验）
+//    返回 0=全部从站写入并校验通过, -1=参数越界或有从站校验失败 (bring-up 据此拒绝进 OP)
+int axis_sdo_config_pp(int axis_idx);
+int axis_sdo_config_mode(int axis_idx, uint8_t mode);
 
 // 3. 单轴PDO写：写入控制字+目标位置
 void axis_pdo_write(int slave_id, uint16 cw, int32 pos);

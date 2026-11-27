@@ -50,6 +50,15 @@ extern sim_logger_t g_sim_logger;  // 仿真模式双缓冲轨迹采集器
 extern PlannerConfig_t g_planner_config; // 规划器全局参数
 extern _Atomic int g_sys_alarm_state;    // 系统报警状态: 0=正常, 1=软停机报警中
 extern int g_sim_mode;                   // 仿真模式: 1=纯软件仿真, 0=真实硬件
+
+// ---- 逐轴伺服状态汇总 (RT 单写者, Non-RT 只读; bit i = 房间号 i 的轴) ----
+extern _Atomic uint32_t g_servo_ready_mask;     // 轴 i Operation enabled (可受控)
+extern _Atomic uint32_t g_servo_latched_mask;   // 轴 i 故障锁存, 等 System.Reset
+extern _Atomic uint32_t g_servo_config_mask;    // 轴 i 已配置从站
+extern _Atomic int      g_servo_bus_fault;      // 1 = EtherCAT wkc 故障锁存 (RT 置, Non-RT 解除)
+extern _Atomic uint32_t g_servo_bus_fault_seq;  // 总线故障锁存次数 (+1/次), 诊断线程据此取证
+extern _Atomic int      g_servo_sim_bus_inject; // sim-only: 1 = 模拟 wkc 丢失 (测试钩子写)
+extern _Atomic int      g_rt_exit;              // 1 = RT 线程退出主循环 (SMC_Close 在 ecx_close 后置)
 extern LaserConfig_t  g_laser_cfg;       // 激光器配置 (主线程 init 阶段单写者)
 extern LaserRTState_t g_laser_rt;        // 激光器 RT 镜像状态 (RT 线程单写者)
 

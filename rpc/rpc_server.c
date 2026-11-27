@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <poll.h>
 
 #include "smc_protocol.h"
 #include "smc_api.h"
@@ -52,6 +53,16 @@
 #define SMC_RPC_BACKLOG   8
 /* P0-b v2: 扩到 512 容纳 SmcGetProgramStructureRes (~390B, filepath[256] + bbox×2) */
 #define SMC_RESP_BUF_LEN  512    /* 单包响应 payload 缓冲, 所有 Res 都 < 此值 */
+
+/* 关机请求 (2026-11-27): 信号处理函数只置此标志 (async-signal-safe),
+ * 由 main 循环轮询后走 SMC_Close 再退出; RPC CLOSE 回完响应后也置位。
+ * 此前只有 SIGPIPE 被忽略: Ctrl-C / kill 直接杀进程, 不走优雅下电时序。 */
+static volatile sig_atomic_t g_shutdown_req = 0;
+static void on_shutdown_signal(int sig)
+{
+    (void)sig;
+    g_shutdown_req = 1;
+}
 
 /* ---------------------------------------------------------------------
  * recv_all / send_all  —— TCP 粘包/半包/截断的根本治理
@@ -107,6 +118,7 @@ static int send_all(int fd, const void *buf, size_t n)
  *   流程: 读 SmcReqHeader -> 读 payload -> switch 调 SMC_* -> 写响应
  *
  *   返回:  0 = 成功处理完一轮 (可继续下一轮, 复用连接)
+ *          1 = 本轮是 SMC_CMD_CLOSE, 已请求关机 (调用方结束本客户端服务)
  *          -1 = 对端断开或链路错误 (调用方应关闭 fd)
  * ------------------------------------------------------------------ */
 static int handle_client_request(int client_fd)
@@ -116,6 +128,7 @@ static int handle_client_request(int client_fd)
     uint8_t     *payload = NULL;
     uint8_t      resp_buf[SMC_RESP_BUF_LEN];
     size_t       resp_payload_len = 0;
+    int          shutdown_after_reply = 0;   /* SMC_CMD_CLOSE: 回完响应后进程走关机路径 */
 
     memset(&res_hdr, 0, sizeof(res_hdr));
 
@@ -157,9 +170,11 @@ static int handle_client_request(int client_fd)
         break;
     }
     case SMC_CMD_CLOSE: {
-        /* 危险操作: 关闭整个 CNC 内核 (伺服下电、释放网卡)。
-         * 通常由 CNC 服务自身在退出时调用, 暴露给 CAM 仅供监督工具使用。*/
+        /* 关闭整个 CNC 内核 (伺服下电、释放网卡) 并在回完响应后退出进程。
+         * 此前 Close 后进程不退出: RT 线程继续对已关闭的 ctx 发帧, 端口也仍在监听。 */
         SMC_Close();
+        g_shutdown_req = 1;
+        shutdown_after_reply = 1;
         res_hdr.err_code = SMC_OK;
         resp_payload_len = 0;
         break;
@@ -1244,7 +1259,7 @@ static int handle_client_request(int client_fd)
         printf("[rpc] ClearAlarm\n");
         SmcClearAlarmRes *res = (SmcClearAlarmRes *)resp_buf;
         res->ret_code = SMC_ClearAlarm();
-        printf("[rpc] ClearAlarm: 返回码=%d (0=ok, -1=parser busy, -2=axes not ready)\n",
+        printf("[rpc] ClearAlarm: 返回码=%d (0=ok, -1=parser busy, -3=bus not recoverable)\n",
                res->ret_code);
         res_hdr.err_code = SMC_OK;
         resp_payload_len = sizeof(SmcClearAlarmRes);
@@ -1477,6 +1492,29 @@ static int handle_client_request(int client_fd)
         break;
     }
 
+    /* ===== 逐轴伺服使能 (2026-11-27): 0x008D 状态查询 / 0x008E sim 测试钩子 ===== */
+    case SMC_CMD_GET_AXIS_STATUS: {
+        /* 无 Req; Res = 掩码 + 逐轴 (状态/阶段/从站/状态字/故障码/重试次数) */
+        SmcGetAxisStatusRes *res = (SmcGetAxisStatusRes *)resp_buf;
+        res->ret_code = SMC_GetAxisStatus(res);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcGetAxisStatusRes);
+        break;
+    }
+    case SMC_CMD_SERVO_TEST_HOOK: {
+        /* sim-only: 1=置轴故障 2=清注入 3=模拟 wkc 丢失 4=wkc 恢复; 非 sim 返回 -2 */
+        if (req_hdr.data_len < sizeof(SmcServoTestHookReq)) {
+            res_hdr.err_code = SMC_ERR_PARAM; break;
+        }
+        SmcServoTestHookReq *req = (SmcServoTestHookReq *)payload;
+        SmcServoTestHookRes *res = (SmcServoTestHookRes *)resp_buf;
+        res->ret_code = (req->reserved != 0) ? -1
+            : SMC_ServoTestHook(req->op, (char)req->axis_letter, req->slave_sub);
+        res_hdr.err_code = SMC_OK;
+        resp_payload_len = sizeof(SmcServoTestHookRes);
+        break;
+    }
+
     default:
         /* 未知命令: 仍回响应头让客户端可继续下一轮 */
         res_hdr.err_code = SMC_ERR_UNKNOWN_CMD;
@@ -1492,7 +1530,7 @@ static int handle_client_request(int client_fd)
     if (resp_payload_len > 0) {
         if (send_all(client_fd, resp_buf, resp_payload_len) != 0) return -1;
     }
-    return 0;
+    return shutdown_after_reply;   /* 1 = 已请求关机, 调用方结束本客户端服务 */
 }
 
 /* =====================================================================
@@ -1576,17 +1614,19 @@ static int kernel_init(const char *iface)
     SMC_ConfigSoftLimit('C', 1, -730.0, 730.0);
     SMC_ConfigSoftLimit('B', 1, -110.0, 110.0);
 
+    /* 6.5 激光子系统缺省配置: 与 cnc_test (main.c) 一致。rpc_server 此前从未调
+     *    laser_ctrl_init, g_laser_cfg 全靠 BSS 零值 (各 DI/DO 位偏移全为 0)。 */
+    laser_ctrl_init();
+    SMC_ConfigLaserIO(0, 0, 0);   /* 仿真 / 调试档案: 启用激光状态字段输出 */
+
     /* 7. 启动 EtherCAT / 仿真内核 */
     if (SMC_InitAndStart(iface) != 0) {
         fprintf(stderr, "[rpc] 内核启动失败\n");
         return -1;
     }
 
-    /* 等待全轴就绪 */
-    while (!g_all_axis_op_ready) {
-        usleep(100000);
-    }
-
+    /* 等待各轴到终态 (就绪 / 故障锁存)。SMC_InitAndStart 已等过, 这里只是确认 */
+    (void)SMC_WaitServoSettled(1000);
     printf("[rpc] 物理原点锚定, 内核就绪\n");
 
     SMC_SetZero(SMC_AXIS_ALL);
@@ -1640,6 +1680,10 @@ static int kernel_init_hw(const char *iface)
     periph_ai_init();       /* P1.5-1: 外围 AI 通道 */
     plc_core_init();        /* P1: 软 PLC 程序槽 + autoload */
     PreviewStreamer_Init();
+    /* 2026-11-27: 激光子系统缺省值 (须早于 11.6 的档案 PDO 布局应用, 否则会被重置)。
+     * 此前 rpc_server 路径从不调 laser_ctrl_init, g_laser_cfg 全靠 BSS 零值 —
+     * 从站号 0 而非 -1, 实机上互锁 DI 链对 0 号站取数 (恒为 0), DI/DO 位偏移也全是 0。 */
+    laser_ctrl_init();
 
     /* 2. 档案加载 + A/B/C 哨兵校验 (A 级未填 → 拒绝启动, 防 sim 值上实机)。
      *    修复轮 P1-2 (2026-11-24): 显式损坏档案 → load 返回 -1 → 此处
@@ -1794,14 +1838,17 @@ static int kernel_init_hw(const char *iface)
         limit_map_set_runtime((const LimitSrcCfg_t (*)[AXIS_NUM][2])lmt);
     }
 
+    /* 11.9 激光 I/O 站号 (2026-11-27): 实机未接入激光 I/O 端子, 保持 -1 = 未配置 —
+     *    互锁链明确不启用, 待接入后经 RPC 0x0050 配置。
+     *    仿真 (含 sim hw): 与 cnc_test 一致配置 (0,0,0), 激光状态字段与注入链路照常可测。 */
+    if (g_sim_mode) SMC_ConfigLaserIO(0, 0, 0);
+
     /* 12. 启动内核 (实机 = EtherCAT 组态 + CiA402 使能; sim = 软件驱动) */
     if (SMC_InitAndStart(iface) != 0) {
         fprintf(stderr, "[rpc] 内核启动失败\n");
         return -1;
     }
-    while (!g_all_axis_op_ready) {
-        usleep(100000);
-    }
+    (void)SMC_WaitServoSettled(1000);
     printf("[rpc][hw] 内核就绪 (实机参数档案)\n");
 
     /* 注意: 与 sim 不同, 这里【不】自动 SetZero —
@@ -1833,6 +1880,19 @@ int main(int argc, char *argv[])
     /* 客户端断开时忽略 SIGPIPE */
     signal(SIGPIPE, SIG_IGN);
 
+    /* Ctrl-C / kill / systemd stop → 优雅下电 (2026-11-27)。
+     * 处理函数只置标志; 关机动作 (SMC_Close) 在 main 循环里做 — 信号处理函数内不能 printf。
+     * 此前这些信号直接终止进程: RT 线程消失, 驱动器只能靠自身总线超时掉力矩。 */
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = on_shutdown_signal;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+        sigaction(SIGHUP, &sa, NULL);
+    }
+
     /* 初始化内核 */
     if (use_hw_profile) {
         if (kernel_init_hw(argv[1]) != 0) {
@@ -1840,6 +1900,13 @@ int main(int argc, char *argv[])
         }
     } else if (kernel_init(argv[1]) != 0) {
         return 1;
+    }
+
+    /* 初始化期间收到关机信号: 内核已经起来, 这里补做优雅下电 */
+    if (g_shutdown_req) {
+        printf("[rpc] 初始化期间收到关机信号, 下电退出\n");
+        SMC_Close();
+        return 0;
     }
 
     /* 启动 RPC 监听 */
@@ -1886,24 +1953,47 @@ int main(int argc, char *argv[])
         fprintf(stderr, "[opcua] OPC UA 服务启动失败, 仅 RPC/push/preview/event 可用\n");
     }
 
-    /* 接受连接主循环 */
-    for (;;) {
-        int client_fd = accept(listen_fd, NULL, NULL);
-        if (client_fd < 0) {
-            if (errno == EINTR) continue;
-            perror("[rpc] accept");
+    /* 接受连接主循环 (2026-11-27 改 poll):
+     * 同一时刻只服务一个 RPC 客户端 (与原顺序服务模型一致), 但每 500ms 醒来看一次关机标志 —
+     * 原实现的 accept / recv 会无限阻塞, 信号到了也无人处理。 */
+    int client_fd = -1;
+    while (!g_shutdown_req) {
+        struct pollfd pfds[2];
+        int n = 0;
+        pfds[n].fd = listen_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
+        if (client_fd >= 0) {
+            pfds[n].fd = client_fd; pfds[n].events = POLLIN; pfds[n].revents = 0; n++;
+        }
+        int r = poll(pfds, (nfds_t)n, 500);
+        if (r < 0) {
+            if (errno != EINTR) perror("[rpc] poll");
             continue;
         }
-        printf("[rpc] client connected, fd=%d\n", client_fd);
-
-        while (handle_client_request(client_fd) == 0) {
-            /* 处理请求直到对端断开 */;
+        if (client_fd >= 0 && (pfds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            /* 返回 1 = 本轮是 SMC_CMD_CLOSE (已请求关机); -1 = 对端断开或链路错误 */
+            if (handle_client_request(client_fd) != 0) {
+                close(client_fd);
+                printf("[rpc] client disconnected, fd=%d\n", client_fd);
+                client_fd = -1;
+            }
+            continue;
         }
-        close(client_fd);
-        printf("[rpc] client disconnected, fd=%d\n", client_fd);
+        if (pfds[0].revents & POLLIN) {
+            client_fd = accept(listen_fd, NULL, NULL);
+            if (client_fd < 0) {
+                if (errno != EINTR) perror("[rpc] accept");
+                client_fd = -1;
+                continue;
+            }
+            printf("[rpc] client connected, fd=%d\n", client_fd);
+        }
     }
 
+    if (client_fd >= 0) close(client_fd);
     close(listen_fd);
+    printf("[rpc] 收到关机请求, 执行优雅下电...\n");
+    SMC_Close();   /* 幂等: RPC CLOSE 路径已执行过则此处为空操作 */
+    printf("[rpc] 已退出\n");
     return 0;
 }
 

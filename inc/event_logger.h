@@ -65,6 +65,9 @@ extern "C" {
 
 /* ---- event code 规范 (按 source 分段) ----
  * DRIVE=4:   0x0001 sync err / 0x0002 SW_ERROR / 0x0003 follow err hard / 0x0004 follow err warn
+ *            0x000E 使能超时锁存 / 0x000F 伺服故障锁存 (2026-11-27 逐轴使能)
+ *            0x0050 EtherCAT wkc 丢失 (总线故障锁存) / 0x0051 总线取证 (逐站) / 0x0052 总线恢复
+ *            0x0053 伺服故障文字诊断 (WARN; 该轴锁存后 ALARM) / 0x0054 故障复位后重新使能
  * LASER=3:   0x0010 互锁触发 (实际用法: 通用, value=interlock 位图; 0x8000=系统报警联动)
  *            0x0011 estop soft / 0x0012 laser ALM / 0x0013 water/gas (预留细分, 未用)
  *            0x0014 互锁复位 (INFO, value=复位前位图, 与 0x0010 闭环对照; P0-3c 2026-09-09)
@@ -84,6 +87,7 @@ extern "C" {
  *            0x003B 姿态偏差注入 ON/OFF (WARN/INFO, value=line_no; sim 实验装置
  *                    provenance 标记, 由 CNC_POSE_INJECT_* 环境变量门控, 2026-09-30)
  * MANUAL=6:  0x0040 ClearAlarm req / 0x0041 alarm cleared (RT confirmed)
+ *            0x0046 运动请求因伺服未就绪被拒 (JOG / 回零 / 程序启动, 2026-11-27)
  *            0x0044 safe_lift config rejected (over soft limit)
  * CONFIG=7:  0x0001 profile 加载成功 / 0x0002 加载失败回退默认 / 0x0003 参数变更审计
  *            0x0004 参数被拒 / 0x0005 档案落盘 (0=ok, -1=fail) / 0x0006 写保护拒绝

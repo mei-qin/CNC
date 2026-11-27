@@ -25,6 +25,9 @@
 // 底层轴房间号自动分配计数器
 static int g_allocated_axis_count = 0;
 
+// SMC_Close 防重入 (信号关机与 RPC CLOSE 可能并发/重复)
+static _Atomic int g_smc_close_done = 0;
+
 // P0-3: Safe Z Lift 配置 (非RT init 阶段单写者)
 // 默认 enabled=0, z_axis_idx=-1 (未配置), 调 SMC_ConfigSafeLiftZ 后激活
 SafeLiftConfig_t g_safe_lift_cfg = { 0, -1, 50.0, 20.0, 0 };
@@ -41,10 +44,106 @@ static int axis_lookup(char axis_letter) {
     return g_axis_map[c - 'A'];
 }
 
+// ================== 逐轴伺服状态 (2026-11-27) ==================
+// 掩码 bit i = 房间号 i 的轴, 由 RT 每 1ms 汇总发布 (ecat_core.c 逐轴 CiA402 状态机)。
+
+int SMC_IsServoAxisReady(int axis_idx)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return g_all_axis_op_ready;
+    return (int)((atomic_load_explicit(&g_servo_ready_mask, memory_order_acquire) >> axis_idx) & 1u);
+}
+
+int SMC_ServoAxesReady(uint32_t axis_mask)
+{
+    uint32_t rdy = atomic_load_explicit(&g_servo_ready_mask, memory_order_acquire);
+    return (axis_mask & ~rdy) == 0;
+}
+
+int SMC_IsServoSettled(void)
+{
+    uint32_t cfg = atomic_load_explicit(&g_servo_config_mask, memory_order_acquire);
+    uint32_t rdy = atomic_load_explicit(&g_servo_ready_mask, memory_order_acquire);
+    uint32_t lt  = atomic_load_explicit(&g_servo_latched_mask, memory_order_acquire);
+    return cfg != 0 && ((rdy | lt) == cfg)
+        && atomic_load_explicit(&g_servo_bus_fault, memory_order_acquire) == 0;
+}
+
+int SMC_WaitServoSettled(int timeout_ms)
+{
+    for (int t = 0; !SMC_IsServoSettled(); t += 20) {
+        if (t >= timeout_ms) return -1;
+        osal_usleep(20000);
+    }
+    return 0;
+}
+
+int SMC_GetAxisStatus(SmcGetAxisStatusRes *out)
+{
+    if (out == NULL) return -1;
+    memset(out, 0, sizeof(*out));
+    out->config_mask  = atomic_load_explicit(&g_servo_config_mask, memory_order_acquire);
+    out->ready_mask   = atomic_load_explicit(&g_servo_ready_mask, memory_order_acquire);
+    out->latched_mask = atomic_load_explicit(&g_servo_latched_mask, memory_order_acquire);
+    out->bus_fault    = (atomic_load_explicit(&g_servo_bus_fault, memory_order_acquire) != 0);
+    for (int i = 0; i < AXIS_NUM; i++) {
+        SmcAxisStatusEntry_t *e = &out->axis[i];
+        e->state       = (uint8_t)g_axis[i].servo_state;
+        e->fault_stage = g_axis[i].fault_stage;
+        e->fault_slave = g_axis[i].fault_slave;
+        e->status_word = g_axis[i].status_word[0];
+        e->err_code    = (uint16_t)ecat_servo_err_code(i, 0);
+        e->retry_count = g_axis[i].retry_count;
+    }
+    return 0;
+}
+
+// 启动日志: 逐轴使能结果 (故障轴在此点名, 不阻塞启动)
+static void smc_servo_report(void)
+{
+    uint32_t cfg = atomic_load_explicit(&g_servo_config_mask, memory_order_acquire);
+    uint32_t rdy = atomic_load_explicit(&g_servo_ready_mask, memory_order_acquire);
+    uint32_t lt  = atomic_load_explicit(&g_servo_latched_mask, memory_order_acquire);
+    printf("[SMC_API] 伺服使能结果: 就绪掩码=0x%X 锁存掩码=0x%X 配置掩码=0x%X 总线故障=%d\n",
+           rdy, lt, cfg,
+           atomic_load_explicit(&g_servo_bus_fault, memory_order_acquire));
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (!(cfg & (1u << i))) continue;
+        const char *st = (rdy & (1u << i)) ? "就绪"
+                       : (lt  & (1u << i)) ? "故障锁存 (等 System.Reset 重新使能)"
+                                           : "未到终态 (握手中)";
+        printf("[SMC_API]   轴 %s: %s\n", g_axis[i].axis_name, st);
+    }
+}
+
+// 运动请求因伺服未就绪被拒: 事件流给上位机一条可读原因 (value = axis_idx, -1 = 全轴)
+static void smc_reject_servo(int axis_idx, const char *what)
+{
+    printf("[SMC_API] %s (axis=%d)\n", what, axis_idx);
+    EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0046, axis_idx, what);
+}
+
+// sim 测试钩子: SIM_BOOT_FAULT_MS=N → N ms 后自动撤销 SIM_BOOT_FAULT 的注入
+// (验证"故障在自动复位次数用尽前消失 → 自愈重新使能, 不锁存")。仅 sim 路径创建此线程。
+static void *sim_boot_fault_clear_fn(void *arg)
+{
+    int ms = (int)(intptr_t)arg;
+    osal_usleep((uint32_t)ms * 1000u);
+    const char *bf = getenv("SIM_BOOT_FAULT");
+    for (const char *p = bf; p && *p; p++) {
+        int a = axis_lookup(*p);
+        if (a >= 0) sim_drive_clear_fault(a, 0);
+    }
+    return NULL;
+}
+
 // ================== 系统管理 ==================
 int SMC_InitAndStart(const char *netif_name)
 {
     printf("[SMC_API] 正在初始化运动控制内核...\n");
+
+    // 允许经 RPC INIT_AND_START 在 SMC_Close 之后反向重启 (旧兼容路径): 清上一轮的退出/关闭标记
+    atomic_store_explicit(&g_rt_exit, 0, memory_order_release);
+    atomic_store_explicit(&g_smc_close_done, 0, memory_order_relaxed);
 
     // P2-A: 实时倍率字段初始化 (必须在 RT 线程启动前完成)
     // g_interpolator 是 BSS 零初始化全局, override_ratio 必须 1.0 (非零) 才能
@@ -85,6 +184,23 @@ int SMC_InitAndStart(const char *netif_name)
     // 而 sim_cia_advance 对未初始化状态返回原值, 状态机永久卡死。
     if (g_sim_mode) {
         sim_drive_init_all();
+        /* sim 测试钩子: 环境变量 SIM_BOOT_FAULT="Z" 或 "X,Z" — 指定轴的电机开机即处于故障,
+         * 验证"故障轴不阻塞上电、其余轴正常使能、故障上报、System.Reset 后恢复" */
+        const char *boot_fault = getenv("SIM_BOOT_FAULT");
+        for (const char *p = boot_fault; p && *p; p++) {
+            int a = axis_lookup(*p);
+            if (a >= 0 && sim_drive_inject_fault(a, 0) == 0)
+                printf("[SMC_API] SIM_BOOT_FAULT: 轴 %c 电机开机注入故障\n", *p);
+        }
+        const char *boot_fault_ms = getenv("SIM_BOOT_FAULT_MS");
+        if (boot_fault && boot_fault[0] && boot_fault_ms && atoi(boot_fault_ms) > 0) {
+            pthread_t tid;
+            if (pthread_create(&tid, NULL, sim_boot_fault_clear_fn,
+                               (void *)(intptr_t)atoi(boot_fault_ms)) == 0) {
+                pthread_detach(tid);
+                printf("[SMC_API] SIM_BOOT_FAULT_MS: %s ms 后自动撤销注入\n", boot_fault_ms);
+            }
+        }
     }
 
     if (!osal_thread_create_rt(&thread_rt, 128000, &ecat_thread_rt, NULL)) {
@@ -144,14 +260,14 @@ int SMC_InitAndStart(const char *netif_name)
         ecat_bringup((char*)netif_name);
     }
 
-    printf("[SMC_API] 等待伺服全轴使能并进入 CSP 同步...\n");
-    int timeout = 50; // 最多等5秒
-    while (!g_all_axis_op_ready && timeout > 0) {
-        osal_usleep(100000);
-        timeout--;
-    }
-    if (timeout == 0) {
-        printf("[SMC_API] 伺服使能超时！请检查硬件。\n"); return -1;
+    /* 逐轴使能 (2026-11-27): 等每轴走到终态 (就绪 / 故障锁存), 上限 5s。
+     * 故障轴不再阻塞启动 — 进程照常进入服务, 故障轴经快照 v5 / OPC UA / 报警流上报,
+     * 待 System.Reset 重新使能。只有"没有任何已配置的伺服轴"才返回 -1。 */
+    printf("[SMC_API] 等待各轴伺服使能 (逐轴, 故障轴不阻塞)...\n");
+    (void)SMC_WaitServoSettled(5000);
+    smc_servo_report();
+    if (atomic_load_explicit(&g_servo_config_mask, memory_order_acquire) == 0) {
+        printf("[SMC_API] 没有任何已配置的伺服轴, 内核启动失败！\n"); return -1;
     }
 
     // 给系统时钟收敛留时间
@@ -190,6 +306,13 @@ int SMC_InitAndStart(const char *netif_name)
 
 void SMC_Close(void)
 {
+    /* 防重入: 信号关机与 RPC CLOSE 可能并发/重复触发 */
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&g_smc_close_done, &expected, 1)) {
+        printf("[SMC_API] SMC_Close 已执行过, 忽略重复调用\n");
+        return;
+    }
+
     printf("\n[SMC_API] 收到关闭请求，触发优雅下电时序...\n");
 
     // === 关键修复: 必须先让 RT 线程完全停止, 再释放 SimEngine / TraceLogger 资源 ===
@@ -245,6 +368,8 @@ void SMC_Close(void)
         }
         ecx_close(&ctx);
     }
+    /* 网卡已关: RT 线程退出主循环。此前线程会继续以 1ms 周期对已关闭的 ctx 发过程数据帧 */
+    atomic_store_explicit(&g_rt_exit, 1, memory_order_release);
     printf("[SMC_API] 系统已安全关闭！\n");
 }
 
@@ -754,8 +879,16 @@ static int rerun_file_unchanged(void)
 //          已加载态下 filepath 为空,
 //       -3=加工完成态但程序文件自加载后已变更 → 必须重新 LoadProgram
 //          (否则界面预览与实际执行内容不一致)
+//       -4=有伺服轴未就绪 (故障锁存 / 握手中 / 总线故障) — 2026-11-27 逐轴使能门控
 int SMC_RunLoadedProgram(void) {
     if (g_parser_ctrl.is_running) return -2;
+
+    // 伺服门控 (2026-11-27): 程序运动是多轴联动, 要求全部已配置轴使能就绪。
+    // 返回 -4: 有轴未就绪 (故障锁存 / 握手中 / 总线故障), 可读原因见事件流 MANUAL 0x0046。
+    if (!g_all_axis_op_ready) {
+        smc_reject_servo(-1, "program start rejected: servo not all ready");
+        return -4;
+    }
 
     // Stop 闸: 上次 Stop 的清队列尚未被 RT 执行完 (刹停中, 或驱动未就绪而悬挂) 时不得启动,
     // 否则新程序的段会被迟到的清队列丢弃, 或接在残余段之后。
@@ -884,6 +1017,11 @@ int SMC_ResumeStart(void)
 {
     if (g_parser_ctrl.is_running) return -2;
     if (!atomic_load_explicit(&g_program_resume_ready, memory_order_acquire)) return -1;
+    // 伺服门控 (2026-11-27): 续切启动同程序启动, 要求全轴就绪
+    if (!g_all_axis_op_ready) {
+        smc_reject_servo(-1, "program start rejected: servo not all ready");
+        return -4;
+    }
     // 指纹复查: search 之后文件/WCS 又被改 → 冻结作废
     if (resume_fingerprint_check() != 0) {
         atomic_store_explicit(&g_program_resume_ready, 0, memory_order_release);
@@ -1079,23 +1217,53 @@ int SMC_GetProgramStructure(SmcGetProgramStructureRes *out) {
     return 0;
 }
 
-// ================== P1-b: ClearAlarm ==================
+// ================== 复位 (System.Reset / RPC ClearAlarm; 2026-11-27 重构) ==================
+// 顺序: ① 总线故障锁存: Non-RT 把各站恢复到 OP 后解除 (解除不了返回 -3)
+//       ② 对故障锁存的轴提交人工复位 (清重试计数, RT 回 case 0 重新握手);
+//          其余未就绪轴 (握手/自动重试中) 一并清重试计数
+//       ③ 系统报警: 提交 RT 报警复位 (RT 等各轴到终态后在安全点执行)
+// 此前"有轴未就绪即拒绝 (-2)": 轴一旦故障就永远无法复位, 只能靠自动复位循环。
+// 返回: 0=已受理 (或无事可做), -1=parser 正在运行, -3=总线故障尚未恢复
 int SMC_ClearAlarm(void) {
     /* 安全闸: parser 正在跑时拒绝清 alarm, 防 RT 清队列时撞刀。
-     * 用户应先 AbortProcessing 停程序, 再 ClearAlarm。 */
+     * 用户应先 Stop 程序, 再 Reset。 */
     if (g_parser_ctrl.is_running) {
         EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0040, -1,
-                         "ClearAlarm rejected: parser running, AbortProcessing first");
+                         "ClearAlarm rejected: parser running, stop program first");
         return -1;
     }
-    if (!g_all_axis_op_ready) {
-        EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0040, -2,
-                         "ClearAlarm rejected: axes not op-ready");
-        return -2;
+
+    uint32_t cfg = atomic_load_explicit(&g_servo_config_mask, memory_order_acquire);
+    uint32_t lt  = atomic_load_explicit(&g_servo_latched_mask, memory_order_acquire);
+    int alarm = (atomic_load_explicit(&g_sys_alarm_state, memory_order_acquire) != 0);
+    int bus   = (atomic_load_explicit(&g_servo_bus_fault, memory_order_acquire) != 0);
+
+    if (!alarm && !bus && (lt & cfg) == 0) {
+        printf("[SMC_API] ClearAlarm: 无报警、无锁存轴, 无需复位\n");
+        return 0;
     }
+
+    if (bus) {
+        if (ecat_bus_recover() != 0) {
+            EventLogger_Push(SEVERITY_WARN, SOURCE_MANUAL, 0x0040, -3,
+                             "ClearAlarm rejected: EtherCAT bus not recoverable yet");
+            return -3;
+        }
+    }
+
+    int n_reset = 0;
+    for (int i = 0; i < AXIS_NUM; i++) {
+        if (!(cfg & (1u << i))) continue;
+        if ((lt & (1u << i)) || !SMC_IsServoAxisReady(i)) {
+            atomic_store_explicit(&g_axis[i].fault_reset_req, 1, memory_order_release);
+            n_reset++;
+        }
+    }
+
     EventLogger_Push(SEVERITY_INFO, SOURCE_MANUAL, 0x0040, 0,
-                     "ClearAlarm requested by UI");
-    api_alarm_reset();   /* axis_ctrl.c:756, 设 alarm_reset_request 让 RT 异步清 */
+                     (n_reset > 0) ? "servo fault reset + ClearAlarm requested by UI"
+                                   : "ClearAlarm requested by UI");
+    if (alarm) api_alarm_reset();   /* 设 alarm_reset_request, RT 等各轴到终态后在安全点执行 */
     return 0;
 }
 
@@ -1145,6 +1313,21 @@ int SMC_InjectAxisFault(char axis_letter, int slave_subidx)
     printf("[SMC_API] 注入故障: 轴 %c motor %d\n",
            toupper((unsigned char)axis_letter), slave_subidx);
     return sim_drive_inject_fault(idx, slave_subidx);
+}
+
+// ================== sim-only 伺服测试钩子 (2026-11-27) ==================
+// 非 sim 返回 -2。op: 1=置轴故障 2=清除注入 (电机停在 Fault, 等故障复位上升沿)
+//              3=模拟 wkc 丢失 (总线故障) 4=wkc 恢复
+int SMC_ServoTestHook(int op, char axis_letter, int slave_sub)
+{
+    if (!g_sim_mode) return -2;
+    if (op == 3) { atomic_store_explicit(&g_servo_sim_bus_inject, 1, memory_order_release); return 0; }
+    if (op == 4) { atomic_store_explicit(&g_servo_sim_bus_inject, 0, memory_order_release); return 0; }
+    int idx = axis_lookup(axis_letter);
+    if (idx < 0) return -1;
+    if (op == 1) return sim_drive_inject_fault(idx, slave_sub);
+    if (op == 2) return sim_drive_clear_fault(idx, slave_sub);
+    return -1;
 }
 
 // B2 (2026-07-23): sim 模式注入双驱龙门静态差 (pre-align 验证用)
@@ -1856,6 +2039,11 @@ int SMC_HomeAxis(char axis_letter)
                toupper((unsigned char)axis_letter));
         return -1;
     }
+    // 伺服门控 (2026-11-27 逐轴): 仅要求回零轴就绪
+    if (!SMC_IsServoAxisReady(idx)) {
+        smc_reject_servo(idx, "homing rejected: axis servo not ready");
+        return -3;
+    }
     if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
         printf("[SMC_API] HomeAxis 系统运行中, 先 Abort\n");
         return -1;
@@ -1888,6 +2076,11 @@ int SMC_HomeAll(void)
     if (!g_homing_cfg.enabled || g_homing_cfg.order_count == 0) {
         printf("[SMC_API] HomeAll 未配置, 调 SMC_ConfigHomingAll 先\n");
         return -1;
+    }
+    // 伺服门控 (2026-11-27): Home.All 是全轴动作, 要求全部已配置轴就绪
+    if (!g_all_axis_op_ready) {
+        smc_reject_servo(-1, "homing rejected: servo not all ready");
+        return -3;
     }
     if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
         printf("[SMC_API] HomeAll 系统运行中, 先 Abort\n");
@@ -1948,6 +2141,13 @@ int SMC_HomeOrder(const char *axis_letters)
     if (count == 0) {
         printf("[SMC_API] HomeOrder 无有效轴\n");
         return -1;
+    }
+    // 伺服门控 (2026-11-27 逐轴): 只要求参与回零的轴就绪
+    for (int k = 0; k < count; k++) {
+        if (!SMC_IsServoAxisReady(order[k])) {
+            smc_reject_servo(order[k], "homing rejected: axis servo not ready");
+            return -3;
+        }
     }
 
     if (g_parser_ctrl.is_running || !is_trajectory_finished()) {
@@ -2067,6 +2267,11 @@ int SMC_JogStart(char axis_letter, int direction, double speed_mm_s)
         printf("[SMC_API] JogStart speed=%.2f 必须 > 0\n", speed_mm_s);
         return -1;
     }
+    // 伺服门控 (2026-11-27 逐轴): 仅要求本轴 Operation enabled, 他轴故障不影响本轴寸动
+    if (!SMC_IsServoAxisReady(idx)) {
+        smc_reject_servo(idx, "JOG rejected: axis servo not ready");
+        return -3;
+    }
     // 三功能互斥。homing DONE(3) 除外 — 已完成静止态, 不占用资源
     // (PENDING/RUNNING/FAULT 仍封锁; FAULT 需 System.Reset 确认, 保持工业语义)。
     // 背景: 回零完成后 state 停在 3 不自动回 IDLE (仅 CancelHoming/报警复位清),
@@ -2182,7 +2387,9 @@ int SMC_GetCurrentTool(int *tool_id)
 int SMC_GetLaserState(SmcGetLaserStateRes *out)
 {
     if (!out) return -1;
-    if (g_laser_cfg.do_slave_id < 0) { out->ret_code = -1; return -1; }
+    /* 2026-11-27: IO 从站未配置 (do_slave_id < 0, 实机档案尚未接激光 I/O 站) 时不再提前返回 —
+     * 状态镜像 (使能/光闸/互锁/出光时长) 与 IO 是否接线无关, 上位机 Laser.* 节点照常可读;
+     * 仅以 ret_code = -1 标记"未配置 IO 从站"。 */
 
     // ---- 状态字段 (镜像 g_laser_rt) ----
     out->enable           = g_laser_rt.enable;
@@ -2232,8 +2439,9 @@ int SMC_GetLaserState(SmcGetLaserStateRes *out)
     out->pierce_count     = g_laser_rt.pierce_count;
     out->laser_on_time_ms = g_laser_rt.laser_on_time_ms;
 
-    out->ret_code = 0;
-    return 0;
+    // ret_code: 0 = IO 从站已配置, -1 = 未配置 (状态字段仍有效)
+    out->ret_code = (g_laser_cfg.do_slave_id < 0) ? -1 : 0;
+    return out->ret_code;
 }
 
 // @Thread-Safety: 单写者 (此 API), 单读者 (parser M1 分支)

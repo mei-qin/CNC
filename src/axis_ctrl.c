@@ -806,7 +806,19 @@ static int api_push_trajectory_impl_inner(double target_pos[AXIS_NUM],
         printf("[SAFETY] 系统报警中，拒绝入队运动指令！\n");
         return -1;
     }
-    if(!g_all_axis_op_ready) return -1;
+    /* 伺服门控 (2026-11-27 逐轴): 本段实际移动的轴必须都已 Operation enabled。
+     * 段内不动他轴的指令 (单轴寸动等) 不因他轴故障被拒; 程序启动另在 SMC_RunLoadedProgram
+     * 要求全轴就绪。就绪掩码由 RT 每 1ms 发布。 */
+    {
+        uint32_t need = 0;
+        for (int j = 0; j < AXIS_NUM; j++) {
+            if (target_pos[j] > plan_cursor[j] + 1e-9 || target_pos[j] < plan_cursor[j] - 1e-9)
+                need |= (1u << j);
+        }
+        uint32_t cfg = atomic_load_explicit(&g_servo_config_mask, memory_order_acquire);
+        uint32_t rdy = atomic_load_explicit(&g_servo_ready_mask, memory_order_acquire);
+        if (cfg == 0 || (need & ~rdy) != 0) return -1;
+    }
     if(!check_soft_limits(target_pos)) return -1;
 
     if(speed_sec_mm <= 0.0) {
@@ -1585,10 +1597,10 @@ void axis_sys_init(void)
 }
 
 /************************ 单轴SDO配置PP模式 ************************/
-void axis_sdo_config_pp(int axis_idx)
+int axis_sdo_config_pp(int axis_idx)
 {
     
-    axis_sdo_config_mode(axis_idx, CSP_MODE);
+    return axis_sdo_config_mode(axis_idx, CSP_MODE);
     
     
     /*if (axis_idx < 0 || axis_idx >= AXIS_NUM)
@@ -1616,20 +1628,35 @@ void axis_sdo_config_pp(int axis_idx)
 
 }
 
-void axis_sdo_config_mode(int axis_idx, uint8_t mode)
+int axis_sdo_config_mode(int axis_idx, uint8_t mode)
 {
-    if (g_sim_mode) return; // 仿真模式: 跳过真实 SDO 写入
+    if (g_sim_mode) return 0; // 仿真模式: 跳过真实 SDO 写入
     if (axis_idx < 0 || axis_idx >= AXIS_NUM)
     {
         printf("[SDO错误] 轴索引越界！输入索引：%d，最大索引：%d\n", axis_idx, AXIS_NUM-1);
-        return;
+        return -1;
     }
-    if (g_axis[axis_idx].is_error) return;
+    if (g_axis[axis_idx].is_error) return 0;
 
     int sz = sizeof(mode);
+    int fail = 0;
     // 1.写入CiA402模式值（0x6060）
     for(int s=0;s<g_axis[axis_idx].slave_count;s++){
         int wkc = ecx_SDOwrite(&ctx, g_axis[axis_idx].slave_ids[s], 0x6060, 0x00, FALSE, sz, &mode, EC_TIMEOUTRXM);
+        /* 回读 0x6061 (Modes of operation display) 校验 (2026-11-27):
+         * 驱动器未真正进 CSP 时, 后续 CSP 目标位置写入无效, 主站此前无从得知。 */
+        uint8_t mode_rd = 0;
+        int rsz = (int)sizeof(mode_rd);
+        int wkc_rd = (wkc > 0)
+            ? ecx_SDOread(&ctx, g_axis[axis_idx].slave_ids[s], 0x6061, 0x00, FALSE, &rsz, &mode_rd, EC_TIMEOUTRXM)
+            : 0;
+        if (wkc_rd <= 0 || rsz != (int)sizeof(mode_rd) || mode_rd != mode) {
+            printf("[SDO错误] 站 %d (%s): 0x6060=%u 写入/回读 0x6061 校验失败 "
+                   "(回读=%u, write wkc=%d, read wkc=%d) — 拒绝进 OP\n",
+                   g_axis[axis_idx].slave_ids[s], g_axis[axis_idx].axis_name,
+                   (unsigned)mode, (unsigned)mode_rd, wkc, wkc_rd);
+            fail = 1;
+        }
         osal_usleep(200000); 
 
         //sz=sizeof(g_axis[axis_idx].pp_target_pos);
@@ -1637,6 +1664,7 @@ void axis_sdo_config_mode(int axis_idx, uint8_t mode)
         //osal_usleep(200000);
            // 2. 读回当前模式，验证是否配置成功
     }
+    return fail ? -1 : 0;
 }
 
 // SDO读取函数（读取指定索引/子索引的值）
@@ -1704,13 +1732,11 @@ uint16 axis_pdo_read_sw(int slave_id)
     // 1. 基础校验：索引越界/轴故障/从站ID无效
     if (slave_id <= 0 || slave_id > ctx.slavecount) return 0xFFFF;
 
-    // 2. 重试获取PDO输入缓冲区（防偶发空指针）
-    uint8 *in = NULL;
-    for (int retry = 0; retry < 2; retry++) {
-        in = ctx.slavelist[slave_id].inputs;
-        if (in) break;
-        osal_usleep(1000); // 1ms重试间隔
-    }
+    // 2. 取 PDO 输入缓冲区; 为空 (拓扑未就绪) 按"状态字无效"处理。
+    //    本函数在硬 RT 线程调用: 不能 sleep 重试, 也不能解引用空指针 (0xFFFF 含故障位,
+    //    状态机会按故障取证 → 上报, 而不是静默读到 0)。
+    uint8 *in = ctx.slavelist[slave_id].inputs;
+    if (!in) return 0xFFFF;
 
     // 3. 解析状态字（小端序：低字节在前，高字节在后）
     uint16 sw = (uint16)(in[PDO_SW_BYTE1] << 8 | in[PDO_SW_BYTE0]);

@@ -57,7 +57,8 @@ extern "C" {
 
 /* ---- 帧标识 (与 SmcPushFrameHeader.magic 一致) ---- */
 #define SMC_SNAPSHOT_MAGIC    0x534E4150u   /* "SNAP" little-endian */
-#define SMC_SNAPSHOT_VERSION  4u   /* v4: P2-A 实时倍率字段 (2026-07-16).
+#define SMC_SNAPSHOT_VERSION  5u   /* v5: 逐轴伺服状态字段 (2026-11-27, 契约 §29-2, 追加在结构体末尾)
+                                    *      v4: P2-A 实时倍率字段 (2026-07-16)
                                     *      v3: 加 current_seg_id + segment_progress 字段 (2026-07-13, P0-c) */
 
 #pragma pack(push, 1)
@@ -70,6 +71,7 @@ extern "C" {
 #define SMC_SNAP_FLAG_WAIT_MCODE  0x00000010u   /* g_interpolator.is_waiting_mcode */
 #define SMC_SNAP_FLAG_RESUME_READY 0x00000020u  /* 断点续切: SEARCH 已冻结边界, 可 ResumeStart
                                                  * (g_program_resume_ready==1, UI 显示"可续切"按钮) */
+#define SMC_SNAP_FLAG_SERVO_FAULT  0x00000040u  /* v5: 有轴故障锁存或总线故障锁存 (2026-11-27) */
 
 /* P0-a 状态快照结构 (~200B, AXIS_NUM=5)
  *
@@ -170,6 +172,20 @@ typedef struct {
     int32_t current_seg_is_exact_stop;  /* P2-A-4: 当前段 is_exact_stop 镜像 (RT 段消费环同步),
                                            供客户端/测试识别精准停拐角 (G09/G61=1, G64=0).
                                            复用原 _tail_pad 预留位, 保持 SNAP_SIZE=440 不变. */
+
+    /* === v5: 逐轴伺服状态 (RT 单写者, 2026-11-27; 字段追加在末尾, 9528 SDK 校验版本号) ===
+     * axis_servo_state: 0=IDLE 1=ENABLING 2=OP_ENABLED 3=FAULT_PROBE 4=FAULT_LATCHED 5=BUS_FAULT
+     *   (与 CNC Core 的 ServoState_t 数值一致; 本头文件不依赖 axis_cfg.h)
+     * servo_ready_mask / servo_latched_mask / servo_config_mask: bit i = 房间号 i 的轴
+     *   (房间号序 = 轴配置顺序)。Axis.Active = ready_mask 对应位; 全轴就绪 = ready == config。 */
+    uint8_t  axis_servo_state[AXIS_NUM];
+    uint8_t  bus_fault;                    /* 1 = EtherCAT wkc 故障锁存 (状态字为残留值) */
+    uint8_t  _pad8[2];
+    uint16_t axis_status_word[AXIS_NUM];   /* 各轴主驱 CiA402 状态字原始值 */
+    uint16_t _pad16_v5;
+    uint32_t servo_ready_mask;             /* bit i = 轴 i Operation enabled */
+    uint32_t servo_latched_mask;           /* bit i = 轴 i 故障锁存, 等 System.Reset */
+    uint32_t servo_config_mask;            /* bit i = 轴 i 已配置从站 */
 } SMC_Snapshot_t;
 
 #pragma pack(pop)

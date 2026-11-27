@@ -118,6 +118,30 @@ typedef uint16_t uint16;
 
 #define MCODE_WAIT_TIMEOUT_MS  5000  // M代码等待绝对超时（ms），防止队列死锁
 
+/************************ 逐轴伺服使能 (2026-11-27) ************************/
+/* RT 线程逐轴跑 CiA402 状态机, 每轴独立走到终态 (就绪 / 故障锁存),
+ * 他轴故障不阻塞本轴使能; 汇总为掩码供门控与上位机读取。 */
+typedef enum {
+    SERVO_IDLE = 0,        /* 未开始握手 (上电初期 / 总线故障解除后) */
+    SERVO_ENABLING,        /* CiA402 握手中 (case 0/1/2) */
+    SERVO_OP_ENABLED,      /* Operation enabled: 力矩保持, 可受控 */
+    SERVO_FAULT_PROBE,     /* 故障已检出: 整轴撤销使能, 等诊断线程读回驱动器故障码 */
+    SERVO_FAULT_LATCHED,   /* 自动复位超限 / 使能超时: 等 System.Reset */
+    SERVO_BUS_FAULT,       /* EtherCAT wkc 故障锁存: 状态字不可信 */
+} ServoState_t;
+
+/* fault_stage: 故障被检出时轴所处的阶段 (诊断线程据此组织文字) */
+#define SERVO_FAULT_STAGE_INIT    0   /* 上电握手 (case 0/1/2) */
+#define SERVO_FAULT_STAGE_RUN     1   /* 运行期 (case 3) */
+#define SERVO_FAULT_STAGE_TIMEOUT 2   /* 握手停留超时 (驱动器未到位, 无故障位) */
+
+#define SERVO_ENABLE_TIMEOUT_MS   4000  /* 单轴握手停留上限 (输出生效后计时), 超时锁存 */
+#define SERVO_FAULT_RETRY_MAX        3  /* 自动故障复位次数上限, 超限锁存等 System.Reset */
+#define SERVO_FAULT_PROBE_MS        50  /* 故障取证等待上限 (诊断线程读 0x603F) */
+#define SERVO_FAULT_RESET_WAIT_MS  500  /* 发出故障复位后等故障位清除的上限, 超时判复位无效 */
+#define SERVO_STABLE_MS           2000  /* 轴在 Operation enabled 连续停留满此时长, 清重试计数 */
+#define SERVO_WKC_FAULT_MS           3  /* wkc != expectedWKC 连续周期数, 达到即锁存总线故障 */
+
 /************************ 跟随误差监控参数 ************************/
 #define FOLLOW_ERR_MAX_PULSE     5000   // 跟随误差硬限（脉冲），超过立即停机
 #define FOLLOW_ERR_WARN_PULSE    3000   // 跟随误差警告阈值（脉冲）
@@ -205,7 +229,23 @@ typedef struct {
     int _current_sync_timer;    // 同步误差计时器（ms），用于跟踪同步异常持续时间
 
     int32_t _follow_err_timer;  // 跟随误差警告持续时间计时器（ms）
-    
+
+    // ⑥ 逐轴伺服状态 (RT 单写者; 带 _req 的由 Non-RT 写, RT 读后清)
+    int      servo_state;                               // ServoState_t
+    int      enable_wait_ms;                            // 本次握手已停留 ms (case 0/1/2 累计)
+    int      op_stable_ms;                              // case 3 连续停留 ms
+    int      retry_count;                               // 本轮已用掉的自动复位次数
+    int      fault_seen;                                // 本次使能过程中出过故障 (回 case 3 时发恢复事件)
+    int      hold_fixed;                                // 故障后重新使能且插补器刹停: 指令位固定在重锚定值, 不追随插补器
+    uint8_t  fault_stage;                               // SERVO_FAULT_STAGE_*
+    uint8_t  fault_step;                                // 检出时所处的 cia_step
+    int8_t   fault_slave;                               // 检出故障的从站子下标, -1 = 无
+    uint16_t fault_sw;                                  // 检出时该从站的状态字
+    uint16_t status_word[MAX_SLAVES_PER_AXIS];          // 本周期各从站状态字 (总线故障时为残留值)
+    _Atomic uint32_t fault_seq;                         // 每检出一次故障 +1, 诊断线程据此取证
+    _Atomic int    fault_probe_done;                    // 诊断线程取证完成置 1, RT 读后清
+    _Atomic int    fault_reset_req;                     // System.Reset: 人工复位 (清重试计数)
+
 } AxisCtrl_t;
 
 /************************ 规划器全局参数 ************************/

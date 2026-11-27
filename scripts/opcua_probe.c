@@ -25,6 +25,8 @@
 /* CNC 端程序根目录 (与 rpc/opcua_server.c 对齐): SMC_PROGRAM_DIR 环境变量
  * 优先, 默认开发机路径。main() 开头初始化 (实机用户名可能不同, 如 server) */
 #define PROBE_NC_DIR_DEFAULT "/home/server/nc"
+/* CiA402 状态字 bit3 = 故障 (与 CNC Core 的 SW_ERROR 同值; 探针不依赖内核头文件) */
+#define SW_ERROR_PROBE 0x0008
 static char PROBE_NC_SHARED[512];
 static char PROBE_NC_DIR[448];
 
@@ -83,6 +85,18 @@ static int read_string(UA_Client *c, const char *id, char *out, size_t outsz)
     } else {
         out[0] = '\0';
     }
+    UA_Variant_clear(&v);
+    return ok ? 0 : -1;
+}
+
+/* 伺服状态节点 (2026-11-27): UInt16 状态字 (Boolean 用下方既有的 read_bool) */
+static int read_u16(UA_Client *c, const char *id, uint16_t *out)
+{
+    UA_Variant v;
+    UA_Variant_init(&v);
+    UA_StatusCode sc = read_variant(c, id, &v);
+    int ok = (sc == UA_STATUSCODE_GOOD) && UA_Variant_hasScalarType(&v, &UA_TYPES[UA_TYPES_UINT16]);
+    if (ok) *out = *(UA_UInt16 *)v.data;
     UA_Variant_clear(&v);
     return ok ? 0 : -1;
 }
@@ -330,6 +344,73 @@ int main(int argc, char *argv[])
         check(ok_prog, "Read CNC.Axis.X.ProgramPosition (Double mm)", NULL);
         check(ok_rem,  "Read CNC.Axis.X.RemainingDistance (Double)", NULL);
         check(ok_act,  "Read CNC.Axis.X.Active (Boolean)", NULL);
+
+        /* ---- 伺服状态 (2026-11-27, 契约 §24/§25)。
+         *     默认模式: 9527 开始监听时各轴已到终态, sim 无故障注入 → 全轴 Operation enabled。
+         *     故障场景 (环境变量 OPCUA_PROBE_SERVO_FAULT=1, 服务端以 SIM_BOOT_FAULT=Z 启动):
+         *       Z 轴故障锁存 → Z.Active=false / ServoOk=false / 报警列表有 Z 轴文字, 其余轴正常 ---- */
+        {
+            int servo_fault_mode = (getenv("OPCUA_PROBE_SERVO_FAULT") != NULL);
+            UA_Boolean servo_ok = 0, z_active = 1;
+            uint16_t sw = 0, z_sw = 0;
+            int32_t alarm_code = -12345, alarm_cnt2 = -1;
+            int ok_sw   = read_u16(client, "CNC.Axis.X.StatusWord", &sw) == 0;
+            int ok_code = read_int(client, "CNC.Axis.X.DriveAlarmCode", &alarm_code) == 0;
+            int ok_serv = read_bool(client, "CNC.Safety.ServoOk", &servo_ok) == 0;
+            int ok_zsw  = read_u16(client, "CNC.Axis.Z.StatusWord", &z_sw) == 0;
+            int ok_zact = read_bool(client, "CNC.Axis.Z.Active", &z_active) == 0;
+            read_int(client, "CNC.Alarm.Count", &alarm_cnt2);
+            printf("        X: StatusWord=0x%04X DriveAlarmCode=%d ServoOk=%d | "
+                   "Z: Active=%d StatusWord=0x%04X Alarm=%d\n",
+                   sw, alarm_code, (int)servo_ok, (int)z_active, z_sw, alarm_cnt2);
+            check(ok_act && active == 1,        "CNC.Axis.X.Active == true (enabled)", NULL);
+            check(ok_sw,                         "Read CNC.Axis.X.StatusWord (UInt16)", NULL);
+            check(ok_sw && (sw & 0x006F) == 0x0027,
+                  "CNC.Axis.X.StatusWord == Operation enabled", NULL);
+            check(ok_code,                       "Read CNC.Axis.X.DriveAlarmCode (Int32)", NULL);
+            check(ok_code && alarm_code == 0,    "CNC.Axis.X.DriveAlarmCode == 0", NULL);
+            check(ok_serv,                       "Read CNC.Safety.ServoOk (Boolean)", NULL);
+            check(ok_serv && servo_ok == !servo_fault_mode,
+                  servo_fault_mode ? "CNC.Safety.ServoOk == false (Z latched)"
+                                   : "CNC.Safety.ServoOk == true", NULL);
+            check(ok_zact && z_active == !servo_fault_mode,
+                  servo_fault_mode ? "CNC.Axis.Z.Active == false (latched)"
+                                   : "CNC.Axis.Z.Active == true", NULL);
+            if (!servo_fault_mode) {
+                check(ok_zsw && (z_sw & 0x006F) == 0x0027,
+                      "CNC.Axis.Z.StatusWord == Operation enabled", NULL);
+            } else {
+                /* sim 驱动器 Fault 态状态字 = SW_ERROR (0x0008); 实机各驱动器 Fault 态位定义以其手册为准 */
+                check(ok_zsw && (z_sw & SW_ERROR_PROBE) != 0,
+                      "CNC.Axis.Z.StatusWord has fault bit", NULL);
+                check(alarm_cnt2 >= 1, "CNC.Alarm.Count >= 1 (servo fault)", NULL);
+                {
+                    UA_Variant lv;
+                    UA_Variant_init(&lv);
+                    int has_text = 0;
+                    if (read_variant(client, "CNC.Alarm.List", &lv) == UA_STATUSCODE_GOOD &&
+                        UA_Variant_hasArrayType(&lv, &UA_TYPES[UA_TYPES_STRING])) {
+                        UA_String *arr = (UA_String *)lv.data;
+                        for (size_t k = 0; k < lv.arrayLength; k++) {
+                            char row[160] = {0};
+                            size_t len = (arr[k].length < sizeof(row) - 1) ? arr[k].length : sizeof(row) - 1;
+                            memcpy(row, arr[k].data, len);
+                            if (strstr(row, "Z servo fault") || strstr(row, "servo fault latched"))
+                                has_text = 1;
+                        }
+                    }
+                    UA_Variant_clear(&lv);
+                    check(has_text, "CNC.Alarm.List has 'Z servo fault' text", NULL);
+                }
+            }
+            if (servo_fault_mode) {
+                /* 故障场景只核对伺服状态面: 程序/寸动等后续段落在此模式下按设计应被拒绝 */
+                printf("=== RESULT: %d PASS, %d FAIL === (servo fault scenario)\n", g_pass, g_fail);
+                UA_Client_disconnect(client);
+                UA_Client_delete(client);
+                return (g_fail == 0) ? 0 : 1;
+            }
+        }
     }
 
     /* ---- 3c. Alarm.List 数组节点 (可为空数组, 但类型必须是 String[]) ---- */

@@ -16,10 +16,12 @@ extern "C" {
 // 系统生命周期管理 API
 // =======================================================
 // 初始化并启动系统 (包含 EtherCAT 组网、线程启动、伺服上电握手)
-// 阻塞函数，直到全轴就绪返回 0，失败返回 -1
+// 阻塞到每轴走到终态 (就绪 / 故障锁存) 或 5s 为止, 返回 0。
+// 2026-11-27 起故障轴不再阻塞启动: 其余轴照常使能, 故障轴经快照 v5 / OPC UA / 报警流上报,
+// 待 System.Reset 重新使能。仅当没有任何已配置的伺服轴时返回 -1。
 int SMC_InitAndStart(const char *netif_name);
 
-// 安全关闭系统 (伺服优雅下电，释放网卡)
+// 安全关闭系统 (伺服优雅下电，释放网卡)。幂等: 重复调用只执行一次。
 void SMC_Close(void);
 
 // =======================================================
@@ -388,6 +390,32 @@ int SMC_InjectSimLimitInput(int slave_id, int valid, uint32_t word);
 //   out_entries: AXIS_NUM*2 条目 (轴主序, + 在前 − 在后), 结构见 smc_protocol.h
 // 返回: 0=成功
 int SMC_QueryLimitDiag(SmcLimitDiagEntry_t *out_entries);
+
+// =======================================================
+// 逐轴伺服状态 (2026-11-27) — 掩码 bit i = 房间号 i 的轴, 由 RT 每 1ms 发布
+// =======================================================
+// 轴是否 Operation enabled (axis_idx 越界时按全轴就绪判)。门控约定:
+//   程序启动 / Home.All 要求全部已配置轴就绪; 单轴 JOG / 单轴回零 / 增量寸动只要求相关轴就绪
+int SMC_IsServoAxisReady(int axis_idx);
+
+// axis_mask 中列出的轴是否全部就绪
+int SMC_ServoAxesReady(uint32_t axis_mask);
+
+// 每轴都已到终态 (就绪 或 故障锁存) 且总线无故障
+int SMC_IsServoSettled(void);
+
+// 阻塞等待 SMC_IsServoSettled, 上限 timeout_ms。返回 0=已到终态, -1=超时 (轴仍在握手中)
+int SMC_WaitServoSettled(int timeout_ms);
+
+// 逐轴伺服状态查询 (契约 §25 / §28.2)。out 见 smc_protocol.h SmcGetAxisStatusRes。
+// 返回: 0=成功, -1=out 为空
+int SMC_GetAxisStatus(SmcGetAxisStatusRes *out);
+
+// sim-only 伺服测试钩子 (非 sim 返回 -2):
+//   op 1=置轴故障 (axis_letter 轴的 slave_sub 电机)  2=清除该注入 (电机停在 Fault, 等故障复位)
+//   op 3=模拟 wkc 丢失 (总线故障)                     4=wkc 恢复
+// 返回: 0=成功, -1=参数/op 非法, -2=非 sim 模式
+int SMC_ServoTestHook(int op, char axis_letter, int slave_sub);
 
 // P1.5-2 (2026-09-15): PLC 用户变量强制 (输出强制语义, 周期末覆写)
 // name: 变量名 (大小写不敏感); name 空且 on=0 = 清除全部; 仅 RUNNING 有效

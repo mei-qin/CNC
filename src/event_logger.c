@@ -52,11 +52,28 @@ static uint64_t g_persist_last_seq = 0;
 static uint64_t g_boot_id_counter = 0;
 static char g_persist_dir[256] = {0};
 static char g_persist_current_file[512] = {0};
+/* Init 回放结束时的 write_seq = 本次会话第一条新事件的序号。
+ * 持久化线程从这里开始写, 初始化阶段 (含伺服使能握手) 的事件才不会漏掉落盘。 */
+static uint64_t g_replay_end_seq = 0;
+
+static int find_latest_persist_file(const char *dir_path, char *out_path, size_t out_size);
+static int replay_persist_file(const char *file_path);
 
 int EventLogger_Init(void)
 {
     memset(g_event_ring, 0, sizeof(g_event_ring));
     atomic_store_explicit(&g_event_write_seq, 0, memory_order_release);
+
+    /* C1 修正 (2026-11-27): 上电回放改在这里做, 即任何事件入环之前。
+     * 此前回放在 StartPersistThread 里做: 回放把历史事件写回 ring 并把 write_seq 置为
+     * 历史值, 于是 Init 之后、持久化线程启动之前 (内核初始化 + 伺服使能握手) 产生的事件
+     * 全部被覆盖, 环里和落盘文件里都没有。只有第一次上电 (没有历史文件) 看不出问题,
+     * 实机上每次启动都会丢 — 开机伺服故障的检测/诊断/锁存事件正落在这个窗口。 */
+    char latest[512];
+    if (find_latest_persist_file(EVENT_PERSIST_DIR, latest, sizeof(latest)) == 0) {
+        replay_persist_file(latest);
+    }
+    g_replay_end_seq = EventLogger_GetWriteSeq();
 
     /* C1: 重置持久化状态 (实际启动在 StartPersistThread) */
     g_persist_fp = NULL;
@@ -312,11 +329,7 @@ int EventLogger_StartPersistThread(const char *dir_path, uint64_t *out_boot_id)
         }
     }
 
-    /* 扫描最新文件 → 回放 */
-    char latest[512];
-    if (find_latest_persist_file(g_persist_dir, latest, sizeof(latest)) == 0) {
-        replay_persist_file(latest);
-    }
+    /* 上电回放已在 EventLogger_Init 完成 (须早于任何事件入环), 此处不再回放 */
 
     /* 清理旧文件 */
     cleanup_old_persist_files(g_persist_dir, EVENT_PERSIST_MAX_AGE_D);
@@ -331,13 +344,14 @@ int EventLogger_StartPersistThread(const char *dir_path, uint64_t *out_boot_id)
         return -2;
     }
 
-    /* 写 empty header (write_seq 已被回放设为历史值, boot_id 递增) */
+    /* 写 empty header (boot_id 递增)。write_seq 先记为回放结束处的序号: 本会话已产生
+     * 但尚未落盘的事件 (初始化阶段) 不提前声称已写入, 由落盘线程写完后再推进。 */
     g_boot_id_counter++;
     g_persist_header.magic = EVENT_PERSIST_MAGIC;
     g_persist_header.version = EVENT_PERSIST_VERSION;
     g_persist_header.capacity = EVENT_RING_CAPACITY;
     g_persist_header.reserved = 0;
-    g_persist_header.write_seq = EventLogger_GetWriteSeq();
+    g_persist_header.write_seq = g_replay_end_seq;
     g_persist_header.boot_id = g_boot_id_counter;
     fwrite(&g_persist_header, sizeof(g_persist_header), 1, g_persist_fp);
     fflush(g_persist_fp);
@@ -350,7 +364,8 @@ int EventLogger_StartPersistThread(const char *dir_path, uint64_t *out_boot_id)
     fputc(0, g_persist_fp);
     fflush(g_persist_fp);
 
-    g_persist_last_seq = g_persist_header.write_seq;
+    /* 从回放结束处开始写: 初始化阶段 (含开机伺服故障) 的事件也进本次会话文件 */
+    g_persist_last_seq = g_replay_end_seq;
 
     /* 启动落盘线程 (用 pthread, 与 sim_engine 落盘线程同模式) */
     atomic_store_explicit(&g_persist_running, 1, memory_order_release);

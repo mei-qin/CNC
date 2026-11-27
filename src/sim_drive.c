@@ -204,6 +204,14 @@ int sim_drive_inject_fault(int axis_idx, int slave_subidx)
     return 0;
 }
 
+int sim_drive_clear_fault(int axis_idx, int slave_subidx)
+{
+    if (axis_idx < 0 || axis_idx >= AXIS_NUM) return -1;
+    if (slave_subidx < 0 || slave_subidx >= MAX_SLAVES_PER_AXIS) return -1;
+    g_sim_axis[axis_idx].motor[slave_subidx].fault_injected = 0;
+    return 0;
+}
+
 int sim_drive_config_alpha(int axis_idx, double alpha)
 {
     if (axis_idx < 0 || axis_idx >= AXIS_NUM) return -1;

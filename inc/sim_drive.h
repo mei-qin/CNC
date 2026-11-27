@@ -105,6 +105,12 @@ int32_t sim_drive_get_follow_err(int axis_idx, int slave_subidx);
  * 返回 0=成功, -1=参数越界 */
 int sim_drive_inject_fault(int axis_idx, int slave_subidx);
 
+/* @Context: Non-RealTime Background Thread (sim 测试钩子线程)
+ * @Thread-Safety: 清 fault_injected。motor 此后停在 FAULT, 直到收到 CW_FAULT_RESET 上升沿
+ * (sim_drive_step_axis 既有逻辑) 才回 SWITCH_ON_DISABLED — 用于验证"故障撤销后自动复位"。
+ * 返回 0=成功, -1=参数越界 */
+int sim_drive_clear_fault(int axis_idx, int slave_subidx);
+
 /* @Context: Non-RealTime Background Thread (RPC 线程)
  * @Thread-Safety: 写 alpha 字段, RT 线程下一周期生效。
  * alpha 必须在 (0, 1) 范围内, 否则返回 -1 */
